@@ -6,6 +6,8 @@ WIP, this 1.0
 
 WHY? Because I can. And education. And I want to offer a mpv-style player without configs or intimidation-factor.
 
+There is a portable Windows build you can try here: https://github.com/ASIXicle/DSVP/releases/tag/v1.0-alpha
+
 TODO- subtitles are next up
 
 Claude wrote most of this stuff:
