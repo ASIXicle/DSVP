@@ -1,5 +1,7 @@
 # DSVP — Dead Simple Video Player
 
+<img width="1099" height="731" alt="DSVPmenu" src="https://github.com/user-attachments/assets/ba3330f3-fcdc-4eca-985f-2bc6701d4d02" />
+
 WIP, this 1.0
 
 WHY? Because I can. And education. And I want to offer a mpv-style player without configs or intimidation-factor.
