@@ -244,8 +244,10 @@ int player_open(PlayerState *ps, const char *filename) {
             return -1;
         }
 
-        /* Enable error-diffusion dithering for bit-depth conversion */
-        av_opt_set_int(ps->sws_ctx, "dithering", SWS_DITHER_ED, 0);
+        /* Enable error-diffusion dithering for bit-depth conversion.
+         * Value 1 = SWS_DITHER_ED in FFmpeg's internal enum. Using the
+         * integer directly for compatibility across FFmpeg versions. */
+        av_opt_set_int(ps->sws_ctx, "dithering", 1, 0);
 
         /* Allocate buffer for the converted frame */
         int buf_size = av_image_get_buffer_size(dst_fmt, dst_w, dst_h, 32);
