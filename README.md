@@ -1,6 +1,7 @@
 # DSVP — Dead Simple Video Player
 
 WIP, this 1.0
+
 WHY? Because I can. And education. And I want to offer a mpv-style player without configs or intimidation-factor.
 
 TODO- subtitles are next up
