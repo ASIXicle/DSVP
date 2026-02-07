@@ -97,7 +97,7 @@ This creates a `DSVP-portable/` folder with the exe and all required DLLs.
 ```bash
 # Debian/Ubuntu
 sudo apt install gcc make libavformat-dev libavcodec-dev libswscale-dev \
-    libswresample-dev libavutil-dev libsdl2-dev
+    libswresample-dev libavutil-dev libsdl2-dev zenity
 
 make
 ./package.sh
