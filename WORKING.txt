@@ -1,0 +1,33 @@
+I want us to write a cross-platform (Windows/Mac/Linux) media player program that is essentially a GUI wrapper for ffplay. All necessary library components and extensions should be compiled/included in a portable installation folder for the end-user. I am developing using VSCodium on a Windows 11 PC and may eventually push to GitHub. I use Scoop instead of Chocolatey-- that's where my Python is installed. I am using this project to educate myself. Offer clear, concise directions and explanations. As far as language and frameworks to make this possible, offer suggestions. I do not want to use mpv. This is meant as an alternative to mpv that uses ffplay to present video files in reference quality.
+
+GUI video player that has the following attributes:
+
+-player is called "DSVP", or Dead Simple Video Player
+
+-minimalist presentation/interface, all drop down menus appear and disappear on mouse-hover
+
+-rendering movie files as accurately as possible, both sound and vision. Reference quality audio and video. This is the highest priority, rendering and playing movie files (x264, x265, mkv, mp4, h264, AV1, etc) as perfectly as possible in adherence to their attributes concerning color, gamma, fps, audio, etc.
+
+-on the default blank open window, pressing "o" will prompt to open a media file, "q" to quit program or close playback of a file. Simple mouse controlled seek bar and volume control; arrow keys "left" and "right" to seek forward and back, arrow keys "up" and "down" to adjust volume. Pressing "d" brings up an overlay debug menu with as much info about playback as possible to probe, pressing "d" again closes this overlay . Pressing "i" displays playback metrics and media info with as much info about media being played as is possible to probe, pressing "i" again closes this overlay. There is also a drop-down menu offering all of these settings that is present when no media is being played and disappears upon media playing. It can be recalled upon mouse hover and disappears after one second when mouse hover is no longer present.
+
+-portable installation. End user does not need to download any files or add PATHs-- all is bundled into the installation folder.
+
+-No hardware decode of files, software decode ONLY. If optimal use lanczos4sharpest or catmull_rom. No dithering or debanding. I believe ffplay has some manner of lancos baked in.
+
+-when a video is loaded the window should stay on the center of the screen, double-clicking any of the video presentation area switches to fullscreen mode, doing the same reverts to windowed. This function is duplicated by pressing the "f" key or using the drop-down.
+
+-Use as much CPU/RAM as necessary, this is meant for high-end systems.
+
+-No networking capabilities, this is a local media player ONLY. Security and sanitary code is paramount.
+
+Current working directory and gcc and ffmpeg versions:
+
+PS C:\Users\seth\Pictures\CLAUDE\DSVP> ffmpeg -version
+
+ffmpeg version 8.0.1-full_build-www.gyan.dev Copyright (c) 2000-2025 the FFmpeg developers
+
+built with gcc 15.2.0 (Rev8, Built by MSYS2 project)
+
+PS C:\Users\seth\Pictures\CLAUDE\DSVP> gcc --version
+
+gcc.exe (x86_64-posix-seh-rev0, Built by MinGW-Builds project) 15.2.0
