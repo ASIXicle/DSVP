@@ -155,3 +155,7 @@ This enables console output, verbose FFmpeg logging, and debug symbols. A `dsvp.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Attribution
+
+"Co-Authored-By: Claude Opus 4.6"
