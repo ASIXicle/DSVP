@@ -51,15 +51,42 @@ static int open_file_dialog(char *out, int out_size) {
     return 0;
 
 #else
-    /* Linux/macOS: use zenity or osascript as fallback */
+    /* Linux/macOS: try multiple dialog backends */
     FILE *fp = NULL;
 
     #ifdef __APPLE__
     fp = popen("osascript -e 'POSIX path of (choose file of type {\"public.movie\", \"public.audio\"})'", "r");
     #else
-    fp = popen("zenity --file-selection --title='Open Media File' "
-               "--file-filter='Media files|*.mkv *.mp4 *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts *.mpg *.mpeg *.mp3 *.flac *.wav *.aac *.ogg *.opus *.m4a *.wma' "
-               "--file-filter='All files|*' 2>/dev/null", "r");
+    /* Try zenity, then kdialog, then yad */
+    const char *commands[] = {
+        "zenity --file-selection --title='Open Media File' "
+            "--file-filter='Media files|*.mkv *.mp4 *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts *.mpg *.mpeg *.mp3 *.flac *.wav *.aac *.ogg *.opus *.m4a *.wma' "
+            "--file-filter='All files|*' 2>/dev/null",
+        "kdialog --getopenfilename . "
+            "'Media files (*.mkv *.mp4 *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts *.mpg *.mpeg *.mp3 *.flac *.wav *.aac *.ogg *.opus *.m4a *.wma)' 2>/dev/null",
+        "yad --file-selection --title='Open Media File' 2>/dev/null",
+        NULL
+    };
+    const char *names[] = { "zenity", "kdialog", "yad" };
+
+    for (int i = 0; commands[i]; i++) {
+        /* Check if the tool exists before trying it */
+        char which_cmd[64];
+        snprintf(which_cmd, sizeof(which_cmd), "which %s >/dev/null 2>&1", names[i]);
+        if (system(which_cmd) == 0) {
+            log_msg("File dialog: using %s", names[i]);
+            fp = popen(commands[i], "r");
+            break;
+        }
+    }
+
+    if (!fp) {
+        log_msg("ERROR: No file dialog available. Install zenity, kdialog, or yad.");
+        log_msg("  Debian/Ubuntu: sudo apt install zenity");
+        log_msg("  Fedora: sudo dnf install zenity");
+        log_msg("  Tip: you can also pass a file path on the command line: ./dsvp video.mp4");
+        return 0;
+    }
     #endif
 
     if (!fp) return 0;
