@@ -1,0 +1,24 @@
+# Build output
+build/
+*.o
+*.exe
+
+# Dependencies (downloaded locally, not committed)
+deps/ffmpeg/
+deps/SDL2/
+deps/
+
+# IDE
+.vscode/
+.vscodium/
+*.swp
+*.swo
+*~
+
+# OS
+Thumbs.db
+.DS_Store
+
+# My notes
+WORKING.txt
+*.txt
