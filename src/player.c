@@ -420,6 +420,8 @@ void player_close(PlayerState *ps) {
     ps->sub_selection      = 0;
     ps->sub_active_idx     = -1;
     ps->sub_valid          = 0;
+    ps->sub_is_bitmap      = 0;
+    ps->sub_bitmap_count   = 0;
     ps->sub_text[0]        = '\0';
     ps->sub_osd[0]         = '\0';
 
@@ -597,6 +599,35 @@ int video_decode_frame(PlayerState *ps) {
     }
 }
 
+/* Compute the letterboxed display rectangle for the video.
+ * Maintains aspect ratio within the current window, centering with
+ * black bars on the shorter axis. Call after window resize or video open. */
+void player_update_display_rect(PlayerState *ps) {
+    if (ps->vid_w <= 0 || ps->vid_h <= 0 || ps->win_w <= 0 || ps->win_h <= 0) {
+        ps->display_rect = (SDL_Rect){ 0, 0, ps->win_w, ps->win_h };
+        return;
+    }
+
+    double video_aspect = (double)ps->vid_w / ps->vid_h;
+    double win_aspect   = (double)ps->win_w / ps->win_h;
+
+    int disp_w, disp_h;
+    if (video_aspect > win_aspect) {
+        /* Video is wider than window — pillarbox (bars top/bottom) */
+        disp_w = ps->win_w;
+        disp_h = (int)(ps->win_w / video_aspect);
+    } else {
+        /* Video is taller than window — letterbox (bars left/right) */
+        disp_h = ps->win_h;
+        disp_w = (int)(ps->win_h * video_aspect);
+    }
+
+    ps->display_rect.x = (ps->win_w - disp_w) / 2;
+    ps->display_rect.y = (ps->win_h - disp_h) / 2;
+    ps->display_rect.w = disp_w;
+    ps->display_rect.h = disp_h;
+}
+
 /* Display the current video frame: scale → upload to texture → render.
  *
  * A/V sync logic:
@@ -624,9 +655,11 @@ void video_display(PlayerState *ps) {
         ps->rgb_frame->data[2], ps->rgb_frame->linesize[2]   /* V */
     );
 
-    /* ── Render ── */
+    /* ── Render with correct aspect ratio ── */
+    SDL_SetRenderDrawColor(ps->renderer, 0, 0, 0, 255);
     SDL_RenderClear(ps->renderer);
-    SDL_RenderCopy(ps->renderer, ps->texture, NULL, NULL);
+    player_update_display_rect(ps);
+    SDL_RenderCopy(ps->renderer, ps->texture, NULL, &ps->display_rect);
     /* Note: overlays are drawn on top in main.c before RenderPresent */
 }
 

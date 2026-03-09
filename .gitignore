@@ -2,6 +2,7 @@
 build/
 *.o
 *.exe
+DSVP-portable/
 
 # Dependencies (downloaded locally, not committed)
 deps/ffmpeg/

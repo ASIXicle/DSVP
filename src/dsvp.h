@@ -44,6 +44,7 @@
 #define MAX_SUB_STREAMS     16      /* max subtitle tracks to catalog   */
 #define MAX_AUDIO_STREAMS   16      /* max audio tracks to catalog      */
 #define SUB_TEXT_SIZE       4096    /* max subtitle text buffer         */
+#define MAX_SUB_BITMAPS     4       /* max bitmap rects per subtitle    */
 
 /* Default window size when no video is loaded */
 #define DEFAULT_WIN_W       960
@@ -145,6 +146,7 @@ typedef struct PlayerState {
     /* ── Window geometry ── */
     int                 win_w, win_h;     /* current window size        */
     int                 vid_w, vid_h;     /* video native resolution    */
+    SDL_Rect            display_rect;     /* letterboxed video area     */
 
     /* ── Overlays ── */
     int                 show_debug;
@@ -164,6 +166,12 @@ typedef struct PlayerState {
     double              sub_start_pts;      /* show from this PTS           */
     double              sub_end_pts;        /* hide after this PTS          */
     int                 sub_valid;          /* 1 = sub_text should display  */
+    int                 sub_is_bitmap;      /* 1 = bitmap sub, 0 = text     */
+
+    /* Bitmap subtitle textures (PGS, VobSub, DVB) */
+    SDL_Texture        *sub_bitmaps[MAX_SUB_BITMAPS];
+    SDL_Rect            sub_bitmap_rects[MAX_SUB_BITMAPS];
+    int                 sub_bitmap_count;
 
     /* Track change OSD */
     char                sub_osd[256];       /* "Subtitles: English" etc.    */
@@ -194,6 +202,7 @@ void  video_display(PlayerState *ps);
 void  player_seek(PlayerState *ps, double incr);
 void  player_build_media_info(PlayerState *ps);
 void  player_build_debug_info(PlayerState *ps);
+void  player_update_display_rect(PlayerState *ps);
 
 /* ── Audio API (audio.c) ──────────────────────────────────────────── */
 
