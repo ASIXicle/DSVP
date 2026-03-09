@@ -111,6 +111,17 @@ void sub_close_font(void) {
     if (font_loaded)      { TTF_Quit(); font_loaded = 0; }
 }
 
+/* Free any active bitmap subtitle textures */
+static void sub_clear_bitmaps(PlayerState *ps) {
+    for (int i = 0; i < ps->sub_bitmap_count; i++) {
+        if (ps->sub_bitmaps[i]) {
+            SDL_DestroyTexture(ps->sub_bitmaps[i]);
+            ps->sub_bitmaps[i] = NULL;
+        }
+    }
+    ps->sub_bitmap_count = 0;
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════
  * Stream Discovery
@@ -126,14 +137,23 @@ void sub_find_streams(PlayerState *ps) {
         if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) continue;
 
         enum AVCodecID cid = st->codecpar->codec_id;
-        if (cid != AV_CODEC_ID_SRT &&
-            cid != AV_CODEC_ID_SUBRIP &&
-            cid != AV_CODEC_ID_ASS &&
-            cid != AV_CODEC_ID_SSA &&
-            cid != AV_CODEC_ID_MOV_TEXT &&
-            cid != AV_CODEC_ID_TEXT &&
-            cid != AV_CODEC_ID_WEBVTT) {
-            log_msg("Subtitle stream %d: skipping bitmap codec %s", i,
+
+        /* Check if this is a supported text subtitle */
+        int is_text = (cid == AV_CODEC_ID_SRT ||
+                       cid == AV_CODEC_ID_SUBRIP ||
+                       cid == AV_CODEC_ID_ASS ||
+                       cid == AV_CODEC_ID_SSA ||
+                       cid == AV_CODEC_ID_MOV_TEXT ||
+                       cid == AV_CODEC_ID_TEXT ||
+                       cid == AV_CODEC_ID_WEBVTT);
+
+        /* Check if this is a supported bitmap subtitle */
+        int is_bitmap = (cid == AV_CODEC_ID_HDMV_PGS_SUBTITLE ||
+                         cid == AV_CODEC_ID_DVD_SUBTITLE ||
+                         cid == AV_CODEC_ID_DVB_SUBTITLE);
+
+        if (!is_text && !is_bitmap) {
+            log_msg("Subtitle stream %d: skipping unsupported codec %s", i,
                 avcodec_get_name(cid));
             continue;
         }
@@ -195,7 +215,9 @@ int sub_open_codec(PlayerState *ps, int stream_idx) {
     }
 
     ps->sub_active_idx = stream_idx;
-    log_msg("Subtitle codec opened: %s (stream %d)", codec->name, stream_idx);
+    log_msg("Subtitle codec opened: %s (stream %d), canvas %dx%d",
+        codec->name, stream_idx,
+        ps->sub_codec_ctx->width, ps->sub_codec_ctx->height);
     return 0;
 }
 
@@ -205,7 +227,9 @@ void sub_close_codec(PlayerState *ps) {
     }
     ps->sub_active_idx = -1;
     ps->sub_valid = 0;
+    ps->sub_is_bitmap = 0;
     ps->sub_text[0] = '\0';
+    sub_clear_bitmaps(ps);
 }
 
 
@@ -239,7 +263,9 @@ void sub_cycle(PlayerState *ps) {
 
         /* Clear current display so new track takes effect immediately */
         ps->sub_valid = 0;
+        ps->sub_is_bitmap = 0;
         ps->sub_text[0] = '\0';
+        sub_clear_bitmaps(ps);
 
         snprintf(ps->sub_osd, sizeof(ps->sub_osd), "Subtitles: %s",
             ps->sub_stream_names[sel]);
@@ -315,6 +341,7 @@ void sub_decode_pending(PlayerState *ps) {
 
     /* Current subtitle expired (or none active) — try the next one */
     ps->sub_valid = 0;
+    sub_clear_bitmaps(ps);
 
     AVPacket pkt;
     while (pq_get(spq, &pkt, 0) > 0) {
@@ -346,16 +373,70 @@ void sub_decode_pending(PlayerState *ps) {
             end = start + 3.0;  /* last resort fallback */
         }
 
-        /* Extract text */
+        /* Extract text or bitmap data */
         char text[SUB_TEXT_SIZE] = {0};
+        int got_bitmap = 0;
+
+        /* Clear any previous bitmap textures */
+        sub_clear_bitmaps(ps);
+
         for (unsigned i = 0; i < sub.num_rects; i++) {
             AVSubtitleRect *rect = sub.rects[i];
+
             if (rect->type == SUBTITLE_TEXT && rect->text) {
                 snprintf(text, sizeof(text), "%s", rect->text);
                 log_msg("Sub [TEXT] %.1f-%.1f: \"%.*s\"", start, end, 60, text);
             } else if (rect->type == SUBTITLE_ASS && rect->ass) {
                 strip_ass_markup(rect->ass, text, sizeof(text));
                 log_msg("Sub [ASS] %.1f-%.1f: \"%.*s\"", start, end, 60, text);
+            } else if (rect->type == SUBTITLE_BITMAP &&
+                       rect->data[0] && rect->data[1] &&
+                       rect->w > 0 && rect->h > 0 &&
+                       ps->sub_bitmap_count < MAX_SUB_BITMAPS) {
+                /*
+                 * Bitmap subtitles (PGS, VobSub, DVB):
+                 *   rect->data[0] = pixel indices into palette
+                 *   rect->data[1] = RGBA palette (4 bytes per entry, 0xAARRGGBB native)
+                 *   rect->w/h     = dimensions
+                 *   rect->x/y     = position relative to video frame
+                 */
+                uint32_t *palette = (uint32_t *)rect->data[1];
+                int w = rect->w;
+                int h = rect->h;
+
+                /* Convert paletted pixels to RGBA */
+                uint8_t *rgba = av_malloc(w * h * 4);
+                if (rgba) {
+                    for (int row = 0; row < h; row++) {
+                        for (int col = 0; col < w; col++) {
+                            uint8_t idx = rect->data[0][row * rect->linesize[0] + col];
+                            uint32_t color = palette[idx];
+                            int off = (row * w + col) * 4;
+                            rgba[off + 0] = (color >> 16) & 0xFF;  /* R */
+                            rgba[off + 1] = (color >> 8)  & 0xFF;  /* G */
+                            rgba[off + 2] =  color        & 0xFF;  /* B */
+                            rgba[off + 3] = (color >> 24) & 0xFF;  /* A */
+                        }
+                    }
+
+                    SDL_Texture *tex = SDL_CreateTexture(ps->renderer,
+                        SDL_PIXELFORMAT_RGBA32,
+                        SDL_TEXTUREACCESS_STATIC, w, h);
+                    if (tex) {
+                        SDL_UpdateTexture(tex, NULL, rgba, w * 4);
+                        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+
+                        int bi = ps->sub_bitmap_count;
+                        ps->sub_bitmaps[bi] = tex;
+                        ps->sub_bitmap_rects[bi] = (SDL_Rect){ rect->x, rect->y, w, h };
+                        ps->sub_bitmap_count++;
+                        got_bitmap = 1;
+
+                        log_msg("Sub [BITMAP] %.1f-%.1f: %dx%d at (%d,%d)",
+                            start, end, w, h, rect->x, rect->y);
+                    }
+                    av_free(rgba);
+                }
             } else {
                 log_msg("Sub: unknown rect type %d", rect->type);
             }
@@ -368,16 +449,23 @@ void sub_decode_pending(PlayerState *ps) {
         avsubtitle_free(&sub);
         av_packet_unref(&pkt);
 
-        if (text[0] == '\0') continue;
+        if (text[0] == '\0' && !got_bitmap) continue;
 
         /* Skip subtitles that have already expired */
         if (end < now) {
             log_msg("Sub: skipped expired (end=%.1f < now=%.1f)", end, now);
+            sub_clear_bitmaps(ps);
             continue;
         }
 
         /* Keep this subtitle */
-        snprintf(ps->sub_text, sizeof(ps->sub_text), "%s", text);
+        if (got_bitmap) {
+            ps->sub_is_bitmap = 1;
+            ps->sub_text[0] = '\0';
+        } else {
+            ps->sub_is_bitmap = 0;
+            snprintf(ps->sub_text, sizeof(ps->sub_text), "%s", text);
+        }
         ps->sub_start_pts = start;
         ps->sub_end_pts   = end;
         ps->sub_valid     = 1;
@@ -423,50 +511,81 @@ static void render_text_outlined(SDL_Renderer *renderer, TTF_Font *font,
 }
 
 void sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h) {
-    if (!font_loaded) return;
 
-    /* ── Render active subtitle text ── */
-    if (ps->sub_valid && ps->sub_text[0]) {
+    /* ── Render active subtitle ── */
+    if (ps->sub_valid) {
         double now = ps->audio_clock;
         if (ps->audio_stream_idx < 0) now = ps->video_clock;
 
         if (now >= ps->sub_start_pts && now <= ps->sub_end_pts) {
-            char buf[SUB_TEXT_SIZE];
-            snprintf(buf, sizeof(buf), "%s", ps->sub_text);
+            if (ps->sub_is_bitmap && ps->sub_bitmap_count > 0) {
+                /* ── Bitmap subtitle: scale from canvas coords to display area ──
+                 *
+                 * Subtitle positions are relative to the subtitle canvas (e.g.
+                 * 1920×1080). We map into the letterboxed display_rect, not the
+                 * full window, so subs stay properly aligned with the video.
+                 */
+                int canvas_w = (ps->sub_codec_ctx && ps->sub_codec_ctx->width  > 0)
+                    ? ps->sub_codec_ctx->width  : ps->vid_w;
+                int canvas_h = (ps->sub_codec_ctx && ps->sub_codec_ctx->height > 0)
+                    ? ps->sub_codec_ctx->height : ps->vid_h;
 
-            char *lines[64];
-            int nlines = 0;
-            char *tok = strtok(buf, "\n");
-            while (tok && nlines < 64) {
-                if (tok[0] != '\0') {
-                    lines[nlines++] = tok;
+                SDL_Rect dr = ps->display_rect;
+                double sx = (canvas_w > 0) ? (double)dr.w / canvas_w : 1.0;
+                double sy = (canvas_h > 0) ? (double)dr.h / canvas_h : 1.0;
+
+                for (int i = 0; i < ps->sub_bitmap_count; i++) {
+                    if (!ps->sub_bitmaps[i]) continue;
+                    SDL_Rect dst = {
+                        dr.x + (int)(ps->sub_bitmap_rects[i].x * sx),
+                        dr.y + (int)(ps->sub_bitmap_rects[i].y * sy),
+                        (int)(ps->sub_bitmap_rects[i].w * sx),
+                        (int)(ps->sub_bitmap_rects[i].h * sy)
+                    };
+                    SDL_RenderCopy(renderer, ps->sub_bitmaps[i], NULL, &dst);
                 }
-                tok = strtok(NULL, "\n");
-            }
+            } else if (!ps->sub_is_bitmap && ps->sub_text[0]) {
+                /* ── Text subtitle: render with SDL_ttf ── */
+                if (font_loaded) {
+                    char buf[SUB_TEXT_SIZE];
+                    snprintf(buf, sizeof(buf), "%s", ps->sub_text);
 
-            int font_size = win_h / 24;
-            if (font_size < 14) font_size = 14;
-            if (font_size > 54) font_size = 54;
+                    char *lines[64];
+                    int nlines = 0;
+                    char *tok = strtok(buf, "\n");
+                    while (tok && nlines < 64) {
+                        if (tok[0] != '\0') {
+                            lines[nlines++] = tok;
+                        }
+                        tok = strtok(NULL, "\n");
+                    }
 
-            TTF_SetFontSize(sub_font, font_size);
-            if (sub_font_outline)
-                TTF_SetFontSize(sub_font_outline, font_size);
+                    int font_size = win_h / 24;
+                    if (font_size < 14) font_size = 14;
+                    if (font_size > 54) font_size = 54;
 
-            int line_height = TTF_FontLineSkip(sub_font);
-            int total_height = nlines * line_height;
-            int y_base = win_h - 60 - total_height;
+                    TTF_SetFontSize(sub_font, font_size);
+                    if (sub_font_outline)
+                        TTF_SetFontSize(sub_font_outline, font_size);
 
-            for (int i = 0; i < nlines; i++) {
-                int tw = 0, th = 0;
-                TTF_SizeUTF8(sub_font, lines[i], &tw, &th);
-                int x = (win_w - tw) / 2;
-                int y = y_base + i * line_height;
+                    int line_height = TTF_FontLineSkip(sub_font);
+                    int total_height = nlines * line_height;
+                    int y_base = win_h - 60 - total_height;
 
-                render_text_outlined(renderer, sub_font, sub_font_outline,
-                    lines[i], x, y, COLOR_SUB, COLOR_OUTLINE);
+                    for (int i = 0; i < nlines; i++) {
+                        int tw = 0, th = 0;
+                        TTF_SizeUTF8(sub_font, lines[i], &tw, &th);
+                        int x = (win_w - tw) / 2;
+                        int y = y_base + i * line_height;
+
+                        render_text_outlined(renderer, sub_font, sub_font_outline,
+                            lines[i], x, y, COLOR_SUB, COLOR_OUTLINE);
+                    }
+                }
             }
         } else if (now > ps->sub_end_pts) {
             ps->sub_valid = 0;
+            sub_clear_bitmaps(ps);
         }
     }
 
@@ -492,7 +611,7 @@ void sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h) {
         ps->sub_osd[0] = '\0';
     }
 
-    if (osd_text && get_time_sec() < osd_until) {
+    if (osd_text && get_time_sec() < osd_until && font_loaded) {
         int font_size = win_h / 40;
         if (font_size < 12) font_size = 12;
         if (font_size > 32) font_size = 32;

@@ -694,8 +694,10 @@ int main(int argc, char *argv[]) {
             /* Paused — decode pending subs, redraw current frame */
             sub_decode_pending(&ps);
             if (ps.texture) {
+                SDL_SetRenderDrawColor(ps.renderer, 0, 0, 0, 255);
                 SDL_RenderClear(ps.renderer);
-                SDL_RenderCopy(ps.renderer, ps.texture, NULL, NULL);
+                player_update_display_rect(&ps);
+                SDL_RenderCopy(ps.renderer, ps.texture, NULL, &ps.display_rect);
             }
         } else {
             /* No media loaded — draw idle screen */
