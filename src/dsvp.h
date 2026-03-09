@@ -129,6 +129,7 @@ typedef struct PlayerState {
     int64_t             seek_target;      /* seek target in AV_TIME_BASE*/
     int                 seek_request;     /* 1 = seek pending           */
     int                 seek_flags;
+    double              seek_grace_until; /* suppress frame drops until */
 
     /* ── Threads ── */
     SDL_Thread         *demux_thread;
@@ -181,6 +182,15 @@ typedef struct PlayerState {
     char                filepath[1024];
     char                media_info[8192]; /* formatted info string      */
     char                debug_info[4096]; /* formatted debug string     */
+
+    /* ── Playback diagnostics ── */
+    int                 diag_frames_displayed; /* total frames shown       */
+    int                 diag_frames_decoded;   /* total frames decoded     */
+    int                 diag_frames_dropped;   /* frames decoded but not shown */
+    int                 diag_multi_decodes;    /* ticks with >1 decode     */
+    int                 diag_timer_snaps;      /* frame_timer snap-forwards*/
+    double              diag_max_av_drift;     /* worst A/V drift (signed) */
+    double              diag_last_report;      /* time of last periodic log*/
 
 } PlayerState;
 
