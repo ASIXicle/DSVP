@@ -431,6 +431,20 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->audio_clock      = 0.0;
     ps->video_clock      = 0.0;
 
+    /* Grace period: suppress frame drops while the decode pipeline
+     * fills. Same logic as post-seek — the first few frames need
+     * to decode from the nearest keyframe before A/V sync is valid. */
+    ps->seek_grace_until = get_time_sec() + 0.25;
+
+    /* ── Reset diagnostics ── */
+    ps->diag_frames_displayed = 0;
+    ps->diag_frames_decoded   = 0;
+    ps->diag_frames_dropped   = 0;
+    ps->diag_multi_decodes    = 0;
+    ps->diag_timer_snaps      = 0;
+    ps->diag_max_av_drift     = 0.0;
+    ps->diag_last_report      = get_time_sec();
+
     /* ── Open audio output ── */
     if (ps->audio_codec_ctx) {
         audio_open(ps);
@@ -452,6 +466,22 @@ int player_open(PlayerState *ps, const char *filename) {
 void player_close(PlayerState *ps) {
     if (!ps->playing && !ps->fmt_ctx) return;
     log_msg("player_close: stopping playback");
+
+    /* ── Playback diagnostics summary ── */
+    if (ps->diag_frames_decoded > 0) {
+        double drop_pct = (ps->diag_frames_decoded > 0)
+            ? (100.0 * ps->diag_frames_dropped / ps->diag_frames_decoded)
+            : 0.0;
+        log_msg("DIAG: === Playback Summary ===");
+        log_msg("DIAG:   Frames decoded:   %d", ps->diag_frames_decoded);
+        log_msg("DIAG:   Frames displayed:  %d", ps->diag_frames_displayed);
+        log_msg("DIAG:   Frames dropped:    %d (%.2f%%)",
+                ps->diag_frames_dropped, drop_pct);
+        log_msg("DIAG:   Multi-decode ticks: %d", ps->diag_multi_decodes);
+        log_msg("DIAG:   Timer snap-forwards: %d", ps->diag_timer_snaps);
+        log_msg("DIAG:   Peak A/V drift:    %.1fms",
+                ps->diag_max_av_drift * 1000.0);
+    }
 
     ps->quit = 1;
 
@@ -516,6 +546,7 @@ void player_close(PlayerState *ps) {
     ps->audio_buf_index    = 0;
     ps->seek_request       = 0;
     ps->seeking            = 0;
+    ps->seek_grace_until   = 0.0;
     ps->show_debug         = 0;
     ps->show_info          = 0;
     ps->aud_count          = 0;
@@ -597,6 +628,12 @@ int demux_thread_func(void *arg) {
 
             ps->seeking = 0;
             SDL_UnlockMutex(ps->seek_mutex);
+
+            /* Grace period: suppress frame drops for 150ms after seek.
+             * The video decoder needs 2–3 frames to catch up from the
+             * nearest keyframe, and A/V drift during this window is
+             * expected and harmless. */
+            ps->seek_grace_until = get_time_sec() + 0.15;
 
             /* Resume audio playback */
             if (ps->audio_dev && !ps->paused)
@@ -744,21 +781,36 @@ void video_display(PlayerState *ps) {
     if (!ps->texture || !ps->video_frame || !ps->video_frame->data[0]) return;
     if (ps->seeking) return;
 
-    /* ── Scale / convert to YUV420P ── */
-    sws_scale(ps->sws_ctx,
-        (const uint8_t *const *)ps->video_frame->data,
-        ps->video_frame->linesize,
-        0, ps->vid_h,
-        ps->rgb_frame->data,
-        ps->rgb_frame->linesize
-    );
+    /* ── YUV420P passthrough optimization ──
+     *
+     * When the source is already YUV420P (the SDL texture format), skip
+     * sws_scale entirely and upload the decoded frame directly. This
+     * avoids an expensive Lanczos + error-diffusion pass that would
+     * produce byte-identical output anyway (same format, same size).
+     *
+     * For any other pixel format (10-bit, 4:2:2, RGB, etc.), we run
+     * the full sws_scale pipeline with Lanczos + error-diffusion
+     * dithering for reference-quality conversion. */
+    if (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P) {
+        /* Direct upload — no conversion needed */
+        SDL_UpdateYUVTexture(ps->texture, NULL,
+            ps->video_frame->data[0], ps->video_frame->linesize[0],
+            ps->video_frame->data[1], ps->video_frame->linesize[1],
+            ps->video_frame->data[2], ps->video_frame->linesize[2]);
+    } else {
+        /* Format conversion required — full quality pipeline */
+        sws_scale(ps->sws_ctx,
+            (const uint8_t *const *)ps->video_frame->data,
+            ps->video_frame->linesize,
+            0, ps->vid_h,
+            ps->rgb_frame->data,
+            ps->rgb_frame->linesize);
 
-    /* ── Upload to SDL texture ── */
-    SDL_UpdateYUVTexture(ps->texture, NULL,
-        ps->rgb_frame->data[0], ps->rgb_frame->linesize[0],  /* Y */
-        ps->rgb_frame->data[1], ps->rgb_frame->linesize[1],  /* U */
-        ps->rgb_frame->data[2], ps->rgb_frame->linesize[2]   /* V */
-    );
+        SDL_UpdateYUVTexture(ps->texture, NULL,
+            ps->rgb_frame->data[0], ps->rgb_frame->linesize[0],
+            ps->rgb_frame->data[1], ps->rgb_frame->linesize[1],
+            ps->rgb_frame->data[2], ps->rgb_frame->linesize[2]);
+    }
 
     /* ── Render with correct aspect ratio ── */
     SDL_SetRenderDrawColor(ps->renderer, 0, 0, 0, 255);
@@ -940,4 +992,14 @@ void player_build_debug_info(PlayerState *ps) {
         ? (double)ps->fmt_ctx->duration / AV_TIME_BASE : 0.0;
     double pos = ps->video_clock;
     off += snprintf(buf + off, sz - off, "Position:    %.1f / %.1f s\n", pos, duration);
+
+    /* Playback diagnostics */
+    off += snprintf(buf + off, sz - off, "\n--- Diagnostics ---\n");
+    off += snprintf(buf + off, sz - off, "Decoded:     %d\n", ps->diag_frames_decoded);
+    off += snprintf(buf + off, sz - off, "Displayed:   %d\n", ps->diag_frames_displayed);
+    off += snprintf(buf + off, sz - off, "Dropped:     %d\n", ps->diag_frames_dropped);
+    off += snprintf(buf + off, sz - off, "Multi-ticks: %d\n", ps->diag_multi_decodes);
+    off += snprintf(buf + off, sz - off, "Stall snaps: %d\n", ps->diag_timer_snaps);
+    off += snprintf(buf + off, sz - off, "Peak drift:  %.1f ms\n",
+        ps->diag_max_av_drift * 1000.0);
 }

@@ -441,12 +441,22 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Create renderer ──
-     * SDL_RENDERER_SOFTWARE forces CPU rendering (no GPU compositing).
-     * We use PRESENTVSYNC to match the display refresh rate. */
+     * GPU-accelerated compositing: the GPU handles texture upload and
+     * blitting only — all decode and pixel processing stays on the CPU.
+     * This produces identical output to software compositing but frees
+     * the CPU from having to composite 1920×1080 frames every tick.
+     * Falls back to software renderer if no GPU is available. */
     SDL_Renderer *renderer = SDL_CreateRenderer(window, -1,
-        SDL_RENDERER_SOFTWARE | SDL_RENDERER_PRESENTVSYNC);
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     if (!renderer) {
-        /* Fallback: try without VSYNC */
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    }
+    if (!renderer) {
+        log_msg("WARNING: No GPU renderer available, falling back to software");
+        renderer = SDL_CreateRenderer(window, -1,
+            SDL_RENDERER_SOFTWARE | SDL_RENDERER_PRESENTVSYNC);
+    }
+    if (!renderer) {
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     }
     if (!renderer) {
@@ -649,47 +659,192 @@ int main(int argc, char *argv[]) {
         if (ps.playing && !ps.paused) {
             /* Decode pending subtitles */
             sub_decode_pending(&ps);
-            /* Decode and display video frames with A/V sync */
+
+            /* ── Video decode and A/V sync ──
+             *
+             * Two-tier pacing:
+             *   1. frame_timer governs WHEN to show a new frame based
+             *      on content frame rate (e.g. every ~41.7ms for 24fps).
+             *   2. VSync (when available) governs the render loop rate.
+             *      On ticks where no new frame is due, we re-blit the
+             *      current texture (required by GPU double-buffering).
+             *
+             * The decode loop consumes ALL frames that are due by now,
+             * keeping only the last for display. This handles every
+             * combination of content FPS and display refresh rate:
+             *
+             *   24fps on  60Hz → ~1 decode every 2-3 VSync ticks
+             *   59fps on 122Hz → ~1 decode every 2 VSync ticks
+             *   60fps on  60Hz → ~1 decode per tick (with jitter safety)
+             *  120fps on  60Hz → ~2 decodes per tick, display the latest
+             *
+             * A/V sync adjusts frame_timer forward (video ahead of
+             * audio) or collapses delay to zero (video behind audio).
+             * If video is >50ms behind, the frame is decoded but not
+             * displayed, letting video catch up without audio glitches.
+             *
+             * No explicit SDL_Delay in the active-playback path —
+             * VSync in SDL_RenderPresent provides the heartbeat. If
+             * VSync is unavailable, a 1ms yield prevents CPU spin. */
             double now = get_time_sec();
+            int new_frame = 0;
+            int decoded_any = 0;
+            int decoded_this_tick = 0;
 
-            int vret = video_decode_frame(&ps);
-            if (vret > 0) {
-                /* Compute delay based on A/V sync */
-                double pts_delay = ps.video_clock - ps.frame_last_pts;
-                if (pts_delay <= 0.0 || pts_delay >= 1.0) {
-                    pts_delay = ps.frame_last_delay;
-                }
-                ps.frame_last_pts   = ps.video_clock;
-                ps.frame_last_delay = pts_delay;
+            /* Decode all frames that are due by now. When content FPS
+             * exceeds display refresh (e.g. 120fps on 60Hz), multiple
+             * frames may be due per tick — we decode them all but only
+             * display the last one, which is what the viewer sees.
+             * Cap at 4 iterations to prevent runaway loops on extreme
+             * clock jumps (e.g. system suspend/resume). */
+            int max_catchup = 4;
+            while (now >= ps.frame_timer && max_catchup-- > 0) {
+                int vret = video_decode_frame(&ps);
+                if (vret > 0) {
+                    decoded_any = 1;
+                    decoded_this_tick++;
+                    ps.diag_frames_decoded++;
 
-                /* Sync to audio */
-                double delay = pts_delay;
-                if (ps.audio_stream_idx >= 0) {
-                    double diff = ps.video_clock - ps.audio_clock;
-                    double threshold = fmax(pts_delay, 0.01);
+                    /* Compute inter-frame delay from PTS */
+                    double pts_delay = ps.video_clock - ps.frame_last_pts;
+                    if (pts_delay <= 0.0 || pts_delay >= 1.0)
+                        pts_delay = ps.frame_last_delay;
+                    ps.frame_last_pts   = ps.video_clock;
+                    ps.frame_last_delay = pts_delay;
 
-                    if (diff > threshold) {
-                        delay = pts_delay + diff;
-                    } else if (diff < -threshold) {
-                        delay = 0.0;
+                    /* A/V sync adjustment */
+                    double delay = pts_delay;
+                    double av_diff = 0.0;
+                    if (ps.audio_stream_idx >= 0) {
+                        av_diff = ps.video_clock - ps.audio_clock;
+                        double threshold = fmax(pts_delay, 0.01);
+
+                        if (av_diff > threshold) {
+                            /* Video is ahead — stretch the delay */
+                            delay = pts_delay + av_diff;
+                        } else if (av_diff < -threshold) {
+                            /* Video is behind — catch up gradually */
+                            delay = 0.0;
+                        }
+
+                        /* Track worst drift (absolute value) */
+                        if (fabs(av_diff) > fabs(ps.diag_max_av_drift))
+                            ps.diag_max_av_drift = av_diff;
                     }
-                }
 
-                ps.frame_timer += delay;
-                double actual_delay = ps.frame_timer - now;
-                if (actual_delay > 0.0 && actual_delay < 1.0) {
-                    SDL_Delay((Uint32)(actual_delay * 1000.0));
-                }
+                    /* ── Minimum delay floor ──
+                     *
+                     * When delay = 0 (video behind audio), frame_timer
+                     * doesn't advance, so the while loop immediately
+                     * decodes ANOTHER frame on the same tick — creating
+                     * a micro-stutter (one frame held too long, the
+                     * next silently skipped).
+                     *
+                     * Fix: always advance frame_timer by at least half
+                     * the nominal frame duration. This limits catch-up
+                     * to ~2x real-time: one extra frame per normal
+                     * interval, spread across successive VSync ticks
+                     * instead of bursting on one.
+                     *
+                     * For 24fps on 60Hz: min_delay = ~20.8ms, VSync =
+                     * 16.7ms → at most 1 decode per tick, catch-up at
+                     * ~48fps until sync is restored.
+                     *
+                     * For 120fps on 60Hz: min_delay = ~4.2ms, VSync =
+                     * 16.7ms → up to 4 decodes per tick, which matches
+                     * the genuine 2:1 frame ratio. */
+                    double min_delay = ps.frame_last_delay * 0.5;
+                    if (delay < min_delay)
+                        delay = min_delay;
 
+                    /* Schedule next frame */
+                    ps.frame_timer += delay;
+
+                    /* Mark for display (overwritten each iteration —
+                     * only the last decoded frame gets displayed) */
+                    new_frame = 1;
+
+                    /* If video is >50ms behind audio, decode but don't
+                     * display — let video catch up. Suppressed during
+                     * the grace period after seeks and playback start,
+                     * when transient drift is expected and harmless. */
+                    if (ps.audio_stream_idx >= 0 && av_diff < -0.05
+                            && now >= ps.seek_grace_until) {
+                        new_frame = 0;
+                        ps.diag_frames_dropped++;
+                        log_msg("DIAG: frame dropped at %.3fs "
+                                "(A/V drift: %.1fms)",
+                                ps.video_clock, av_diff * 1000.0);
+                    }
+                } else {
+                    /* No packet available or decode error — stop loop */
+                    if (vret < 0) {
+                        log_msg("Video decode error at clock=%.3f",
+                                ps.video_clock);
+                    } else if (ps.eof && ps.video_pq.nb_packets == 0
+                                    && ps.audio_pq.nb_packets == 0) {
+                        log_msg("Playback finished, returning to idle");
+                        player_close(&ps);
+                        ps.quit = 0;
+                    }
+                    break;
+                }
+            }
+
+            /* Track multi-decode ticks (content FPS > display Hz) */
+            if (decoded_this_tick > 1) {
+                ps.diag_multi_decodes++;
+            }
+
+            /* If frame_timer drifted too far behind (system suspend,
+             * extreme stall, etc.), snap it forward to prevent a burst
+             * of catch-up decodes on the next tick */
+            if (ps.frame_timer < now - 0.1) {
+                ps.frame_timer = now;
+                ps.diag_timer_snaps++;
+                log_msg("DIAG: frame_timer snapped forward "
+                        "(stall recovery at %.3fs)", ps.video_clock);
+            }
+
+            /* Display the last decoded frame */
+            if (new_frame) {
                 video_display(&ps);
-            } else if (vret < 0) {
-                log_msg("Video decode error at clock=%.3f", ps.video_clock);
-            } else if (ps.eof && ps.video_pq.nb_packets == 0
-                            && ps.audio_pq.nb_packets == 0) {
-                /* End of file — return to idle screen */
-                log_msg("Playback finished, returning to idle");
-                player_close(&ps);
-                ps.quit = 0;
+                ps.diag_frames_displayed++;
+            }
+
+            /* ── Periodic diagnostics (every 10 seconds) ── */
+            if (ps.playing && now - ps.diag_last_report >= 10.0) {
+                double av_now = (ps.audio_stream_idx >= 0)
+                    ? ps.video_clock - ps.audio_clock : 0.0;
+                log_msg("DIAG: [%.0fs] decoded=%d displayed=%d "
+                        "dropped=%d multi_ticks=%d snaps=%d "
+                        "A/V=%.1fms peak=%.1fms",
+                        ps.video_clock,
+                        ps.diag_frames_decoded,
+                        ps.diag_frames_displayed,
+                        ps.diag_frames_dropped,
+                        ps.diag_multi_decodes,
+                        ps.diag_timer_snaps,
+                        av_now * 1000.0,
+                        ps.diag_max_av_drift * 1000.0);
+                ps.diag_last_report = now;
+            }
+
+            /* Re-blit current texture on ticks with no new frame.
+             * GPU double-buffering: back buffer is undefined after
+             * swap, so we must always render explicitly. */
+            if (!new_frame && ps.playing && ps.texture) {
+                SDL_SetRenderDrawColor(ps.renderer, 0, 0, 0, 255);
+                SDL_RenderClear(ps.renderer);
+                player_update_display_rect(&ps);
+                SDL_RenderCopy(ps.renderer, ps.texture, NULL, &ps.display_rect);
+            }
+
+            /* If VSync is unavailable (SDL_RenderPresent returns
+             * instantly), we'd spin at 100% CPU on re-blit ticks.
+             * Yield briefly when we had nothing new to decode. */
+            if (!decoded_any) {
+                SDL_Delay(1);
             }
         } else if (ps.playing && ps.paused) {
             /* Paused — decode pending subs, redraw current frame */
