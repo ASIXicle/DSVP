@@ -12,6 +12,8 @@
  *   to match the audio clock. This is the standard approach (same as
  *   ffplay) because audio glitches are far more perceptible than
  *   dropped/delayed video frames. Words so I can remove embarassing commit spelling error
+ *   ok git, explain this: git commit -m "optimization: adaptive seek recovery, SWS_POINT for format-only conversion, min-delay floor"
+ *
  */
 
 #include "dsvp.h"
