@@ -312,7 +312,10 @@ int player_open(PlayerState *ps, const char *filename) {
             } else {
                 src_range = 0; /* assume limited (vast majority of video) */
             }
-            int dst_range = src_range;
+            /* Always output full range — SDL3's limited-range YUV→RGB
+             * shader is broken (crushed blacks). Let FFmpeg expand
+             * limited [16-235] → full [0-255] via swscale instead. */
+            int dst_range = 1;
 
             /* Retrieve defaults, then override with correct values */
             int *inv_table, *table;
@@ -326,7 +329,7 @@ int player_open(PlayerState *ps, const char *filename) {
                 sws_getCoefficients(dst_cs), dst_range,
                 brightness, contrast, saturation);
 
-            log_msg("swscale: colorspace=%s range=%s",
+            log_msg("swscale: colorspace=%s range=%s→full",
                 (src_cs == SWS_CS_ITU709) ? "BT.709" : "BT.601",
                 src_range ? "full" : "limited");
         }
@@ -403,11 +406,12 @@ int player_open(PlayerState *ps, const char *filename) {
 
     /* ── Create SDL texture for video ── */
 
-       /* ── Create video texture with correct colorspace ── */
+    /* ── Create video texture with correct colorspace ── */
+    /* Always FULL range — swscale expands limited→full before upload */
     if (ps->texture) SDL_DestroyTexture(ps->texture);
     {
         SDL_Colorspace cspace = (ps->vid_h >= 720)
-            ? SDL_COLORSPACE_BT709_LIMITED : SDL_COLORSPACE_BT601_LIMITED;
+            ? SDL_COLORSPACE_BT709_FULL : SDL_COLORSPACE_BT601_FULL;
 
         SDL_PropertiesID props = SDL_CreateProperties();
         SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, cspace);
@@ -427,7 +431,7 @@ int player_open(PlayerState *ps, const char *filename) {
     /* SDL3: set texture scale mode (replaces SDL_HINT_RENDER_SCALE_QUALITY) */
     SDL_SetTextureScaleMode(ps->texture, SDL_SCALEMODE_LINEAR);
     log_msg("SDL: using linear texture scaling");
-    log_msg("SDL: YUV colorspace set to %s",
+    log_msg("SDL: YUV colorspace set to %s (full range)",
         ps->vid_h >= 720 ? "BT.709" : "BT.601");
 
     /* ── Init packet queues ── */
@@ -808,33 +812,41 @@ void video_display(PlayerState *ps) {
 
     /* ── YUV420P passthrough optimization ──
      *
-     * When the source is already YUV420P (the SDL texture format), skip
-     * sws_scale entirely and upload the decoded frame directly. This
-     * avoids an expensive Lanczos + error-diffusion pass that would
-     * produce byte-identical output anyway (same format, same size).
+     * When the source is already YUV420P AND full-range (JPEG/PC levels),
+     * skip sws_scale entirely and upload the decoded frame directly.
+     *
+     * Limited-range YUV420P MUST go through sws_scale for range expansion
+     * (limited [16-235] → full [0-255]) because SDL3's GPU-side
+     * limited-range shader produces crushed blacks.
      *
      * For any other pixel format (10-bit, 4:2:2, RGB, etc.), we run
-     * the full sws_scale pipeline with Lanczos + error-diffusion
-     * dithering for reference-quality conversion. */
-    if (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P) {
-        /* Direct upload — no conversion needed */
-        SDL_UpdateYUVTexture(ps->texture, NULL,
-            ps->video_frame->data[0], ps->video_frame->linesize[0],
-            ps->video_frame->data[1], ps->video_frame->linesize[1],
-            ps->video_frame->data[2], ps->video_frame->linesize[2]);
-    } else {
-        /* Format conversion required — full quality pipeline */
-        sws_scale(ps->sws_ctx,
-            (const uint8_t *const *)ps->video_frame->data,
-            ps->video_frame->linesize,
-            0, ps->vid_h,
-            ps->rgb_frame->data,
-            ps->rgb_frame->linesize);
+     * the full sws_scale pipeline with error-diffusion dithering for
+     * reference-quality conversion. */
+    {
+        int is_yuv420p = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P);
+        int is_full_range = (ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar->color_range == AVCOL_RANGE_JPEG);
 
-        SDL_UpdateYUVTexture(ps->texture, NULL,
-            ps->rgb_frame->data[0], ps->rgb_frame->linesize[0],
-            ps->rgb_frame->data[1], ps->rgb_frame->linesize[1],
-            ps->rgb_frame->data[2], ps->rgb_frame->linesize[2]);
+        if (is_yuv420p && is_full_range) {
+            /* Full-range YUV420P — direct upload, no conversion needed */
+            SDL_UpdateYUVTexture(ps->texture, NULL,
+                ps->video_frame->data[0], ps->video_frame->linesize[0],
+                ps->video_frame->data[1], ps->video_frame->linesize[1],
+                ps->video_frame->data[2], ps->video_frame->linesize[2]);
+        } else {
+            /* Limited-range or non-YUV420P — sws_scale handles
+             * range expansion and/or format conversion */
+            sws_scale(ps->sws_ctx,
+                (const uint8_t *const *)ps->video_frame->data,
+                ps->video_frame->linesize,
+                0, ps->vid_h,
+                ps->rgb_frame->data,
+                ps->rgb_frame->linesize);
+
+            SDL_UpdateYUVTexture(ps->texture, NULL,
+                ps->rgb_frame->data[0], ps->rgb_frame->linesize[0],
+                ps->rgb_frame->data[1], ps->rgb_frame->linesize[1],
+                ps->rgb_frame->data[2], ps->rgb_frame->linesize[2]);
+        }
     }
 
     /* ── Render with correct aspect ratio ── */
@@ -993,11 +1005,17 @@ void player_build_debug_info(PlayerState *ps) {
             ps->video_codec_ctx->thread_count);
     }
     if (ps->video_codec_ctx) {
-        if (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P) {
-            off += snprintf(buf + off, sz - off, "SWS: passthrough (no conversion)\n");
+        int is_yuv420p = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P);
+        int is_full_range = (ps->fmt_ctx &&
+            ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar->color_range == AVCOL_RANGE_JPEG);
+
+        if (is_yuv420p && is_full_range) {
+            off += snprintf(buf + off, sz - off, "SWS: passthrough (full-range YUV420P)\n");
+        } else if (is_yuv420p) {
+            off += snprintf(buf + off, sz - off, "SWS: range expand (limited→full, SWS_POINT)\n");
         } else {
             off += snprintf(buf + off, sz - off,
-                "SWS: format-only (point + ED dither)\n");
+                "SWS: format convert (point + ED dither)\n");
         }
     }
 

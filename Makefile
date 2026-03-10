@@ -16,7 +16,7 @@ endif
 
 SRCS    = main.c player.c audio.c subtitle.c log.c
 OBJS    = $(SRCS:%.c=$(BUILDDIR)/%.o)
-TARGET  = dsvp
+TARGET  = $(BUILDDIR)/dsvp
 
 .PHONY: all clean debug
 
@@ -30,9 +30,10 @@ $(BUILDDIR):
 
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
+	rm -f $(OBJS)
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c $(SRCDIR)/dsvp.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -rf $(BUILDDIR)
