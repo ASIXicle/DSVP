@@ -1,64 +1,38 @@
-# DSVP Makefile
-# Targets: Windows (MinGW), Linux, macOS
+# DSVP — Dead Simple Video Player
+# Makefile for SDL3 build (v0.1.3-beta)
 
-CC       = gcc
-CFLAGS   = -Wall -Wextra -O2 -std=c11
-CFLAGS  += -D_REENTRANT
+CC      = gcc
+SRCDIR  = src
+BUILDDIR = build
 
-SRCS     = src/main.c src/player.c src/audio.c src/subtitle.c src/log.c
-TARGET   = build/dsvp
+CFLAGS  = -Wall -Wextra -O2 $(shell pkg-config --cflags sdl3 SDL3_ttf libavformat libavcodec libavutil libswscale libswresample)
+LDFLAGS = $(shell pkg-config --libs sdl3 SDL3_ttf libavformat libavcodec libavutil libswscale libswresample) -lm
 
-# --- Platform detection ---
-
-ifeq ($(OS),Windows_NT)
-    # Windows / MinGW
-    TARGET       := build/dsvp.exe
-    CFLAGS       += -I./deps/ffmpeg/include -I./deps/SDL2/include -I./deps/SDL2/include/SDL2 -I./deps/SDL2_ttf/include -I./deps/SDL2_ttf/include/SDL2
-    LDFLAGS       = -L./deps/ffmpeg/lib -L./deps/SDL2/lib -L./deps/SDL2_ttf/lib
-    LIBS          = -lmingw32 -lSDL2main -lSDL2 -lSDL2_ttf
-    LIBS         += -lavformat -lavcodec -lswscale -lswresample -lavutil
-    LIBS         += -lm -lpthread
-    # Win32 API for native file dialog
-    LIBS         += -lole32 -lcomdlg32 -luuid
-    # Hide console window for release (comment out for debug)
-    LDFLAGS      += -mwindows
-else
-    UNAME_S := $(shell uname -s)
-    ifeq ($(UNAME_S),Darwin)
-        # macOS
-        CFLAGS   += $(shell pkg-config --cflags libavformat libavcodec libswscale libswresample libavutil sdl2 SDL2_ttf)
-        LIBS      = $(shell pkg-config --libs libavformat libavcodec libswscale libswresample libavutil sdl2 SDL2_ttf)
-    else
-        # Linux
-        CFLAGS   += $(shell pkg-config --cflags libavformat libavcodec libswscale libswresample libavutil sdl2 SDL2_ttf)
-        LIBS      = $(shell pkg-config --libs libavformat libavcodec libswscale libswresample libavutil sdl2 SDL2_ttf)
-        LIBS     += -lm -lpthread
-    endif
+# If pkg-config doesn't find SDL3_ttf, try sdl3-ttf
+ifeq ($(shell pkg-config --exists SDL3_ttf 2>/dev/null && echo yes),)
+  CFLAGS  = -Wall -Wextra -O2 $(shell pkg-config --cflags sdl3 sdl3-ttf libavformat libavcodec libavutil libswscale libswresample 2>/dev/null)
+  LDFLAGS = $(shell pkg-config --libs sdl3 sdl3-ttf libavformat libavcodec libavutil libswscale libswresample 2>/dev/null) -lm
 endif
 
-# --- Build rules ---
+SRCS    = main.c player.c audio.c subtitle.c log.c
+OBJS    = $(SRCS:%.c=$(BUILDDIR)/%.o)
+TARGET  = dsvp
 
-all: dirs $(TARGET)
+.PHONY: all clean debug
 
-dirs:
-ifeq ($(OS),Windows_NT)
-	@if not exist build mkdir build
-else
-	@mkdir -p build
-endif
+all: $(BUILDDIR) $(TARGET)
 
-$(TARGET): $(SRCS) src/dsvp.h
-	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS) $(LIBS)
+debug: CFLAGS += -g -DDSVP_DEBUG
+debug: $(BUILDDIR) $(TARGET)
 
-debug: CFLAGS += -g -DDSVP_DEBUG -O0
-debug: LDFLAGS := $(filter-out -mwindows,$(LDFLAGS))
-debug: all
+$(BUILDDIR):
+	mkdir -p $(BUILDDIR)
+
+$(TARGET): $(OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+$(BUILDDIR)/%.o: $(SRCDIR)/%.c $(SRCDIR)/dsvp.h
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-ifeq ($(OS),Windows_NT)
-	@if exist build\dsvp.exe del build\dsvp.exe
-else
-	rm -f $(TARGET)
-endif
-
-.PHONY: all dirs clean debug
+	rm -f $(OBJS) $(TARGET)

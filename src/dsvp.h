@@ -26,20 +26,20 @@
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 
-/* SDL2 */
-#include <SDL2/SDL.h>
-#include <SDL2/SDL_ttf.h>
+/* SDL3 */
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
+#include <SDL3_ttf/SDL_ttf.h>
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.1.2.1"
+#define DSVP_VERSION        "0.1.3-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
 #define AUDIO_BUF_SIZE      192000  /* max decoded audio buffer bytes   */
 #define SEEK_STEP_SEC       5.0     /* arrow key seek increment         */
 #define VOLUME_STEP         0.05    /* arrow key volume increment       */
-#define SDL_AUDIO_BUFFER_SZ 1024    /* SDL audio callback buffer size   */
 
 #define MAX_SUB_STREAMS     16      /* max subtitle tracks to catalog   */
 #define MAX_AUDIO_STREAMS   16      /* max audio tracks to catalog      */
@@ -67,8 +67,8 @@ typedef struct PacketQueue {
     PacketNode  *last;
     int          nb_packets;
     int          size;          /* total byte size of queued packet data */
-    SDL_mutex   *mutex;
-    SDL_cond    *cond;
+    SDL_Mutex   *mutex;
+    SDL_Condition *cond;
     int          abort_request; /* signal threads to stop blocking      */
 } PacketQueue;
 
@@ -117,7 +117,7 @@ typedef struct PlayerState {
     SDL_Window         *window;
     SDL_Renderer       *renderer;
     SDL_Texture        *texture;
-    SDL_AudioDeviceID   audio_dev;
+    SDL_AudioStream    *audio_stream;    /* SDL3: owns the device   */
     SDL_AudioSpec       audio_spec;       /* actual device spec         */
 
     /* ── Timing / A/V sync ── */
@@ -133,7 +133,7 @@ typedef struct PlayerState {
 
     /* ── Threads ── */
     SDL_Thread         *demux_thread;
-    SDL_mutex          *seek_mutex;    /* protects codec flush vs decode  */
+    SDL_Mutex          *seek_mutex;    /* protects codec flush vs decode  */
     int                 seeking;       /* 1 = flush in progress, skip decode */
 
     /* ── Playback state ── */
@@ -218,7 +218,8 @@ void  player_update_display_rect(PlayerState *ps);
 
 int   audio_open(PlayerState *ps);
 void  audio_close(PlayerState *ps);
-void  audio_callback(void *userdata, Uint8 *stream, int len);
+void  SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
+                              int additional_amount, int total_amount);
 int   audio_decode_frame(PlayerState *ps);
 void  audio_find_streams(PlayerState *ps);
 void  audio_cycle(PlayerState *ps);
@@ -244,6 +245,11 @@ void  log_msg(const char *fmt, ...);
 
 static inline double get_time_sec(void) {
     return (double)av_gettime_relative() / 1000000.0;
+}
+
+/* SDL3 render functions use SDL_FRect. Convert from our int rects. */
+static inline SDL_FRect rect_to_frect(const SDL_Rect *r) {
+    return (SDL_FRect){ (float)r->x, (float)r->y, (float)r->w, (float)r->h };
 }
 
 #endif /* DSVP_H */

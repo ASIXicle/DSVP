@@ -25,13 +25,13 @@
 void pq_init(PacketQueue *q) {
     memset(q, 0, sizeof(PacketQueue));
     q->mutex = SDL_CreateMutex();
-    q->cond  = SDL_CreateCond();
+    q->cond  = SDL_CreateCondition();
 }
 
 void pq_destroy(PacketQueue *q) {
     pq_flush(q);
     if (q->mutex) SDL_DestroyMutex(q->mutex);
-    if (q->cond)  SDL_DestroyCond(q->cond);
+    if (q->cond)  SDL_DestroyCondition(q->cond);
 }
 
 /* Push a packet onto the queue. Caller still owns pkt after this call
@@ -59,7 +59,7 @@ int pq_put(PacketQueue *q, AVPacket *pkt) {
     q->nb_packets++;
     q->size += node->pkt->size;
 
-    SDL_CondSignal(q->cond);
+    SDL_SignalCondition(q->cond);
     SDL_UnlockMutex(q->mutex);
     return 0;
 }
@@ -93,7 +93,7 @@ int pq_get(PacketQueue *q, AVPacket *pkt, int block) {
             ret = 0;
             break;
         } else {
-            SDL_CondWait(q->cond, q->mutex);
+            SDL_WaitCondition(q->cond, q->mutex);
         }
     }
     SDL_UnlockMutex(q->mutex);
@@ -371,10 +371,10 @@ int player_open(PlayerState *ps, const char *filename) {
     /* ── Resize window to video dimensions ── */
     {
         /* Cap to 80% of screen, maintain aspect ratio */
-        SDL_DisplayMode dm;
-        SDL_GetCurrentDisplayMode(0, &dm);
-        int max_w = (int)(dm.w * 0.8);
-        int max_h = (int)(dm.h * 0.8);
+        const SDL_DisplayMode *dm = SDL_GetCurrentDisplayMode(
+            SDL_GetPrimaryDisplay());
+        int max_w = dm ? (int)(dm->w * 0.8) : 1920;
+        int max_h = dm ? (int)(dm->h * 0.8) : 1080;
 
         int w = ps->vid_w;
         int h = ps->vid_h;
@@ -403,41 +403,32 @@ int player_open(PlayerState *ps, const char *filename) {
 
     /* ── Create SDL texture for video ── */
 
-    /* Set texture scaling quality — applies to the NEXT texture created.
-     * "2" = anisotropic (best), "1" = bilinear (good fallback).
-     * This controls how SDL scales the texture when the display rect
-     * differs from the native video resolution (window resize, fullscreen).
-     * Without this, SDL defaults to nearest-neighbor (blocky). */
-    if (!SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "2")) {
-        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
-        log_msg("SDL: using bilinear texture scaling (anisotropic unavailable)");
-    } else {
-        log_msg("SDL: using anisotropic texture scaling");
-    }
-
-    /* Set YUV→RGB conversion matrix based on resolution.
-     * BT.601 is the SD standard (< 720p), BT.709 is HD (≥ 720p).
-     * SDL defaults to BT.601, which produces subtly wrong colors on HD. */
-    if (ps->vid_h >= 720) {
-        SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT709);
-        log_msg("SDL: YUV conversion set to BT.709 (HD)");
-    } else {
-        SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT601);
-        log_msg("SDL: YUV conversion set to BT.601 (SD)");
-    }
-
+       /* ── Create video texture with correct colorspace ── */
     if (ps->texture) SDL_DestroyTexture(ps->texture);
-    ps->texture = SDL_CreateTexture(
-        ps->renderer,
-        SDL_PIXELFORMAT_IYUV,         /* = YUV420P */
-        SDL_TEXTUREACCESS_STREAMING,
-        ps->vid_w, ps->vid_h
-    );
+    {
+        SDL_Colorspace cspace = (ps->vid_h >= 720)
+            ? SDL_COLORSPACE_BT709_LIMITED : SDL_COLORSPACE_BT601_LIMITED;
+
+        SDL_PropertiesID props = SDL_CreateProperties();
+        SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_COLORSPACE_NUMBER, cspace);
+        SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, SDL_PIXELFORMAT_IYUV);
+        SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STREAMING);
+        SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, ps->vid_w);
+        SDL_SetNumberProperty(props, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, ps->vid_h);
+        ps->texture = SDL_CreateTextureWithProperties(ps->renderer, props);
+        SDL_DestroyProperties(props);
+    }
     if (!ps->texture) {
         fprintf(stderr, "[DSVP] Cannot create texture: %s\n", SDL_GetError());
         player_close(ps);
         return -1;
     }
+
+    /* SDL3: set texture scale mode (replaces SDL_HINT_RENDER_SCALE_QUALITY) */
+    SDL_SetTextureScaleMode(ps->texture, SDL_SCALEMODE_LINEAR);
+    log_msg("SDL: using linear texture scaling");
+    log_msg("SDL: YUV colorspace set to %s",
+        ps->vid_h >= 720 ? "BT.709" : "BT.601");
 
     /* ── Init packet queues ── */
     pq_init(&ps->video_pq);
@@ -512,8 +503,8 @@ void player_close(PlayerState *ps) {
     /* Signal queues to unblock any waiting threads */
     ps->video_pq.abort_request = 1;
     ps->audio_pq.abort_request = 1;
-    SDL_CondSignal(ps->video_pq.cond);
-    SDL_CondSignal(ps->audio_pq.cond);
+    SDL_SignalCondition(ps->video_pq.cond);
+    SDL_SignalCondition(ps->audio_pq.cond);
 
     /* Wait for demux thread */
     if (ps->demux_thread) {
@@ -619,8 +610,8 @@ int demux_thread_func(void *arg) {
             ps->seeking = 1;
 
             /* Pause audio device so callback can't touch audio codec */
-            if (ps->audio_dev)
-                SDL_PauseAudioDevice(ps->audio_dev, 1);
+            if (ps->audio_stream)
+                SDL_PauseAudioStreamDevice(ps->audio_stream);
 
             int ret = av_seek_frame(ps->fmt_ctx, -1, target, ps->seek_flags);
             if (ret < 0) {
@@ -670,8 +661,8 @@ int demux_thread_func(void *arg) {
             ps->seek_recovering = 1;
 
             /* Resume audio playback */
-            if (ps->audio_dev && !ps->paused)
-                SDL_PauseAudioDevice(ps->audio_dev, 0);
+            if (ps->audio_stream && !ps->paused)
+                SDL_ResumeAudioStreamDevice(ps->audio_stream);
 
             log_msg("Demux: seek complete");
         }
@@ -738,7 +729,7 @@ int video_decode_frame(PlayerState *ps) {
     if (ps->seeking) return 0;
 
     /* Lock to prevent demux thread from flushing codecs mid-decode */
-    if (SDL_TryLockMutex(ps->seek_mutex) != 0) {
+    if (!SDL_TryLockMutex(ps->seek_mutex)) {
         return 0; /* mutex held by seek — skip this frame */
     }
 
@@ -746,18 +737,12 @@ int video_decode_frame(PlayerState *ps) {
         /* Try to receive a decoded frame first (may have buffered frames) */
         ret = avcodec_receive_frame(ps->video_codec_ctx, ps->video_frame);
         if (ret == 0) {
-            /* Got a frame — compute its PTS in seconds.
-             * Prefer best_effort_timestamp: FFmpeg computes this from
-             * DTS/PTS/codec delay, handling B-frame reorder and codecs
-             * that don't set frame->pts (VC-1, some MPEG-2, etc.). */
+            /* Got a frame — compute its PTS in seconds */
             AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
             double pts = 0.0;
 
-            int64_t frame_pts = ps->video_frame->best_effort_timestamp;
-            if (frame_pts == AV_NOPTS_VALUE)
-                frame_pts = ps->video_frame->pts;
-            if (frame_pts != AV_NOPTS_VALUE) {
-                pts = (double)frame_pts * av_q2d(vs->time_base);
+            if (ps->video_frame->pts != AV_NOPTS_VALUE) {
+                pts = (double)ps->video_frame->pts * av_q2d(vs->time_base);
             }
             ps->video_clock = pts;
             SDL_UnlockMutex(ps->seek_mutex);
@@ -856,7 +841,8 @@ void video_display(PlayerState *ps) {
     SDL_SetRenderDrawColor(ps->renderer, 0, 0, 0, 255);
     SDL_RenderClear(ps->renderer);
     player_update_display_rect(ps);
-    SDL_RenderCopy(ps->renderer, ps->texture, NULL, &ps->display_rect);
+    SDL_FRect dr = rect_to_frect(&ps->display_rect);
+    SDL_RenderTexture(ps->renderer, ps->texture, NULL, &dr);
     /* Note: overlays are drawn on top in main.c before RenderPresent */
 }
 

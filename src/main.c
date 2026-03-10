@@ -228,7 +228,7 @@ static void draw_char(SDL_Renderer *r, int x, int y, char ch, int scale) {
         uint8_t bits = font_5x7[idx][row];
         for (int col = 0; col < 5; col++) {
             if (bits & (1 << (4 - col))) {
-                SDL_Rect px = { x + col * scale, y + row * scale, scale, scale };
+                SDL_FRect px = { (float)(x + col * scale), (float)(y + row * scale), (float)scale, (float)scale };
                 SDL_RenderFillRect(r, &px);
             }
         }
@@ -272,7 +272,7 @@ static void draw_overlay(SDL_Renderer *renderer, const char *text,
     /* Background */
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 180);
-    SDL_Rect bg = { x - pad, y - pad, box_w, box_h };
+    SDL_FRect bg = { (float)(x - pad), (float)(y - pad), (float)box_w, (float)box_h };
     SDL_RenderFillRect(renderer, &bg);
 
     /* Text */
@@ -309,12 +309,12 @@ static void draw_seek_bar(PlayerState *ps) {
 
     /* Track background */
     SDL_SetRenderDrawColor(ps->renderer, 100, 100, 100, 150);
-    SDL_Rect track = { bar_x, bar_y, bar_w, bar_h };
+    SDL_FRect track = { (float)bar_x, (float)bar_y, (float)bar_w, (float)bar_h };
     SDL_RenderFillRect(ps->renderer, &track);
 
     /* Filled portion */
     SDL_SetRenderDrawColor(ps->renderer, 200, 200, 200, 220);
-    SDL_Rect filled = { bar_x, bar_y, (int)(bar_w * frac), bar_h };
+    SDL_FRect filled = { (float)bar_x, (float)bar_y, (float)(bar_w * frac), (float)bar_h };
     SDL_RenderFillRect(ps->renderer, &filled);
 
     /* Time text */
@@ -394,7 +394,7 @@ static void draw_menu(PlayerState *ps, MenuState *menu) {
     /* Menu bar background */
     SDL_SetRenderDrawBlendMode(ps->renderer, SDL_BLENDMODE_BLEND);
     SDL_SetRenderDrawColor(ps->renderer, 30, 30, 34, 220);
-    SDL_Rect bar = { 0, 0, w, 32 };
+    SDL_FRect bar = { 0.0f, 0.0f, (float)w, 32.0f };
     SDL_RenderFillRect(ps->renderer, &bar);
 
     /* Menu items */
@@ -414,7 +414,7 @@ int main(int argc, char *argv[]) {
     log_msg("Starting DSVP (argc=%d)", argc);
 
     /* ── Initialize SDL ── */
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER) < 0) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
         fprintf(stderr, "[DSVP] SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
@@ -430,9 +430,8 @@ int main(int argc, char *argv[]) {
     /* ── Create window ── */
     SDL_Window *window = SDL_CreateWindow(
         DSVP_WINDOW_TITLE,
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         DEFAULT_WIN_W, DEFAULT_WIN_H,
-        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY
     );
     if (!window) {
         fprintf(stderr, "[DSVP] Cannot create window: %s\n", SDL_GetError());
@@ -441,30 +440,18 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Create renderer ──
-     * GPU-accelerated compositing: the GPU handles texture upload and
-     * blitting only — all decode and pixel processing stays on the CPU.
-     * This produces identical output to software compositing but frees
-     * the CPU from having to composite 1920×1080 frames every tick.
-     * Falls back to software renderer if no GPU is available. */
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (!renderer) {
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-    }
-    if (!renderer) {
-        log_msg("WARNING: No GPU renderer available, falling back to software");
-        renderer = SDL_CreateRenderer(window, -1,
-            SDL_RENDERER_SOFTWARE | SDL_RENDERER_PRESENTVSYNC);
-    }
-    if (!renderer) {
-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-    }
+     * SDL3: no flags parameter. GPU acceleration is the default.
+     * VSync is set separately via SDL_SetRenderVSync(). */
+    SDL_Renderer *renderer = SDL_CreateRenderer(window, NULL);
     if (!renderer) {
         fprintf(stderr, "[DSVP] Cannot create renderer: %s\n", SDL_GetError());
         SDL_DestroyWindow(window);
         SDL_Quit();
         return 1;
     }
+
+    /* Enable VSync — SDL3 manages the fallback chain internally */
+    SDL_SetRenderVSync(renderer, 1);
 
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
 
@@ -507,15 +494,15 @@ int main(int argc, char *argv[]) {
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
 
-            case SDL_QUIT:
+            case SDL_EVENT_QUIT:
                 if (ps.playing) player_close(&ps);
                 ps.quit = 1;
                 break;
 
-            case SDL_KEYDOWN:
-                switch (ev.key.keysym.sym) {
+            case SDL_EVENT_KEY_DOWN:
+                switch (ev.key.key) {
 
-                case SDLK_q:
+                case SDLK_Q:
                     if (ps.playing) {
                         player_close(&ps);
                         ps.quit = 0; /* don't exit, return to idle */
@@ -524,7 +511,7 @@ int main(int argc, char *argv[]) {
                     }
                     break;
 
-                case SDLK_o: {
+                case SDLK_O: {
                     char path[1024] = {0};
                     log_msg("File open dialog requested");
                     if (open_file_dialog(path, sizeof(path))) {
@@ -546,8 +533,11 @@ int main(int argc, char *argv[]) {
                 case SDLK_SPACE:
                     if (ps.playing) {
                         ps.paused = !ps.paused;
-                        if (ps.audio_dev) {
-                            SDL_PauseAudioDevice(ps.audio_dev, ps.paused);
+                        if (ps.audio_stream) {
+                            if (ps.paused)
+                                SDL_PauseAudioStreamDevice(ps.audio_stream);
+                            else
+                                SDL_ResumeAudioStreamDevice(ps.audio_stream);
                         }
                         if (!ps.paused) {
                             ps.frame_timer = get_time_sec();
@@ -557,27 +547,27 @@ int main(int argc, char *argv[]) {
                     }
                     break;
 
-                case SDLK_f:
+                case SDLK_F:
                     ps.fullscreen = !ps.fullscreen;
                     SDL_SetWindowFullscreen(window,
-                        ps.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                        ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
                     break;
 
-                case SDLK_d:
+                case SDLK_D:
                     ps.show_debug = !ps.show_debug;
                     break;
 
-                case SDLK_i:
+                case SDLK_I:
                     ps.show_info = !ps.show_info;
                     break;
 
-                case SDLK_s:
+                case SDLK_S:
                     sub_cycle(&ps);
                     show_overlays = 1;
                     overlay_hide_time = get_time_sec() + overlay_timeout;
                     break;
 
-                case SDLK_a:
+                case SDLK_A:
                     audio_cycle(&ps);
                     show_overlays = 1;
                     overlay_hide_time = get_time_sec() + overlay_timeout;
@@ -598,6 +588,8 @@ int main(int argc, char *argv[]) {
                 case SDLK_UP:
                     ps.volume += VOLUME_STEP;
                     if (ps.volume > 1.0) ps.volume = 1.0;
+                    if (ps.audio_stream)
+                        SDL_SetAudioStreamGain(ps.audio_stream, ps.volume);
                     show_overlays = 1;
                     overlay_hide_time = get_time_sec() + overlay_timeout;
                     break;
@@ -605,6 +597,8 @@ int main(int argc, char *argv[]) {
                 case SDLK_DOWN:
                     ps.volume -= VOLUME_STEP;
                     if (ps.volume < 0.0) ps.volume = 0.0;
+                    if (ps.audio_stream)
+                        SDL_SetAudioStreamGain(ps.audio_stream, ps.volume);
                     show_overlays = 1;
                     overlay_hide_time = get_time_sec() + overlay_timeout;
                     break;
@@ -614,12 +608,12 @@ int main(int argc, char *argv[]) {
                 }
                 break;
 
-            case SDL_MOUSEBUTTONDOWN:
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
                 if (ev.button.button == SDL_BUTTON_LEFT && ev.button.clicks == 2) {
                     /* Double-click → toggle fullscreen */
                     ps.fullscreen = !ps.fullscreen;
                     SDL_SetWindowFullscreen(window,
-                        ps.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                        ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
                 }
 
                 /* Click on seek bar to seek */
@@ -639,18 +633,16 @@ int main(int argc, char *argv[]) {
                 }
                 break;
 
-            case SDL_MOUSEMOTION:
+            case SDL_EVENT_MOUSE_MOTION:
                 /* Show overlays on any mouse movement */
                 show_overlays = 1;
                 overlay_hide_time = get_time_sec() + overlay_timeout;
-                SDL_ShowCursor(SDL_ENABLE);
+                SDL_ShowCursor();
                 break;
 
-            case SDL_WINDOWEVENT:
-                if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+            case SDL_EVENT_WINDOW_RESIZED:
                     ps.win_w = ev.window.data1;
                     ps.win_h = ev.window.data2;
-                }
                 break;
             }
         }
@@ -854,7 +846,7 @@ int main(int argc, char *argv[]) {
                 SDL_SetRenderDrawColor(ps.renderer, 0, 0, 0, 255);
                 SDL_RenderClear(ps.renderer);
                 player_update_display_rect(&ps);
-                SDL_RenderCopy(ps.renderer, ps.texture, NULL, &ps.display_rect);
+                {SDL_FRect _dr = rect_to_frect(&ps.display_rect); SDL_RenderTexture(ps.renderer, ps.texture, NULL, &_dr);}
             }
 
             /* If VSync is unavailable (SDL_RenderPresent returns
@@ -870,12 +862,12 @@ int main(int argc, char *argv[]) {
                 SDL_SetRenderDrawColor(ps.renderer, 0, 0, 0, 255);
                 SDL_RenderClear(ps.renderer);
                 player_update_display_rect(&ps);
-                SDL_RenderCopy(ps.renderer, ps.texture, NULL, &ps.display_rect);
+                {SDL_FRect _dr = rect_to_frect(&ps.display_rect); SDL_RenderTexture(ps.renderer, ps.texture, NULL, &_dr);}
             }
         } else {
             /* No media loaded — draw idle screen */
             draw_idle_screen(&ps);
-            SDL_ShowCursor(SDL_ENABLE);
+            SDL_ShowCursor();
         }
 
         /* ── Draw overlays ── */
@@ -885,7 +877,7 @@ int main(int argc, char *argv[]) {
             /* Auto-hide timer check */
             if (show_overlays && get_time_sec() > overlay_hide_time) {
                 show_overlays = 0;
-                SDL_ShowCursor(SDL_DISABLE);
+                SDL_HideCursor();
             }
 
             /* Seek bar + menu bar (unified visibility) */

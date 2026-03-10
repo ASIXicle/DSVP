@@ -68,8 +68,8 @@ static const char *find_system_font(void) {
 int sub_init_font(void) {
     if (font_loaded) return 0;
 
-    if (TTF_Init() < 0) {
-        log_msg("ERROR: TTF_Init failed: %s", TTF_GetError());
+    if (!TTF_Init()) {
+        log_msg("ERROR: TTF_Init failed: %s", SDL_GetError());
         return -1;
     }
 
@@ -86,7 +86,7 @@ int sub_init_font(void) {
 
     sub_font = TTF_OpenFont(font_path, font_size);
     if (!sub_font) {
-        log_msg("ERROR: Cannot open font %s: %s", font_path, TTF_GetError());
+        log_msg("ERROR: Cannot open font %s: %s", font_path, SDL_GetError());
         TTF_Quit();
         return -1;
     }
@@ -484,29 +484,29 @@ static void render_text_outlined(SDL_Renderer *renderer, TTF_Font *font,
     if (!text || !text[0]) return;
 
     if (outline_font) {
-        SDL_Surface *outline_surf = TTF_RenderUTF8_Blended(outline_font, text, outline_col);
+        SDL_Surface *outline_surf = TTF_RenderText_Blended(outline_font, text, 0, outline_col);
         if (outline_surf) {
             SDL_Texture *outline_tex = SDL_CreateTextureFromSurface(renderer, outline_surf);
             if (outline_tex) {
                 int outline_offset = TTF_GetFontOutline(outline_font);
                 SDL_Rect dst = { x - outline_offset, y - outline_offset,
                                  outline_surf->w, outline_surf->h };
-                SDL_RenderCopy(renderer, outline_tex, NULL, &dst);
+                {SDL_FRect _fdst = rect_to_frect(&dst); SDL_RenderTexture(renderer, outline_tex, NULL, &_fdst);}
                 SDL_DestroyTexture(outline_tex);
             }
-            SDL_FreeSurface(outline_surf);
+            SDL_DestroySurface(outline_surf);
         }
     }
 
-    SDL_Surface *text_surf = TTF_RenderUTF8_Blended(font, text, fg);
+    SDL_Surface *text_surf = TTF_RenderText_Blended(font, text, 0, fg);
     if (text_surf) {
         SDL_Texture *text_tex = SDL_CreateTextureFromSurface(renderer, text_surf);
         if (text_tex) {
             SDL_Rect dst = { x, y, text_surf->w, text_surf->h };
-            SDL_RenderCopy(renderer, text_tex, NULL, &dst);
+            {SDL_FRect _fdst = rect_to_frect(&dst); SDL_RenderTexture(renderer, text_tex, NULL, &_fdst);}
             SDL_DestroyTexture(text_tex);
         }
-        SDL_FreeSurface(text_surf);
+        SDL_DestroySurface(text_surf);
     }
 }
 
@@ -542,7 +542,7 @@ void sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h) {
                         (int)(ps->sub_bitmap_rects[i].w * sx),
                         (int)(ps->sub_bitmap_rects[i].h * sy)
                     };
-                    SDL_RenderCopy(renderer, ps->sub_bitmaps[i], NULL, &dst);
+                    {SDL_FRect _fdst = rect_to_frect(&dst); SDL_RenderTexture(renderer, ps->sub_bitmaps[i], NULL, &_fdst);}
                 }
             } else if (!ps->sub_is_bitmap && ps->sub_text[0]) {
                 /* ── Text subtitle: render with SDL_ttf ── */
@@ -568,13 +568,13 @@ void sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h) {
                     if (sub_font_outline)
                         TTF_SetFontSize(sub_font_outline, font_size);
 
-                    int line_height = TTF_FontLineSkip(sub_font);
+                    int line_height = TTF_GetFontLineSkip(sub_font);
                     int total_height = nlines * line_height;
                     int y_base = win_h - 60 - total_height;
 
                     for (int i = 0; i < nlines; i++) {
                         int tw = 0, th = 0;
-                        TTF_SizeUTF8(sub_font, lines[i], &tw, &th);
+                        TTF_GetStringSize(sub_font, lines[i], 0, &tw, &th);
                         int x = (win_w - tw) / 2;
                         int y = y_base + i * line_height;
 
@@ -621,7 +621,7 @@ void sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h) {
             TTF_SetFontSize(sub_font_outline, font_size);
 
         int tw = 0, th = 0;
-        TTF_SizeUTF8(sub_font, osd_text, &tw, &th);
+        TTF_GetStringSize(sub_font, osd_text, 0, &tw, &th);
         int x = (win_w - tw) / 2;
         int y = 30;
 
