@@ -741,12 +741,17 @@ int video_decode_frame(PlayerState *ps) {
         /* Try to receive a decoded frame first (may have buffered frames) */
         ret = avcodec_receive_frame(ps->video_codec_ctx, ps->video_frame);
         if (ret == 0) {
-            /* Got a frame — compute its PTS in seconds */
+            /* Got a frame — compute its PTS in seconds.
+             * best_effort_timestamp is preferred: FFmpeg computes it
+             * from DTS/packet timing even when the codec doesn't set
+             * frame->pts (required for VC-1, some MPEG-2, etc.). */
             AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
             double pts = 0.0;
-
-            if (ps->video_frame->pts != AV_NOPTS_VALUE) {
-                pts = (double)ps->video_frame->pts * av_q2d(vs->time_base);
+            int64_t frame_pts = ps->video_frame->best_effort_timestamp;
+            if (frame_pts == AV_NOPTS_VALUE)
+                frame_pts = ps->video_frame->pts;
+            if (frame_pts != AV_NOPTS_VALUE) {
+                pts = (double)frame_pts * av_q2d(vs->time_base);
             }
             ps->video_clock = pts;
             SDL_UnlockMutex(ps->seek_mutex);
