@@ -329,7 +329,7 @@ int player_open(PlayerState *ps, const char *filename) {
                 sws_getCoefficients(dst_cs), dst_range,
                 brightness, contrast, saturation);
 
-            log_msg("swscale: colorspace=%s range=%s→full",
+            log_msg("swscale: colorspace=%s range=%s->full",
                 (src_cs == SWS_CS_ITU709) ? "BT.709" : "BT.601",
                 src_range ? "full" : "limited");
         }
@@ -933,15 +933,41 @@ void player_build_media_info(PlayerState *ps) {
                 par->bit_rate / 1000);
         }
 
-        /* Color info */
-        off += snprintf(buf + off, sz - off, "Color Space: %s\n",
-            av_color_space_name(par->color_space));
-        off += snprintf(buf + off, sz - off, "Color Range: %s\n",
-            av_color_range_name(par->color_range));
-        off += snprintf(buf + off, sz - off, "Color Primaries: %s\n",
-            av_color_primaries_name(par->color_primaries));
-        off += snprintf(buf + off, sz - off, "Color TRC: %s\n",
-            av_color_transfer_name(par->color_trc));
+        /* Color info — show tagged values, or infer with "(assumed)" */
+        {
+            int is_hd = (par->height >= 720);
+
+            if (par->color_space != AVCOL_SPC_UNSPECIFIED) {
+                off += snprintf(buf + off, sz - off, "Color Space: %s\n",
+                    av_color_space_name(par->color_space));
+            } else {
+                off += snprintf(buf + off, sz - off, "Color Space: %s (assumed)\n",
+                    is_hd ? "bt709" : "bt601");
+            }
+
+            if (par->color_range != AVCOL_RANGE_UNSPECIFIED) {
+                off += snprintf(buf + off, sz - off, "Color Range: %s\n",
+                    av_color_range_name(par->color_range));
+            } else {
+                off += snprintf(buf + off, sz - off, "Color Range: tv (assumed)\n");
+            }
+
+            if (par->color_primaries != AVCOL_PRI_UNSPECIFIED) {
+                off += snprintf(buf + off, sz - off, "Color Primaries: %s\n",
+                    av_color_primaries_name(par->color_primaries));
+            } else {
+                off += snprintf(buf + off, sz - off, "Color Primaries: %s (assumed)\n",
+                    is_hd ? "bt709" : "bt601");
+            }
+
+            if (par->color_trc != AVCOL_TRC_UNSPECIFIED) {
+                off += snprintf(buf + off, sz - off, "Color TRC: %s\n",
+                    av_color_transfer_name(par->color_trc));
+            } else {
+                off += snprintf(buf + off, sz - off, "Color TRC: %s (assumed)\n",
+                    is_hd ? "bt709" : "bt601");
+            }
+        }
     }
 
     /* Audio stream info */
@@ -1012,10 +1038,10 @@ void player_build_debug_info(PlayerState *ps) {
         if (is_yuv420p && is_full_range) {
             off += snprintf(buf + off, sz - off, "SWS: passthrough (full-range YUV420P)\n");
         } else if (is_yuv420p) {
-            off += snprintf(buf + off, sz - off, "SWS: range expand (limited→full, SWS_POINT)\n");
+            off += snprintf(buf + off, sz - off, "SWS: limited->full expand (SWS_POINT)\n");
         } else {
             off += snprintf(buf + off, sz - off,
-                "SWS: format convert (point + ED dither)\n");
+                "SWS: format convert (SWS_POINT + ED dither)\n");
         }
     }
 

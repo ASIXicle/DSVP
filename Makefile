@@ -16,7 +16,14 @@ endif
 
 SRCS    = main.c player.c audio.c subtitle.c log.c
 OBJS    = $(SRCS:%.c=$(BUILDDIR)/%.o)
-TARGET  = $(BUILDDIR)/dsvp
+
+# Windows: append .exe, locate SDL3 DLLs via pkg-config
+ifeq ($(OS),Windows_NT)
+  TARGET   = $(BUILDDIR)/dsvp.exe
+  SDL3_BIN = $(shell pkg-config --variable=prefix sdl3)/bin
+else
+  TARGET   = $(BUILDDIR)/dsvp
+endif
 
 .PHONY: all clean debug
 
@@ -31,6 +38,10 @@ $(BUILDDIR):
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 	rm -f $(OBJS)
+ifeq ($(OS),Windows_NT)
+	cp -u $(SDL3_BIN)/SDL3.dll $(BUILDDIR)/
+	cp -u $(SDL3_BIN)/SDL3_ttf.dll $(BUILDDIR)/
+endif
 
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c $(SRCDIR)/dsvp.h
 	$(CC) $(CFLAGS) -c -o $@ $<

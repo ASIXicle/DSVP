@@ -514,6 +514,10 @@ int main(int argc, char *argv[]) {
                 case SDLK_O: {
                     char path[1024] = {0};
                     log_msg("File open dialog requested");
+                    /* Pause audio while dialog blocks the render loop */
+                    int was_playing = ps.playing && !ps.paused;
+                    if (was_playing && ps.audio_stream)
+                        SDL_PauseAudioStreamDevice(ps.audio_stream);
                     if (open_file_dialog(path, sizeof(path))) {
                         log_msg("Opening file: %s", path);
                         if (ps.playing) player_close(&ps);
@@ -526,6 +530,11 @@ int main(int argc, char *argv[]) {
                         }
                     } else {
                         log_msg("File dialog cancelled");
+                        /* Resume audio and resync frame timer */
+                        if (was_playing && ps.audio_stream) {
+                            ps.frame_timer = get_time_sec();
+                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                        }
                     }
                     break;
                 }
@@ -548,9 +557,17 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDLK_F:
+                    /* Pause audio during mode switch to prevent drift */
+                    if (ps.playing && !ps.paused && ps.audio_stream)
+                        SDL_PauseAudioStreamDevice(ps.audio_stream);
                     ps.fullscreen = !ps.fullscreen;
                     SDL_SetWindowFullscreen(window,
                         ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
+                    if (ps.playing) {
+                        ps.frame_timer = get_time_sec();
+                        if (!ps.paused && ps.audio_stream)
+                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                    }
                     break;
 
                 case SDLK_D:
@@ -611,9 +628,16 @@ int main(int argc, char *argv[]) {
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
                 if (ev.button.button == SDL_BUTTON_LEFT && ev.button.clicks == 2) {
                     /* Double-click → toggle fullscreen */
+                    if (ps.playing && !ps.paused && ps.audio_stream)
+                        SDL_PauseAudioStreamDevice(ps.audio_stream);
                     ps.fullscreen = !ps.fullscreen;
                     SDL_SetWindowFullscreen(window,
                         ps.fullscreen ? SDL_WINDOW_FULLSCREEN : 0);
+                    if (ps.playing) {
+                        ps.frame_timer = get_time_sec();
+                        if (!ps.paused && ps.audio_stream)
+                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                    }
                 }
 
                 /* Click on seek bar to seek */
