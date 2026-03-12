@@ -452,14 +452,12 @@ int main(int argc, char *argv[]) {
              * video_reblit() re-draws the last frame without uploading. */
             double now = get_time_sec();
             int new_frame = 0;
-            int decoded_any = 0;
             int decoded_this_tick = 0;
 
             int max_catchup = 4;
             while (now >= ps.frame_timer && max_catchup-- > 0) {
                 int vret = video_decode_frame(&ps);
                 if (vret > 0) {
-                    decoded_any = 1;
                     decoded_this_tick++;
                     ps.diag_frames_decoded++;
 
@@ -567,10 +565,7 @@ int main(int argc, char *argv[]) {
                 video_reblit(&ps);
             }
 
-            /* Yield when VSync is unavailable and nothing was decoded */
-            if (!decoded_any) {
-                SDL_Delay(1);
-            }
+
         } else if (ps.playing && ps.paused) {
             /* Paused — decode pending subs, redraw current frame */
             sub_decode_pending(&ps);
