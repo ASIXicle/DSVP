@@ -86,7 +86,9 @@ typedef struct GPUUniforms {
     float colorMatrix[16];  /* 4×4 YUV→RGB matrix (row-major)   64 bytes */
     float rangeY[2];        /* { offset, scale } for Y plane      8 bytes */
     float rangeUV[2];       /* { offset, scale } for UV planes    8 bytes */
-} GPUUniforms;              /*                                   80 bytes */
+    float texSizeY[2];      /* { width, height } of Y texture     8 bytes */
+    float texSizeUV[2];     /* { width, height } of UV textures   8 bytes */
+} GPUUniforms;              /*                                   96 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *
@@ -139,6 +141,7 @@ typedef struct PlayerState {
     SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv;   /* planar YUV420P   */
     SDL_GPUGraphicsPipeline    *gpu_pipeline_nv12;  /* NV12 / P010      */
     SDL_GPUSampler             *gpu_sampler;         /* linear filtering */
+    SDL_GPUSampler             *gpu_sampler_nearest; /* nearest for overlay */
 
     /* ── SDL_GPU handles (lifetime: per-file, created/destroyed in player_open/close) ── */
     SDL_GPUTexture             *gpu_tex_y;           /* Y plane          */
@@ -186,6 +189,7 @@ typedef struct PlayerState {
     int                 win_w, win_h;     /* current window size        */
     int                 vid_w, vid_h;     /* video native resolution    */
     SDL_Rect            display_rect;     /* letterboxed video area     */
+    int                 sc_w, sc_h;       /* last swapchain dims (physical pixels) */
 
     /* ── Overlay visibility state ── */
     int                 show_debug;

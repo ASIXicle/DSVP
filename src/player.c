@@ -56,8 +56,19 @@ static const char hlsl_fullscreen_vert[] =
     "    return o;\n"
     "}\n";
 
-/* Planar YUV420P fragment shader — 3 separate R8 planes (Y, U, V).
- * Used for all 8-bit content after swscale conversion. */
+/* Planar YUV420P fragment shader — Lanczos-2 luma, Catmull-Rom chroma, ordered dither.
+ *
+ * Luma (Y): Lanczos-2 windowed sinc, 4×4 texel kernel (16 taps).
+ *           Preserves sharp detail during downscaling.
+ *
+ * Chroma (U, V): Catmull-Rom bicubic, 4×4 texel kernel (16 taps).
+ *           Smoother than Lanczos without ringing at chroma block
+ *           boundaries. Standard for chroma in quality video players.
+ *
+ * Output: Interleaved gradient noise dither (±0.5 LSB) before 8-bit
+ *         quantization. Breaks up banding in smooth gradients.
+ *
+ * SampleLevel(s, uv, 0) forces mip level 0. */
 static const char hlsl_yuv_planar_frag[] =
     "Texture2D<float> texY : register(t0, space2);\n"
     "Texture2D<float> texU : register(t1, space2);\n"
@@ -70,19 +81,104 @@ static const char hlsl_yuv_planar_frag[] =
     "    row_major float4x4 colorMatrix;\n"
     "    float2 rangeY;\n"
     "    float2 rangeUV;\n"
+    "    float2 texSizeY;\n"
+    "    float2 texSizeUV;\n"
     "};\n"
     "\n"
-    "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
-    "    float y  = texY.Sample(sampY, uv).r;\n"
-    "    float cb = texU.Sample(sampU, uv).r;\n"
-    "    float cr = texV.Sample(sampV, uv).r;\n"
+    "#define PI 3.14159265358979\n"
+    "\n"
+    "float lanczos2(float x) {\n"
+    "    x = abs(x);\n"
+    "    if (x < 1e-6) return 1.0;\n"
+    "    if (x >= 2.0) return 0.0;\n"
+    "    float pix = PI * x;\n"
+    "    return (sin(pix) * sin(pix * 0.5)) / (pix * pix * 0.5);\n"
+    "}\n"
+    "\n"
+    "float sample_lanczos(Texture2D<float> tex, SamplerState samp,\n"
+    "                     float2 uv, float2 tex_size) {\n"
+    "    float2 pos  = uv * tex_size - 0.5;\n"
+    "    float2 base = floor(pos);\n"
+    "    float2 f    = pos - base;\n"
+    "\n"
+    "    float result = 0.0;\n"
+    "    float wsum   = 0.0;\n"
+    "\n"
+    "    [unroll] for (int j = -1; j <= 2; j++) {\n"
+    "        float wy = lanczos2(float(j) - f.y);\n"
+    "        [unroll] for (int i = -1; i <= 2; i++) {\n"
+    "            float wx = lanczos2(float(i) - f.x);\n"
+    "            float w  = wx * wy;\n"
+    "            float2 tc = (base + float2(float(i), float(j)) + 0.5)\n"
+    "                        / tex_size;\n"
+    "            result += tex.SampleLevel(samp, tc, 0).r * w;\n"
+    "            wsum   += w;\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    return (wsum > 0.0) ? result / wsum : 0.0;\n"
+    "}\n"
+    "\n"
+    "/* Interleaved gradient noise (Jorge Jimenez, 2014).\n"
+    " * Produces a [0,1) value from screen position with no visible\n"
+    " * pattern structure. Temporally stable (same output each frame\n"
+    " * for same pixel). Used for dithering in UE4/5 and AAA titles. */\n"
+    "float orderedDither(float2 screen_pos) {\n"
+    "    return frac(52.9829189 * frac(dot(screen_pos,\n"
+    "               float2(0.06711056, 0.00583715)))) - 0.5;\n"
+    "}\n"
+    "\n"
+    "/* Catmull-Rom (bicubic) 4x4 tap filter for chroma planes.\n"
+    " * Smoother than bilinear without the ringing of Lanczos.\n"
+    " * Standard for chroma upscaling in quality video players (mpv). */\n"
+    "float sample_catmull(Texture2D<float> tex, SamplerState samp,\n"
+    "                     float2 uv, float2 tex_size) {\n"
+    "    float2 pos  = uv * tex_size - 0.5;\n"
+    "    float2 base = floor(pos);\n"
+    "    float2 f    = pos - base;\n"
+    "\n"
+    "    float result = 0.0;\n"
+    "    float wsum   = 0.0;\n"
+    "\n"
+    "    [unroll] for (int j = -1; j <= 2; j++) {\n"
+    "        float t = abs(float(j) - f.y);\n"
+    "        float wy = (t <= 1.0)\n"
+    "            ? (1.5 * t * t * t - 2.5 * t * t + 1.0)\n"
+    "            : (-0.5 * t * t * t + 2.5 * t * t - 4.0 * t + 2.0);\n"
+    "        [unroll] for (int i = -1; i <= 2; i++) {\n"
+    "            float s = abs(float(i) - f.x);\n"
+    "            float wx = (s <= 1.0)\n"
+    "                ? (1.5 * s * s * s - 2.5 * s * s + 1.0)\n"
+    "                : (-0.5 * s * s * s + 2.5 * s * s - 4.0 * s + 2.0);\n"
+    "            float w = wx * wy;\n"
+    "            float2 tc = (base + float2(float(i), float(j)) + 0.5)\n"
+    "                        / tex_size;\n"
+    "            result += tex.SampleLevel(samp, tc, 0).r * w;\n"
+    "            wsum   += w;\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    return (wsum > 0.0) ? result / wsum : 0.0;\n"
+    "}\n"
+    "\n"
+    "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target0 {\n"
+    "    /* Lanczos-2 for luma, Catmull-Rom for chroma */\n"
+    "    float y  = sample_lanczos(texY, sampY, uv, texSizeY);\n"
+    "    float cb = sample_catmull(texU, sampU, uv, texSizeUV);\n"
+    "    float cr = sample_catmull(texV, sampV, uv, texSizeUV);\n"
     "\n"
     "    y  = (y  - rangeY.x)  * rangeY.y;\n"
     "    cb = (cb - rangeUV.x) * rangeUV.y;\n"
     "    cr = (cr - rangeUV.x) * rangeUV.y;\n"
     "\n"
     "    float4 yuv = float4(y, cb - 0.5, cr - 0.5, 1.0);\n"
-    "    return float4(mul(colorMatrix, yuv).rgb, 1.0);\n"
+    "    float3 rgb = mul(colorMatrix, yuv).rgb;\n"
+    "\n"
+    "    /* Ordered dither: ±0.5 LSB in 8-bit (±1/510 in [0,1]) */\n"
+    "    float d = orderedDither(pos.xy) / 255.0;\n"
+    "    rgb += float3(d, d, d);\n"
+    "\n"
+    "    return float4(saturate(rgb), 1.0);\n"
     "}\n";
 
 /* NV12/P010 fragment shader — 2 planes (Y + interleaved UV).
@@ -97,6 +193,8 @@ static const char hlsl_nv12_frag[] =
     "    row_major float4x4 colorMatrix;\n"
     "    float2 rangeY;\n"
     "    float2 rangeUV;\n"
+    "    float2 texSizeY;\n"
+    "    float2 texSizeUV;\n"
     "};\n"
     "\n"
     "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
@@ -363,6 +461,24 @@ int gpu_create_pipelines(PlayerState *ps) {
     }
     log_msg("GPU: sampler created (linear + 16x anisotropy)");
 
+    /* ── Create nearest-neighbor sampler for overlay ──
+     * Bitmap font pixels should be pixel-perfect, not bilinear-blurred. */
+    SDL_GPUSamplerCreateInfo nearest_info;
+    SDL_zero(nearest_info);
+    nearest_info.min_filter     = SDL_GPU_FILTER_NEAREST;
+    nearest_info.mag_filter     = SDL_GPU_FILTER_NEAREST;
+    nearest_info.mipmap_mode    = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
+    nearest_info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    nearest_info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    nearest_info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+
+    ps->gpu_sampler_nearest = SDL_CreateGPUSampler(ps->gpu_device, &nearest_info);
+    if (!ps->gpu_sampler_nearest) {
+        log_msg("ERROR: Failed to create nearest sampler: %s", SDL_GetError());
+        return -1;
+    }
+    log_msg("GPU: nearest sampler created (overlay)");
+
     return 0;
 }
 
@@ -374,6 +490,10 @@ void gpu_destroy_pipelines(PlayerState *ps) {
     if (ps->gpu_sampler) {
         SDL_ReleaseGPUSampler(ps->gpu_device, ps->gpu_sampler);
         ps->gpu_sampler = NULL;
+    }
+    if (ps->gpu_sampler_nearest) {
+        SDL_ReleaseGPUSampler(ps->gpu_device, ps->gpu_sampler_nearest);
+        ps->gpu_sampler_nearest = NULL;
     }
     if (ps->gpu_pipeline_yuv) {
         SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv);
@@ -493,9 +613,10 @@ static void gpu_destroy_video_textures(PlayerState *ps) {
  * Sets the YUV→RGB color matrix and range parameters based on the
  * video's colorspace metadata. Called once per file in player_open().
  *
- * Since swscale already converts to full-range YUV420P, the range
- * uniforms are identity ({0,1}). The matrix handles the pure
- * YUV→RGB color conversion.
+ * Three modes:
+ *   10-bit passthrough (yuv420p10le): range expansion in shader (R16_UNORM)
+ *   8-bit passthrough  (yuv420p):     range expansion in shader (R8_UNORM)
+ *   swscale fallback:                 swscale does range → identity uniforms
  */
 
 static void gpu_setup_uniforms(PlayerState *ps) {
@@ -513,32 +634,38 @@ static void gpu_setup_uniforms(PlayerState *ps) {
 
     /* ── Range parameters ──
      *
-     * 8-bit path: swscale outputs full-range YUV420P → identity {0, 1}.
+     * Three passthrough modes, all handling range expansion in shader:
      *
-     * 10-bit passthrough: raw yuv420p10le data uploaded directly to
-     * R16_UNORM textures. Each 10-bit value V is stored as uint16 V
-     * (range 0-1023). The GPU reads V/65535, so we need:
+     * 10-bit passthrough (yuv420p10le → R16_UNORM):
+     *   GPU reads uint16 V as V/65535.
+     *   Limited: Y 64-940, UV 64-960
+     *   Full:    Y/UV 0-1023
      *
-     *   Limited range (most 10-bit content):
-     *     Y:  64-940  → offset = 64/65535, scale = 65535/(940-64)
-     *     UV: 64-960  → offset = 64/65535, scale = 65535/(960-64)
+     * 8-bit passthrough (yuv420p → R8_UNORM):
+     *   GPU reads uint8 V as V/255.
+     *   Limited: Y 16-235, UV 16-240
+     *   Full:    identity {0, 1}
      *
-     *   Full range:
-     *     Y/UV: 0-1023 → offset = 0, scale = 65535/1023
+     * swscale fallback (other formats → yuv420p full-range):
+     *   swscale outputs full-range → identity {0, 1}.
      */
     int is_10bit_passthrough =
         (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE
          && !ps->sws_ctx);
+    int is_8bit_passthrough =
+        (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P
+         && !ps->sws_ctx);
+
+    /* Read color range from metadata */
+    int is_full_range = 0;
+    if (ps->fmt_ctx) {
+        AVCodecParameters *par =
+            ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+        is_full_range = (par->color_range == AVCOL_RANGE_JPEG);
+    }
 
     if (is_10bit_passthrough) {
         /* 10-bit passthrough — range correction in shader */
-        int is_full_range = 0;
-        if (ps->fmt_ctx) {
-            AVCodecParameters *par =
-                ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
-            is_full_range = (par->color_range == AVCOL_RANGE_JPEG);
-        }
-
         if (is_full_range) {
             ps->gpu_uniforms.rangeY[0]  = 0.0f;
             ps->gpu_uniforms.rangeY[1]  = 65535.0f / 1023.0f;
@@ -554,14 +681,34 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         log_msg("GPU: uniforms set (%s, 10-bit %s range → shader)",
                 is_bt709 ? "BT.709" : "BT.601",
                 is_full_range ? "full" : "limited");
+
+    } else if (is_8bit_passthrough) {
+        /* 8-bit YUV420P passthrough — range correction in shader.
+         * R8_UNORM reads uint8 V as V/255. */
+        if (is_full_range) {
+            ps->gpu_uniforms.rangeY[0]  = 0.0f;
+            ps->gpu_uniforms.rangeY[1]  = 1.0f;
+            ps->gpu_uniforms.rangeUV[0] = 0.0f;
+            ps->gpu_uniforms.rangeUV[1] = 1.0f;
+        } else {
+            ps->gpu_uniforms.rangeY[0]  = 16.0f / 255.0f;
+            ps->gpu_uniforms.rangeY[1]  = 255.0f / (235.0f - 16.0f);
+            ps->gpu_uniforms.rangeUV[0] = 16.0f / 255.0f;
+            ps->gpu_uniforms.rangeUV[1] = 255.0f / (240.0f - 16.0f);
+        }
+
+        log_msg("GPU: uniforms set (%s, 8-bit %s range → shader)",
+                is_bt709 ? "BT.709" : "BT.601",
+                is_full_range ? "full" : "limited");
+
     } else {
-        /* 8-bit path — swscale outputs full-range, identity range */
+        /* swscale fallback — outputs full-range YUV420P, identity range */
         ps->gpu_uniforms.rangeY[0]  = 0.0f;
         ps->gpu_uniforms.rangeY[1]  = 1.0f;
         ps->gpu_uniforms.rangeUV[0] = 0.0f;
         ps->gpu_uniforms.rangeUV[1] = 1.0f;
 
-        log_msg("GPU: uniforms set (%s, full range)",
+        log_msg("GPU: uniforms set (%s, full range via swscale)",
                 is_bt709 ? "BT.709" : "BT.601");
     }
 
@@ -587,6 +734,16 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         m[ 8] = 1.0f;  m[ 9] =  1.772f;   m[10] =  0.0f;     /* B */
     }
     m[15] = 1.0f;  /* A passthrough */
+
+    /* ── Texture dimensions for Lanczos resampling ──
+     *
+     * The fragment shader needs texel size to compute sample positions
+     * for the Lanczos-2 4×4 kernel. Y plane is full resolution;
+     * UV planes are half (4:2:0 chroma subsampling). */
+    ps->gpu_uniforms.texSizeY[0]  = (float)ps->vid_w;
+    ps->gpu_uniforms.texSizeY[1]  = (float)ps->vid_h;
+    ps->gpu_uniforms.texSizeUV[0] = (float)(ps->vid_w / 2);
+    ps->gpu_uniforms.texSizeUV[1] = (float)(ps->vid_h / 2);
 }
 
 
@@ -722,7 +879,7 @@ void gpu_overlay_draw(SDL_GPURenderPass *pass, SDL_GPUCommandBuffer *cmd,
 
     SDL_GPUTextureSamplerBinding binding = {
         .texture = ps->gpu_overlay_tex,
-        .sampler = ps->gpu_sampler
+        .sampler = ps->gpu_sampler_nearest  /* nearest = pixel-perfect bitmap font */
     };
     SDL_BindGPUFragmentSamplers(pass, 0, &binding, 1);
 
@@ -952,50 +1109,40 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->rgb_frame   = av_frame_alloc();
     ps->audio_frame = av_frame_alloc();
 
-    /* ── Set up swscale (or skip for 10-bit passthrough) ──
+    /* ── Set up swscale (or skip for GPU passthrough) ──
      *
-     * For yuv420p10le: bypass swscale entirely. Raw 10-bit planes go
-     * directly to R16_UNORM / R16G16_UNORM GPU textures. The fragment
-     * shader handles range expansion and YUV→RGB conversion.
+     * yuv420p10le: bypass swscale. Raw 10-bit planes → R16_UNORM textures.
+     * yuv420p:     bypass swscale. Raw 8-bit planes → R8_UNORM textures.
+     *              Range expansion (limited→full) done in fragment shader.
      *
-     * For all other formats, three swscale modes:
-     *
-     * 1. RESIZE (src size != dst size): Full Lanczos pipeline with
-     *    SWS_FULL_CHR_H_INT for maximum spatial quality.
-     *
-     * 2. FORMAT ONLY, 8-bit (e.g. limited→full range expansion):
-     *    SWS_POINT + error-diffusion dithering.
-     *
-     * 3. FORMAT ONLY, other bit depths: SWS_POINT, no ED dithering.
+     * All other pixel formats need swscale conversion to YUV420P first.
+     * Shader handles the color matrix and any remaining range work.
      */
     {
         enum AVPixelFormat src_fmt = ps->video_codec_ctx->pix_fmt;
-        int is_10bit = (src_fmt == AV_PIX_FMT_YUV420P10LE);
+        int is_10bit  = (src_fmt == AV_PIX_FMT_YUV420P10LE);
+        int is_yuv420p = (src_fmt == AV_PIX_FMT_YUV420P);
 
         if (is_10bit && ps->gpu_pipeline_nv12) {
             /* ── 10-bit GPU passthrough — no swscale needed ── */
             ps->sws_ctx    = NULL;
             ps->rgb_buffer = NULL;
             log_msg("swscale: bypassed (10-bit GPU passthrough)");
+
+        } else if (is_yuv420p) {
+            /* ── 8-bit YUV420P passthrough — range in shader ── */
+            ps->sws_ctx    = NULL;
+            ps->rgb_buffer = NULL;
+            log_msg("swscale: bypassed (8-bit YUV420P, range in shader)");
+
         } else {
-            /* ── swscale path for 8-bit and other formats ── */
+            /* ── swscale path for all other formats ── */
             enum AVPixelFormat dst_fmt = AV_PIX_FMT_YUV420P;
             int dst_w = ps->vid_w;
             int dst_h = ps->vid_h;
 
-            int same_size = (ps->vid_w == dst_w && ps->vid_h == dst_h);
-            int sws_flags;
-            const char *sws_mode;
-
-            if (!same_size) {
-                sws_flags = SWS_LANCZOS | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
-                sws_mode = "resize (SWS_LANCZOS)";
-            } else {
-                sws_flags = SWS_POINT | SWS_ACCURATE_RND;
-                sws_mode = is_10bit
-                    ? "10-bit fast (SWS_POINT, no dither)"
-                    : "format-only (SWS_POINT + error-diffusion)";
-            }
+            int sws_flags = SWS_LANCZOS | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT;
+            const char *sws_mode = "format convert (SWS_LANCZOS + ED dither)";
 
             ps->sws_ctx = sws_getContext(
                 ps->vid_w, ps->vid_h, src_fmt,
@@ -1010,10 +1157,8 @@ int player_open(PlayerState *ps, const char *filename) {
                 return -1;
             }
 
-            /* Enable error-diffusion dithering ONLY for 8-bit sources. */
-            if (!is_10bit) {
-                av_opt_set_int(ps->sws_ctx, "dithering", 1, 0);
-            }
+            /* Error-diffusion dithering for format conversions */
+            av_opt_set_int(ps->sws_ctx, "dithering", 1, 0);
 
             /* ── Colorspace and range ── */
             {
@@ -1532,13 +1677,14 @@ static void upload_plane(
 }
 
 
-/* Display the current video frame: convert → upload to GPU → shader draw.
+/* Display the current video frame: upload to GPU → shader draw.
  *
  * This is the hot path. Called once per new frame from main.c.
  *
  * Three source modes, all using the YUV planar pipeline (3 textures):
  *   1. 10-bit passthrough: direct upload, 2 bytes/sample (R16_UNORM)
- *   2. 8-bit full-range YUV420P: direct upload, 1 byte/sample (R8_UNORM)
+ *   2. 8-bit YUV420P passthrough: direct upload, 1 byte/sample (R8_UNORM)
+ *      Range expansion (limited→full) done in fragment shader.
  *   3. All other formats: swscale → upload, 1 byte/sample (R8_UNORM)
  */
 void video_display(PlayerState *ps) {
@@ -1562,24 +1708,19 @@ void video_display(PlayerState *ps) {
         /* 10-bit passthrough — raw frame directly to R16_UNORM textures */
         src_frame = ps->video_frame;
         bpp = 2;
+    } else if (!ps->sws_ctx) {
+        /* 8-bit YUV420P passthrough — direct upload, range in shader */
+        src_frame = ps->video_frame;
+        bpp = 1;
     } else {
-        int is_yuv420p = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P);
-        int is_full_range = (ps->fmt_ctx->streams[ps->video_stream_idx]
-                                ->codecpar->color_range == AVCOL_RANGE_JPEG);
-
-        if (is_yuv420p && is_full_range) {
-            /* Full-range YUV420P — direct upload, no conversion */
-            src_frame = ps->video_frame;
-        } else {
-            /* All other formats — swscale handles conversion */
-            sws_scale(ps->sws_ctx,
-                (const uint8_t *const *)ps->video_frame->data,
-                ps->video_frame->linesize,
-                0, ps->vid_h,
-                ps->rgb_frame->data,
-                ps->rgb_frame->linesize);
-            src_frame = ps->rgb_frame;
-        }
+        /* swscale path — format conversion to YUV420P */
+        sws_scale(ps->sws_ctx,
+            (const uint8_t *const *)ps->video_frame->data,
+            ps->video_frame->linesize,
+            0, ps->vid_h,
+            ps->rgb_frame->data,
+            ps->rgb_frame->linesize);
+        src_frame = ps->rgb_frame;
         bpp = 1;
     }
 
@@ -1659,6 +1800,10 @@ void video_display(PlayerState *ps) {
         return;
     }
 
+    /* Cache physical pixel dimensions for DPI-correct overlay sizing */
+    ps->sc_w = (int)sc_w;
+    ps->sc_h = (int)sc_h;
+
     /* ── Render pass: YUV planar shader, 3 textures ── */
     SDL_GPUColorTargetInfo color_target;
     SDL_zero(color_target);
@@ -1728,6 +1873,10 @@ void video_reblit(PlayerState *ps) {
         SDL_CancelGPUCommandBuffer(cmd);
         return;
     }
+
+    /* Cache physical pixel dimensions for DPI-correct overlay sizing */
+    ps->sc_w = (int)sc_w;
+    ps->sc_h = (int)sc_h;
 
     SDL_GPUColorTargetInfo color_target;
     SDL_zero(color_target);
@@ -1953,17 +2102,18 @@ void player_build_debug_info(PlayerState *ps) {
 
         if (is_10bit && !ps->sws_ctx) {
             off += snprintf(buf + off, sz - off,
-                "SWS: bypassed (10-bit GPU passthrough, R16_UNORM)\n");
-        } else if (is_yuv420p && is_full_range) {
-            off += snprintf(buf + off, sz - off, "SWS: passthrough (full-range YUV420P)\n");
-        } else if (is_10bit) {
-            off += snprintf(buf + off, sz - off, "SWS: 10-bit fast (SWS_POINT, no dither)\n");
-        } else if (is_yuv420p) {
-            off += snprintf(buf + off, sz - off, "SWS: limited->full expand (SWS_POINT)\n");
+                "SWS: bypassed (10-bit passthrough, %s->full in shader)\n",
+                is_full_range ? "full" : "limited");
+        } else if (is_yuv420p && !ps->sws_ctx) {
+            off += snprintf(buf + off, sz - off,
+                "SWS: bypassed (8-bit passthrough, %s->full in shader)\n",
+                is_full_range ? "full" : "limited");
         } else {
             off += snprintf(buf + off, sz - off,
-                "SWS: format convert (SWS_POINT + ED dither)\n");
+                "SWS: format convert (SWS_LANCZOS + ED dither)\n");
         }
+        off += snprintf(buf + off, sz - off,
+            "GPU: Lanczos-2 luma, Catmull-Rom chroma, IGN dither\n");
     }
 
     /* Audio track info */

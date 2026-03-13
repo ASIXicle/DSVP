@@ -9,9 +9,10 @@
  *   4. Processes keyboard/mouse events
  *   5. Drives video decode and rendering via GPU
  *
- * Phase 1 (v0.1.4-beta): Video-only GPU rendering. Overlays (debug,
- * info, seek bar, subtitles) are disabled — log output provides all
- * diagnostic data. Phase 2 will composite overlays as GPU textures.
+ * Phase 2 (v0.1.4-beta): Full GPU rendering with overlay system.
+ * Video frames rendered via custom HLSL shaders (SDL_GPU). Overlays
+ * (debug, info, seek bar, subtitles, OSD) composited as RGBA texture
+ * with alpha blending over the video quad.
  */
 
 #include "dsvp.h"
@@ -116,6 +117,15 @@ static int open_file_dialog(char *out, int out_size) {
  */
 
 static void gpu_draw_idle(PlayerState *ps) {
+    /* Update physical pixel dimensions for the idle window.
+     * After player_close resets the window to 960×540, the stale
+     * sc_w/sc_h from the video session would cause overlay_render_idle
+     * to draw at the wrong size. */
+    int phys_w, phys_h;
+    SDL_GetWindowSizeInPixels(ps->window, &phys_w, &phys_h);
+    ps->sc_w = phys_w;
+    ps->sc_h = phys_h;
+
     /* Render idle screen text to overlay pixel buffer */
     overlay_render_idle(ps);
 
@@ -420,19 +430,38 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                /* Click on seek bar to seek (Phase 2: re-enable with overlays) */
-                if (ev.button.button == SDL_BUTTON_LEFT && ps.playing) {
+                /* Click on seek bar progress track to seek.
+                 * Geometry must match overlay.c draw_seekbar() layout:
+                 *   [margin][time][12px][==track==][12px][sep][vol][margin]
+                 * We approximate the text widths since the bitmap font
+                 * helpers live in overlay.c. */
+                if (ev.button.button == SDL_BUTTON_LEFT && ps.playing
+                        && ps.show_seekbar) {
                     int w_now, h_now;
                     SDL_GetWindowSize(window, &w_now, &h_now);
-                    int bar_y = h_now - 30;
-                    if (ev.button.y >= bar_y - 10 && ev.button.y <= bar_y + 20) {
-                        double frac = (double)(ev.button.x - 20) / (w_now - 40);
-                        if (frac < 0.0) frac = 0.0;
-                        if (frac > 1.0) frac = 1.0;
-                        double duration = (ps.fmt_ctx->duration != AV_NOPTS_VALUE)
-                            ? (double)ps.fmt_ctx->duration / AV_TIME_BASE : 0.0;
-                        double target = frac * duration;
-                        player_seek(&ps, target - ps.video_clock);
+                    int bar_h = 30;
+                    int bar_y = h_now - bar_h;
+                    int margin = 20;
+
+                    if (ev.button.y >= bar_y && ev.button.y <= h_now) {
+                        /* Volume area: "Vol: 100%" ≈ 9 chars × 6px = 54,
+                         * plus margin. Generous to avoid false seeks. */
+                        int vol_area_w = margin + 60;
+                        int sep_x = w_now - vol_area_w - 12;
+                        /* Time text: "0:00:00 / 0:00:00" ≈ 17 chars × 6 = 102 */
+                        int track_x = margin + 110;
+                        int track_w = sep_x - track_x - 12;
+
+                        if (track_w > 20 && ev.button.x >= track_x
+                                && ev.button.x <= track_x + track_w) {
+                            double frac = (double)(ev.button.x - track_x) / track_w;
+                            if (frac < 0.0) frac = 0.0;
+                            if (frac > 1.0) frac = 1.0;
+                            double duration = (ps.fmt_ctx->duration != AV_NOPTS_VALUE)
+                                ? (double)ps.fmt_ctx->duration / AV_TIME_BASE : 0.0;
+                            double target = frac * duration;
+                            player_seek(&ps, target - ps.video_clock);
+                        }
                     }
                 }
                 break;

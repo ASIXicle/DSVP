@@ -566,8 +566,9 @@ static int       s_pix_h  = 0;
  */
 
 void overlay_render_idle(PlayerState *ps) {
-    int w = ps->win_w;
-    int h = ps->win_h;
+    /* Use physical pixel dimensions when available */
+    int w = (ps->sc_w > 0) ? ps->sc_w : ps->win_w;
+    int h = (ps->sc_h > 0) ? ps->sc_h : ps->win_h;
     if (w <= 0 || h <= 0) return;
 
     if (gpu_overlay_ensure(ps, w, h) < 0) {
@@ -586,7 +587,7 @@ void overlay_render_idle(PlayerState *ps) {
     memset(s_pixels, 0, buf_size);
 
     /* ── Title: "DSVP" in large bitmap font ── */
-    int title_scale = 7;
+    int title_scale = 6;
     const char *title = "DSVP";
     int title_tw = text_width(title, title_scale);
     int title_x = (w - title_tw) / 2;
@@ -595,7 +596,7 @@ void overlay_render_idle(PlayerState *ps) {
               180, 190, 210);
 
     /* ── Version ── */
-    int ver_scale = 2;
+    int ver_scale = 1;
     char ver_str[64];
     snprintf(ver_str, sizeof(ver_str), "v%s", DSVP_VERSION);
     int ver_tw = text_width(ver_str, ver_scale);
@@ -668,8 +669,11 @@ void overlay_render_idle(PlayerState *ps) {
  */
 
 void overlay_render(PlayerState *ps) {
-    int w = ps->win_w;
-    int h = ps->win_h;
+    /* Use swapchain (physical) dimensions for DPI-correct rendering.
+     * On HiDPI displays, sc_w/sc_h > win_w/win_h. Fall back to
+     * window size if swapchain dims aren't known yet. */
+    int w = (ps->sc_w > 0) ? ps->sc_w : ps->win_w;
+    int h = (ps->sc_h > 0) ? ps->sc_h : ps->win_h;
     if (w <= 0 || h <= 0 || !ps->playing) {
         ps->overlay_active = 0;
         return;
