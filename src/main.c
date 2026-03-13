@@ -508,6 +508,14 @@ int main(int argc, char *argv[]) {
             int new_frame = 0;
             int decoded_this_tick = 0;
 
+            /* max_catchup caps burst decodes per VSync tick.
+             * Kept at 4 for all content: at 1:1 (60fps on 60Hz), the
+             * natural (2,0) rhythm self-corrects with max_catchup=4.
+             * For heavy content (4K H.264), the decoder occasionally
+             * needs bursts of 3-4 to recover after expensive I-frames.
+             * max_catchup=2 prevented this, causing accumulated drift
+             * that triggered 100+ snap-forwards and multi-second A/V
+             * desync. max_catchup=4 is the stall recovery safety cap. */
             int max_catchup = 4;
             while (now >= ps.frame_timer && max_catchup-- > 0) {
                 int vret = video_decode_frame(&ps);
@@ -525,6 +533,8 @@ int main(int argc, char *argv[]) {
                     /* A/V sync adjustment */
                     double delay = pts_delay;
                     double av_diff = 0.0;
+                    double av_diff_c = 0.0;
+                    int one_to_one = 0;
                     if (ps.audio_stream_idx >= 0) {
                         av_diff = ps.video_clock - ps.audio_clock_sync;
 
@@ -537,11 +547,11 @@ int main(int argc, char *argv[]) {
                             ps.av_bias = ps.av_bias * 0.95 + av_diff * 0.05;
                             ps.av_bias_samples++;
                         }
-                        double av_diff_c = av_diff;
+                        av_diff_c = av_diff;
                         if (ps.av_bias_samples >= 60) {
                             double bias = ps.av_bias;
-                            if (bias < -0.100) bias = -0.100;
-                            if (bias >  0.100) bias =  0.100;
+                            if (bias < -0.200) bias = -0.200;
+                            if (bias >  0.200) bias =  0.200;
                             av_diff_c = av_diff - bias;
                         }
 
@@ -550,9 +560,9 @@ int main(int argc, char *argv[]) {
                          * alone provides the pacing heartbeat. A/V
                          * delay correction at 1:1 causes oscillation
                          * because any jitter triggers multi-decode
-                         * bunching. Frame drops still fire at -50ms. */
-                        int one_to_one = (pts_delay > 0.001
-                                          && pts_delay < 0.020);
+                         * bunching. */
+                        one_to_one = (pts_delay > 0.001
+                                      && pts_delay < 0.020);
 
                         double threshold = fmax(pts_delay, 0.01);
                         if (!one_to_one) {
@@ -576,14 +586,31 @@ int main(int argc, char *argv[]) {
                     ps.frame_timer += delay;
                     new_frame = 1;
 
-                    /* Drop frame if video is >50ms behind audio */
-                    if (ps.audio_stream_idx >= 0 && av_diff < -0.05
+                    /* Drop frame if video is genuinely behind audio.
+                     *
+                     * At 1:1 (content fps ≈ display refresh), drops are
+                     * DISABLED. VSync provides the pacing heartbeat and
+                     * the snap-forward handles genuine stalls. The raw
+                     * av_diff at 1:1 includes a fixed pipeline offset
+                     * (decode latency + OS audio buffering) that isn't
+                     * growing drift — the decoder IS keeping up. Dropping
+                     * on that offset replaces smooth 60fps video with a
+                     * frozen frame, which is far worse than the offset.
+                     *
+                     * For non-1:1 content (e.g. 24fps on 60Hz), the
+                     * accumulator-based timing needs active correction,
+                     * so bias-corrected drops still apply at -50ms. */
+                    if (!one_to_one && ps.audio_stream_idx >= 0
                             && !ps.seek_recovering) {
-                        new_frame = 0;
-                        ps.diag_frames_dropped++;
-                        log_msg("DIAG: frame dropped at %.3fs "
-                                "(A/V drift: %.1fms)",
-                                ps.video_clock, av_diff * 1000.0);
+                        double drop_diff = (ps.av_bias_samples >= 60)
+                                           ? av_diff_c : av_diff;
+                        if (drop_diff < -0.05) {
+                            new_frame = 0;
+                            ps.diag_frames_dropped++;
+                            log_msg("DIAG: frame dropped at %.3fs "
+                                    "(A/V drift: %.1fms)",
+                                    ps.video_clock, av_diff * 1000.0);
+                        }
                     }
                 } else {
                     if (vret < 0) {
