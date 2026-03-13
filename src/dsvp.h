@@ -164,6 +164,8 @@ typedef struct PlayerState {
     /* ── Timing / A/V sync ── */
     double              audio_clock;      /* current audio PTS in secs (audio thread internal) */
     double              audio_clock_sync; /* latency-corrected snapshot for main thread A/V sync */
+    double              av_bias;          /* adaptive A/V offset (EMA of av_diff) */
+    int                 av_bias_samples;  /* warmup counter (apply after 60)     */
     double              video_clock;      /* current video PTS in secs  */
     double              frame_timer;      /* when we last showed a frame*/
     double              frame_last_delay; /* last frame display duration*/

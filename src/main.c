@@ -527,12 +527,40 @@ int main(int argc, char *argv[]) {
                     double av_diff = 0.0;
                     if (ps.audio_stream_idx >= 0) {
                         av_diff = ps.video_clock - ps.audio_clock_sync;
-                        double threshold = fmax(pts_delay, 0.01);
 
-                        if (av_diff > threshold) {
-                            delay = pts_delay + av_diff;
-                        } else if (av_diff < -threshold) {
-                            delay = 0.0;
+                        /* Adaptive bias correction: EMA of av_diff
+                         * absorbs systematic OS audio pipeline latency.
+                         * Only the catch-up (negative) branch uses the
+                         * corrected value — the slow-down (positive)
+                         * branch uses raw av_diff to avoid overcorrection. */
+                        if (!ps.seek_recovering) {
+                            ps.av_bias = ps.av_bias * 0.95 + av_diff * 0.05;
+                            ps.av_bias_samples++;
+                        }
+                        double av_diff_c = av_diff;
+                        if (ps.av_bias_samples >= 60) {
+                            double bias = ps.av_bias;
+                            if (bias < -0.100) bias = -0.100;
+                            if (bias >  0.100) bias =  0.100;
+                            av_diff_c = av_diff - bias;
+                        }
+
+                        /* 1:1 VSync pacing: when content frame rate
+                         * matches display refresh (~50-60fps), VSync
+                         * alone provides the pacing heartbeat. A/V
+                         * delay correction at 1:1 causes oscillation
+                         * because any jitter triggers multi-decode
+                         * bunching. Frame drops still fire at -50ms. */
+                        int one_to_one = (pts_delay > 0.001
+                                          && pts_delay < 0.020);
+
+                        double threshold = fmax(pts_delay, 0.01);
+                        if (!one_to_one) {
+                            if (av_diff > threshold) {
+                                delay = pts_delay + av_diff;
+                            } else if (av_diff_c < -threshold) {
+                                delay = 0.0;
+                            }
                         }
 
                         if (!ps.seek_recovering &&
@@ -602,7 +630,7 @@ int main(int argc, char *argv[]) {
                     ? ps.video_clock - ps.audio_clock_sync : 0.0;
                 log_msg("DIAG: [%.0fs] decoded=%d displayed=%d "
                         "dropped=%d multi_ticks=%d snaps=%d "
-                        "A/V=%.1fms peak=%.1fms",
+                        "A/V=%.1fms peak=%.1fms bias=%.1fms",
                         ps.video_clock,
                         ps.diag_frames_decoded,
                         ps.diag_frames_displayed,
@@ -610,7 +638,8 @@ int main(int argc, char *argv[]) {
                         ps.diag_multi_decodes,
                         ps.diag_timer_snaps,
                         av_now * 1000.0,
-                        ps.diag_max_av_drift * 1000.0);
+                        ps.diag_max_av_drift * 1000.0,
+                        ps.av_bias * 1000.0);
                 ps.diag_last_report = now;
             }
 

@@ -1291,6 +1291,8 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->frame_last_pts   = 0.0;
     ps->audio_clock      = 0.0;
     ps->audio_clock_sync = 0.0;
+    ps->av_bias = 0.0;
+    ps->av_bias_samples = 0;
     ps->video_clock      = 0.0;
 
     /* Suppress frame drops until the first frame is displayed.
@@ -1342,6 +1344,8 @@ void player_close(PlayerState *ps) {
         log_msg("DIAG:   Timer snap-forwards: %d", ps->diag_timer_snaps);
         log_msg("DIAG:   Peak A/V drift:    %.1fms",
                 ps->diag_max_av_drift * 1000.0);
+        log_msg("DIAG:   A/V bias:          %.1fms",
+                ps->av_bias * 1000.0);
     }
 
     ps->quit = 1;
@@ -1509,6 +1513,8 @@ int demux_thread_func(void *arg) {
              * ~100ms, HEVC with long GOPs may take 5–10 seconds.
              * Cleared in main.c when a frame is actually shown. */
             ps->seek_recovering = 1;
+            ps->av_bias = 0.0;
+            ps->av_bias_samples = 0;
 
             /* Resume audio playback */
             if (ps->audio_stream && !ps->paused)
@@ -2084,6 +2090,8 @@ void player_build_debug_info(PlayerState *ps) {
     off += snprintf(buf + off, sz - off, "Audio Clock: %.3f s\n", ps->audio_clock_sync);
     off += snprintf(buf + off, sz - off, "A/V Diff:    %.3f ms\n",
         (ps->video_clock - ps->audio_clock_sync) * 1000.0);
+    off += snprintf(buf + off, sz - off, "A/V Bias:    %.1f ms\n",
+        ps->av_bias * 1000.0);
     off += snprintf(buf + off, sz - off, "Video Queue: %d pkts (%d KB)\n",
         ps->video_pq.nb_packets, ps->video_pq.size / 1024);
     off += snprintf(buf + off, sz - off, "Audio Queue: %d pkts (%d KB)\n",
@@ -2095,8 +2103,7 @@ void player_build_debug_info(PlayerState *ps) {
     if (ps->video_codec_ctx) {
         off += snprintf(buf + off, sz - off, "Decoder Threads: %d\n",
             ps->video_codec_ctx->thread_count);
-    }
-    if (ps->video_codec_ctx) {
+
         int is_yuv420p = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P);
         int is_10bit = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE);
         int is_full_range = (ps->fmt_ctx &&
@@ -2152,4 +2159,6 @@ void player_build_debug_info(PlayerState *ps) {
     off += snprintf(buf + off, sz - off, "Stall snaps: %d\n", ps->diag_timer_snaps);
     off += snprintf(buf + off, sz - off, "Peak drift:  %.1f ms\n",
         ps->diag_max_av_drift * 1000.0);
+    off += snprintf(buf + off, sz - off, "A/V bias:    %.1f ms\n",
+        ps->av_bias * 1000.0);
 }
