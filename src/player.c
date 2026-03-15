@@ -181,33 +181,6 @@ static const char hlsl_yuv_planar_frag[] =
     "    return float4(saturate(rgb), 1.0);\n"
     "}\n";
 
-/* NV12/P010 fragment shader — 2 planes (Y + interleaved UV).
- * Used for 10-bit passthrough (R16_UNORM Y + R16G16_UNORM UV). */
-static const char hlsl_nv12_frag[] =
-    "Texture2D<float>  texY  : register(t0, space2);\n"
-    "Texture2D<float2> texUV : register(t1, space2);\n"
-    "SamplerState sampY  : register(s0, space2);\n"
-    "SamplerState sampUV : register(s1, space2);\n"
-    "\n"
-    "cbuffer Params : register(b0, space3) {\n"
-    "    row_major float4x4 colorMatrix;\n"
-    "    float2 rangeY;\n"
-    "    float2 rangeUV;\n"
-    "    float2 texSizeY;\n"
-    "    float2 texSizeUV;\n"
-    "};\n"
-    "\n"
-    "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
-    "    float  y     = texY.Sample(sampY, uv).r;\n"
-    "    float2 cb_cr = texUV.Sample(sampUV, uv).rg;\n"
-    "\n"
-    "    y     = (y     - rangeY.x)  * rangeY.y;\n"
-    "    cb_cr = (cb_cr - rangeUV.x) * rangeUV.y;\n"
-    "\n"
-    "    float4 yuv = float4(y, cb_cr.x - 0.5, cb_cr.y - 0.5, 1.0);\n"
-    "    return float4(mul(colorMatrix, yuv).rgb, 1.0);\n"
-    "}\n";
-
 /* RGBA overlay fragment shader — simple passthrough with alpha.
  * Used for compositing debug overlays, seek bar, subtitles, etc.
  * over the video frame. One texture, one sampler, no uniforms. */
@@ -308,8 +281,8 @@ static SDL_GPUShader *compile_shader(
  * graphics pipelines and sampler.
  *
  * Two pipelines:
- *   - gpu_pipeline_yuv:  planar YUV420P (3 textures, 3 samplers)
- *   - gpu_pipeline_nv12: NV12/P010 (2 textures, 2 samplers) [10-bit passthrough]
+ *   - gpu_pipeline_yuv:     planar YUV420P (3 textures, 3 samplers)
+ *   - gpu_pipeline_overlay: RGBA + alpha blend (1 texture, 1 sampler)
  */
 
 int gpu_create_pipelines(PlayerState *ps) {
@@ -359,26 +332,7 @@ int gpu_create_pipelines(PlayerState *ps) {
     }
     log_msg("GPU: YUV planar pipeline created");
 
-    /* ── Compile NV12 fragment shader (P010 10-bit passthrough) ── */
-    SDL_GPUShader *frag_nv12 = compile_shader(
-        ps->gpu_device, hlsl_nv12_frag, "main",
-        SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT);
-    if (frag_nv12) {
-        pipe_info.fragment_shader = frag_nv12;
-        ps->gpu_pipeline_nv12 = SDL_CreateGPUGraphicsPipeline(
-            ps->gpu_device, &pipe_info);
-        SDL_ReleaseGPUShader(ps->gpu_device, frag_nv12);
-        if (ps->gpu_pipeline_nv12) {
-            log_msg("GPU: NV12/P010 pipeline created");
-        } else {
-            log_msg("WARNING: NV12 pipeline failed (P010 path unavailable): %s",
-                    SDL_GetError());
-        }
-    } else {
-        log_msg("WARNING: NV12 shader compile failed (P010 path unavailable)");
-    }
-
-    /* Vertex shader used by both pipelines — safe to release now */
+    /* Vertex shader done — safe to release now */
     SDL_ReleaseGPUShader(ps->gpu_device, vert);
 
     /* ── Compile overlay RGBA fragment shader ── */
@@ -499,10 +453,6 @@ void gpu_destroy_pipelines(PlayerState *ps) {
         SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_yuv);
         ps->gpu_pipeline_yuv = NULL;
     }
-    if (ps->gpu_pipeline_nv12) {
-        SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_nv12);
-        ps->gpu_pipeline_nv12 = NULL;
-    }
     if (ps->gpu_pipeline_overlay) {
         SDL_ReleaseGPUGraphicsPipeline(ps->gpu_device, ps->gpu_pipeline_overlay);
         ps->gpu_pipeline_overlay = NULL;
@@ -586,7 +536,6 @@ static int gpu_create_video_textures(PlayerState *ps) {
         return -1;
     }
 
-    ps->gpu_is_nv12 = 0;
     log_msg("GPU: textures created (Y=%dx%d, UV=%dx%d, %s planar)",
             w, h, cw, ch,
             is_10bit ? "R16_UNORM 10-bit" : "R8_UNORM");
@@ -1123,7 +1072,7 @@ int player_open(PlayerState *ps, const char *filename) {
         int is_10bit  = (src_fmt == AV_PIX_FMT_YUV420P10LE);
         int is_yuv420p = (src_fmt == AV_PIX_FMT_YUV420P);
 
-        if (is_10bit && ps->gpu_pipeline_nv12) {
+        if (is_10bit) {
             /* ── 10-bit GPU passthrough — no swscale needed ── */
             ps->sws_ctx    = NULL;
             ps->rgb_buffer = NULL;

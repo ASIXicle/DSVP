@@ -139,18 +139,16 @@ typedef struct PlayerState {
     /* ── SDL_GPU handles (lifetime: application) ── */
     SDL_GPUDevice              *gpu_device;
     SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv;   /* planar YUV420P   */
-    SDL_GPUGraphicsPipeline    *gpu_pipeline_nv12;  /* NV12 / P010      */
     SDL_GPUSampler             *gpu_sampler;         /* linear filtering */
     SDL_GPUSampler             *gpu_sampler_nearest; /* nearest for overlay */
 
     /* ── SDL_GPU handles (lifetime: per-file, created/destroyed in player_open/close) ── */
     SDL_GPUTexture             *gpu_tex_y;           /* Y plane          */
-    SDL_GPUTexture             *gpu_tex_u;           /* U (planar) or UV (NV12) */
-    SDL_GPUTexture             *gpu_tex_v;           /* V (planar), NULL for NV12 */
+    SDL_GPUTexture             *gpu_tex_u;           /* U plane          */
+    SDL_GPUTexture             *gpu_tex_v;           /* V plane          */
     SDL_GPUTransferBuffer      *gpu_xfer_y;          /* CPU→GPU staging  */
     SDL_GPUTransferBuffer      *gpu_xfer_u;
     SDL_GPUTransferBuffer      *gpu_xfer_v;
-    int                         gpu_is_nv12;         /* 1 = NV12/P010 path */
     GPUUniforms                 gpu_uniforms;         /* current color params */
 
     /* ── Overlay GPU handles (lifetime: application, resized as needed) ── */
