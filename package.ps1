@@ -1,7 +1,7 @@
 # DSVP Portable Packaging Script (Windows)
 # Creates a clean DSVP-portable/ folder with exe + all DLLs.
 #
-# Run from git-bash or PowerShell in the DSVP repo root.
+# Run from PowerShell in the DSVP repo root.
 #
 # Usage:
 #   .\package.ps1
