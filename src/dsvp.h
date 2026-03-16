@@ -146,6 +146,7 @@ typedef struct PlayerState {
     SDL_GPUTexture             *gpu_tex_y;           /* Y plane          */
     SDL_GPUTexture             *gpu_tex_u;           /* U plane          */
     SDL_GPUTexture             *gpu_tex_v;           /* V plane          */
+    SDL_GPUTexture         *gpu_tex_noise;           /* 64×64 blue noise dither (app lifetime) */
     SDL_GPUTransferBuffer      *gpu_xfer_y;          /* CPU→GPU staging  */
     SDL_GPUTransferBuffer      *gpu_xfer_u;
     SDL_GPUTransferBuffer      *gpu_xfer_v;
@@ -185,6 +186,7 @@ typedef struct PlayerState {
     double              volume;           /* 0.0 — 1.0                  */
     int                 fullscreen;
     int                 eof;              /* demuxer hit end of file    */
+    int                 video_ready;      /* 1 after first frame uploaded — gates reblit */
 
     /* ── Window geometry ── */
     int                 win_w, win_h;     /* current window size        */

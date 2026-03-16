@@ -217,10 +217,14 @@ int main(int argc, char *argv[]) {
      * adding 30-180ms per frame depending on texture size. On 4K 10-bit
      * content (19.2MB/frame), this made real-time playback impossible.
      * Vulkan's memory model handles transfer buffer cycling without
-     * fence stalls, giving ~1-2ms per frame on the same content.
-     * Verified: identical DSVP code, same hardware, D3D12 = 62% drops
-     * on Ugetsu, Vulkan = 0% drops. */
+     * fence stalls, giving ~1-2ms per frame on the same content.*/
+    /* D3D12 has transfer buffer fence stalls (30-180ms/frame).
+     * Force Vulkan on Windows/Linux, Metal on macOS. */
+#ifdef __APPLE__
+    SDL_SetHint(SDL_HINT_GPU_DRIVER, "metal");
+#else
     SDL_SetHint(SDL_HINT_GPU_DRIVER, "vulkan");
+#endif
 
 #ifdef DSVP_DEBUG
     bool gpu_debug = true;
@@ -684,7 +688,7 @@ int main(int argc, char *argv[]) {
             }
 
             /* Re-blit on ticks with no new frame (GPU double-buffering) */
-            if (!new_frame && ps.playing && ps.gpu_tex_y) {
+            if (!new_frame && ps.playing && ps.gpu_tex_y && ps.video_ready) {
                 video_reblit(&ps);
             }
 
