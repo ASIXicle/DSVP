@@ -87,20 +87,25 @@ Write-Host "      Copied $($buildDlls.Count) DLLs from build/" -ForegroundColor 
 
 Write-Host "[4/5] Resolving DLL dependencies..." -ForegroundColor Yellow
 
-# Find MSYS2 bin directory (where MinGW DLLs live)
-$msysBin = "C:\msys64\mingw64\bin"
-if (-not (Test-Path $msysBin)) {
-    # Try pkg-config to locate it
+# Build list of directories to search for DLLs (MSYS2 + vcpkg)
+$searchDirs = @()
+if (Test-Path "C:\msys64\mingw64\bin")              { $searchDirs += "C:\msys64\mingw64\bin" }
+if (Test-Path "C:\vcpkg\installed\x64-windows\bin") { $searchDirs += "C:\vcpkg\installed\x64-windows\bin" }
+
+# Fallback: try pkg-config
+if ($searchDirs.Count -eq 0) {
     $prefix = & pkg-config --variable=prefix sdl3 2>$null
-    if ($prefix) {
-        $msysBin = Join-Path $prefix "bin"
+    if ($prefix -and (Test-Path (Join-Path $prefix "bin"))) {
+        $searchDirs += Join-Path $prefix "bin"
     }
 }
 
-if (-not (Test-Path $msysBin)) {
-    Write-Host "WARNING: MSYS2 mingw64 bin not found. Skipping dependency resolution." -ForegroundColor Yellow
+if ($searchDirs.Count -eq 0) {
+    Write-Host "WARNING: No MinGW/vcpkg bin dirs found. Skipping dependency resolution." -ForegroundColor Yellow
 } else {
-    # Iteratively resolve: check each DLL/exe in outDir, find missing deps in msysBin
+    Write-Host "      Search dirs: $($searchDirs -join ', ')" -ForegroundColor DarkGray
+
+    # Iteratively resolve: check each DLL/exe in outDir, find missing deps
     $systemDirs = @("C:\Windows\system32", "C:\Windows\SysWOW64", "C:\Windows")
     $resolved = @{}
     $changed = $true
@@ -131,12 +136,15 @@ if (-not (Test-Path $msysBin)) {
                 }
                 if ($isSystem) { continue }
 
-                # Try to find in MSYS2
-                $srcPath = Join-Path $msysBin $dep
-                if (Test-Path $srcPath) {
-                    Copy-Item $srcPath "$outDir\"
-                    Write-Host "      + $dep" -ForegroundColor DarkGray
-                    $changed = $true
+                # Search all known directories
+                foreach ($searchDir in $searchDirs) {
+                    $srcPath = Join-Path $searchDir $dep
+                    if (Test-Path $srcPath) {
+                        Copy-Item $srcPath "$outDir\"
+                        Write-Host "      + $dep" -ForegroundColor DarkGray
+                        $changed = $true
+                        break
+                    }
                 }
             }
         }
