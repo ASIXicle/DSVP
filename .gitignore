@@ -4,12 +4,9 @@ build/
 *.exe
 DSVP-portable/
 dsvp/
-shadercross/
 
 # Dependencies (downloaded locally, not committed)
 deps/ffmpeg/
-deps/SDL2/
-deps/
 
 # IDE
 .vscode/
