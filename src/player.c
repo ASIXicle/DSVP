@@ -166,6 +166,8 @@ static const char hlsl_yuv_planar_frag[] =
     "    float2 rangeUV;\n"
     "    float2 texSizeY;\n"
     "    float2 texSizeUV;\n"
+    "    float2 chromaOffset;\n"
+    "    float2 _pad;\n"
     "};\n"
     "\n"
     "#define PI 3.14159265358979\n"
@@ -236,10 +238,13 @@ static const char hlsl_yuv_planar_frag[] =
     "}\n"
     "\n"
     "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target0 {\n"
+    "    /* Chroma siting: shift UV to actual sample position */\n"
+    "    float2 uv_chroma = uv + chromaOffset / texSizeUV;\n"
+    "\n"
     "    /* Lanczos-2 for luma, Catmull-Rom for chroma */\n"
     "    float y  = sample_lanczos(texY, sampY, uv, texSizeY);\n"
-    "    float cb = sample_catmull(texU, sampU, uv, texSizeUV);\n"
-    "    float cr = sample_catmull(texV, sampV, uv, texSizeUV);\n"
+    "    float cb = sample_catmull(texU, sampU, uv_chroma, texSizeUV);\n"
+    "    float cr = sample_catmull(texV, sampV, uv_chroma, texSizeUV);\n"
     "\n"
     "    y  = (y  - rangeY.x)  * rangeY.y;\n"
     "    cb = (cb - rangeUV.x) * rangeUV.y;\n"
@@ -840,6 +845,67 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     ps->gpu_uniforms.texSizeY[1]  = (float)ps->vid_h;
     ps->gpu_uniforms.texSizeUV[0] = (float)(ps->vid_w / 2);
     ps->gpu_uniforms.texSizeUV[1] = (float)(ps->vid_h / 2);
+
+    /* ── Chroma siting correction ──
+     *
+     * 4:2:0 chroma samples may be co-sited with luma at different sub-texel
+     * positions depending on the codec. The Catmull-Rom kernel assumes samples
+     * are at texel centers (CENTER siting). For other sitings, we offset the
+     * chroma UV coordinate so the kernel reconstructs at the correct position.
+     *
+     * Math: in 4:2:0, each chroma texel spans 2 luma pixels. CENTER places the
+     * sample at the midpoint of this span (texel center — no correction).
+     * LEFT co-sites with the left luma column, which is 0.5 luma pixels = 0.25
+     * chroma texels away from center. Shader applies: uv + offset / texSizeUV.
+     */
+    enum AVChromaLocation chroma_loc = AVCHROMA_LOC_LEFT; /* safe default */
+    if (ps->fmt_ctx) {
+        AVCodecParameters *par =
+            ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+        if (par->chroma_location != AVCHROMA_LOC_UNSPECIFIED)
+            chroma_loc = par->chroma_location;
+    }
+    ps->chroma_location = (int)chroma_loc;
+
+    switch (chroma_loc) {
+        case AVCHROMA_LOC_CENTER:
+            ps->gpu_uniforms.chromaOffset[0] =  0.0f;
+            ps->gpu_uniforms.chromaOffset[1] =  0.0f;
+            break;
+        case AVCHROMA_LOC_TOPLEFT:
+            ps->gpu_uniforms.chromaOffset[0] = -0.25f;
+            ps->gpu_uniforms.chromaOffset[1] = -0.25f;
+            break;
+        case AVCHROMA_LOC_TOP:
+            ps->gpu_uniforms.chromaOffset[0] =  0.0f;
+            ps->gpu_uniforms.chromaOffset[1] = -0.25f;
+            break;
+        case AVCHROMA_LOC_BOTTOMLEFT:
+            ps->gpu_uniforms.chromaOffset[0] = -0.25f;
+            ps->gpu_uniforms.chromaOffset[1] =  0.25f;
+            break;
+        case AVCHROMA_LOC_BOTTOM:
+            ps->gpu_uniforms.chromaOffset[0] =  0.0f;
+            ps->gpu_uniforms.chromaOffset[1] =  0.25f;
+            break;
+        default: /* LEFT and fallback */
+            ps->gpu_uniforms.chromaOffset[0] = -0.25f;
+            ps->gpu_uniforms.chromaOffset[1] =  0.0f;
+            break;
+    }
+
+    ps->gpu_uniforms._pad[0] = 0.0f;
+    ps->gpu_uniforms._pad[1] = 0.0f;
+
+    static const char *chroma_names[] = {
+        "unspecified", "left", "center", "top-left",
+        "top", "bottom-left", "bottom"
+    };
+    const char *cn = (chroma_loc >= 0 && chroma_loc <= 6)
+        ? chroma_names[chroma_loc] : "unknown";
+    log_msg("GPU: chroma siting=%s (offset %.2f, %.2f texels)",
+            cn, ps->gpu_uniforms.chromaOffset[0],
+            ps->gpu_uniforms.chromaOffset[1]);
 }
 
 
@@ -2235,6 +2301,16 @@ void player_build_debug_info(PlayerState *ps) {
         }
         off += snprintf(buf + off, sz - off,
             "GPU: Lanczos-2 luma, Catmull-Rom chroma, blue noise dither\n");
+
+        {
+            static const char *chroma_names[] = {
+                "unspecified", "left", "center", "top-left",
+                "top", "bottom-left", "bottom"
+            };
+            int cl = ps->chroma_location;
+            const char *cn = (cl >= 0 && cl <= 6) ? chroma_names[cl] : "unknown";
+            off += snprintf(buf + off, sz - off, "Chroma Siting: %s\n", cn);
+        }
     }
 
     /* Audio track info */

@@ -88,7 +88,9 @@ typedef struct GPUUniforms {
     float rangeUV[2];       /* { offset, scale } for UV planes    8 bytes */
     float texSizeY[2];      /* { width, height } of Y texture     8 bytes */
     float texSizeUV[2];     /* { width, height } of UV textures   8 bytes */
-} GPUUniforms;              /*                                   96 bytes */
+    float chromaOffset[2];  /* chroma siting correction (texels)  8 bytes */
+    float _pad[2];          /* 16-byte alignment for std140       8 bytes */
+} GPUUniforms;              /*                                  112 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *
@@ -191,6 +193,7 @@ typedef struct PlayerState {
     /* ── Window geometry ── */
     int                 win_w, win_h;     /* current window size        */
     int                 vid_w, vid_h;     /* video native resolution    */
+    int                 chroma_location;  /* AVChromaLocation for debug overlay */
     SDL_Rect            display_rect;     /* letterboxed video area     */
     int                 sc_w, sc_h;       /* last swapchain dims (physical pixels) */
 
