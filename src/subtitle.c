@@ -11,6 +11,7 @@
  */
 
 #include "dsvp.h"
+#include <zlib.h>
 
 /* ── Font state (module-level) ─────────────────────────────────────── */
 
@@ -274,6 +275,20 @@ int sub_open_codec(PlayerState *ps, int stream_idx) {
     log_msg("Subtitle codec opened: %s (stream %d), canvas %dx%d",
         codec->name, stream_idx,
         ps->sub_codec_ctx->width, ps->sub_codec_ctx->height);
+
+    /* Diagnostic: log codec extradata for PGS format analysis */
+    if (ps->sub_codec_ctx->extradata_size > 0) {
+        char hex[128] = {0};
+        int dump_len = ps->sub_codec_ctx->extradata_size < 20
+                      ? ps->sub_codec_ctx->extradata_size : 20;
+        for (int i = 0; i < dump_len; i++)
+            snprintf(hex + i * 3, sizeof(hex) - i * 3, "%02X ",
+                     ps->sub_codec_ctx->extradata[i]);
+        log_msg("Subtitle extradata (%d bytes): %s",
+                ps->sub_codec_ctx->extradata_size, hex);
+    } else {
+        log_msg("Subtitle extradata: none");
+    }
     return 0;
 }
 
@@ -373,6 +388,49 @@ static void strip_ass_markup(const char *ass_event, char *out, int out_size) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * PGS Zlib Decompression
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Some MKV muxers apply ContentCompression (zlib) to PGS subtitle
+ * tracks. FFmpeg's matroska demuxer doesn't always decompress these
+ * transparently, leaving raw zlib data in the AVPacket. Detect via
+ * the 0x78 zlib magic byte and decompress before decoding.
+ *
+ * Returns: newly allocated decompressed buffer (caller must av_free),
+ *          or NULL if not compressed / decompression failed.
+ *          *out_size is set to the decompressed length on success.
+ */
+static uint8_t *pgs_try_decompress(const uint8_t *data, int size, int *out_size) {
+    if (size < 2 || data[0] != 0x78) return NULL;
+    /* 0x78 followed by 0x01/0x5E/0x9C/0xDA = valid zlib header */
+    uint8_t flg = data[1];
+    if (flg != 0x01 && flg != 0x5E && flg != 0x9C && flg != 0xDA)
+        return NULL;
+
+    /* Start with 10x buffer, retry with larger if needed */
+    uLongf dst_len = (uLongf)size * 10;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint8_t *dst = av_malloc(dst_len);
+        if (!dst) return NULL;
+
+        int zret = uncompress(dst, &dst_len, data, (uLong)size);
+        if (zret == Z_OK) {
+            *out_size = (int)dst_len;
+            return dst;
+        }
+        av_free(dst);
+        if (zret == Z_BUF_ERROR) {
+            dst_len *= 4;  /* buffer too small, try larger */
+            continue;
+        }
+        /* Z_DATA_ERROR or other — not valid zlib */
+        return NULL;
+    }
+    return NULL;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * Subtitle Decoding
  * ═══════════════════════════════════════════════════════════════════
  *
@@ -413,13 +471,55 @@ void sub_decode_pending(PlayerState *ps) {
     }
 
     AVPacket pkt;
+    int pgs_packets_this_drain = 0;
+    double last_pgs_pts = 0.0;
     while (pq_get(spq, &pkt, 0) > 0) {
         AVSubtitle sub;
         int got_sub = 0;
 
-        int ret = avcodec_decode_subtitle2(ps->sub_codec_ctx, &sub, &got_sub, &pkt);
-        if (ret < 0 || !got_sub) {
-            log_msg("Sub: decode failed ret=%d got=%d", ret, got_sub);
+        /* PGS zlib fix: some MKV muxers apply ContentCompression (zlib)
+         * to PGS tracks but FFmpeg's demuxer doesn't always decompress.
+         * Detect 0x78 zlib magic and decompress before decoding. */
+        uint8_t *decompressed = NULL;
+        int decomp_size = 0;
+        AVPacket decode_pkt = pkt;
+        if (ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE) {
+            decompressed = pgs_try_decompress(pkt.data, pkt.size, &decomp_size);
+            if (decompressed) {
+                decode_pkt.data = decompressed;
+                decode_pkt.size = decomp_size;
+            }
+        }
+
+        int ret = avcodec_decode_subtitle2(ps->sub_codec_ctx, &sub, &got_sub, &decode_pkt);
+
+        if (ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE) {
+            log_msg("Sub: MAIN-LOOP pkt_size=%d%s got_sub=%d rects=%u ret=%d seg=0x%02X",
+                    pkt.size, decompressed ? " (zlib)" : "",
+                    got_sub, got_sub ? sub.num_rects : 0, ret,
+                    decode_pkt.size > 0 ? decode_pkt.data[0] : 0);
+        } else {
+            log_msg("Sub: MAIN-LOOP pkt_size=%d got_sub=%d rects=%u ret=%d",
+                    pkt.size, got_sub, got_sub ? sub.num_rects : 0, ret);
+        }
+
+        av_free(decompressed);  /* NULL-safe */
+
+        /* Track PGS packets fed this drain cycle */
+        if (ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE) {
+            pgs_packets_this_drain++;
+            AVStream *pgs_st = ps->fmt_ctx->streams[ps->sub_active_idx];
+            if (pkt.pts != AV_NOPTS_VALUE)
+                last_pgs_pts = (double)pkt.pts * av_q2d(pgs_st->time_base);
+        }
+        if (ret < 0) {
+            log_msg("Sub: decode error ret=%d", ret);
+            av_packet_unref(&pkt);
+            continue;
+        }
+        if (!got_sub) {
+            /* Normal for PGS: decoder accumulates segments (PCS, WDS,
+             * PDS, ODS) and only outputs on DISPLAY_SEGMENT (0x80). */
             av_packet_unref(&pkt);
             continue;
         }
@@ -576,6 +676,92 @@ void sub_decode_pending(PlayerState *ps) {
         ps->sub_end_pts   = end;
         ps->sub_valid     = 1;
         break;  /* Show this one, leave rest in queue for later */
+    }
+
+    /* ── PGS post-drain: inject synthetic END segment ──
+     * MKV muxers strip the zero-length END segment (0x80) that triggers
+     * display set output in FFmpeg's PGS decoder. The decoder accumulates
+     * PCS/WDS/PDS/ODS across calls but never fires without END.
+     *
+     * Key: only inject ONCE after draining real PGS packets — not every
+     * idle frame. display_end_segment() resets presentation state, so a
+     * premature END (before all segments arrive) would clear accumulated
+     * data. By waiting until the queue is fully drained, all segments
+     * from the current display set are loaded and END can assemble them. */
+    if (pgs_packets_this_drain > 0 && !ps->sub_valid &&
+        ps->sub_codec_ctx &&
+        ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE) {
+
+        static const uint8_t end_seg[] = { 0x80, 0x00, 0x00 };
+        AVPacket end_pkt;
+        memset(&end_pkt, 0, sizeof(end_pkt));
+        end_pkt.data = (uint8_t *)end_seg;
+        end_pkt.size = sizeof(end_seg);
+
+        AVSubtitle sub;
+        int got_sub = 0;
+        int ret = avcodec_decode_subtitle2(ps->sub_codec_ctx, &sub, &got_sub, &end_pkt);
+        log_msg("Sub: PGS-END inject after %d pkts: got_sub=%d rects=%u ret=%d last_pts=%.1f",
+                pgs_packets_this_drain, got_sub, got_sub ? sub.num_rects : 0, ret, last_pgs_pts);
+
+        if (ret >= 0 && got_sub) {
+            double start = last_pgs_pts + (double)sub.start_display_time / 1000.0;
+            double end   = last_pgs_pts + (double)sub.end_display_time / 1000.0;
+            if (sub.end_display_time == 0) end = start + 5.0;
+            if (end - start > 30.0) end = start + 30.0;
+
+            if (sub.num_rects == 0) {
+                log_msg("Sub: PGS-END clear (0 rects, pts=%.1f)", last_pgs_pts);
+                ps->sub_valid = 0;
+                sub_clear_bitmaps(ps);
+                avsubtitle_free(&sub);
+            } else {
+                sub_clear_bitmaps(ps);
+                int got_bitmap = 0;
+                for (unsigned i = 0; i < sub.num_rects; i++) {
+                    AVSubtitleRect *rect = sub.rects[i];
+                    if (rect->type == SUBTITLE_BITMAP &&
+                        rect->data[0] && rect->data[1] &&
+                        rect->w > 0 && rect->h > 0 &&
+                        ps->sub_bitmap_count < MAX_SUB_BITMAPS) {
+                        uint32_t *palette = (uint32_t *)rect->data[1];
+                        int w = rect->w, h = rect->h;
+                        uint8_t *rgba = av_malloc(w * h * 4);
+                        if (rgba) {
+                            for (int row = 0; row < h; row++) {
+                                for (int col = 0; col < w; col++) {
+                                    uint8_t idx = rect->data[0][row * rect->linesize[0] + col];
+                                    uint32_t color = palette[idx];
+                                    int off = (row * w + col) * 4;
+                                    rgba[off + 0] = (color >> 16) & 0xFF;
+                                    rgba[off + 1] = (color >> 8)  & 0xFF;
+                                    rgba[off + 2] =  color        & 0xFF;
+                                    rgba[off + 3] = (color >> 24) & 0xFF;
+                                }
+                            }
+                            int bi = ps->sub_bitmap_count;
+                            ps->sub_bitmap_data[bi] = rgba;
+                            ps->sub_bitmap_w[bi] = w;
+                            ps->sub_bitmap_h[bi] = h;
+                            ps->sub_bitmap_rects[bi] = (SDL_Rect){ rect->x, rect->y, w, h };
+                            ps->sub_bitmap_count++;
+                            got_bitmap = 1;
+                            log_msg("Sub [PGS BITMAP] %.1f-%.1f: %dx%d at (%d,%d)",
+                                    start, end, w, h, rect->x, rect->y);
+                        }
+                    }
+                }
+                avsubtitle_free(&sub);
+
+                if (got_bitmap) {
+                    ps->sub_is_bitmap = 1;
+                    ps->sub_text[0] = '\0';
+                    ps->sub_start_pts = start;
+                    ps->sub_end_pts   = end;
+                    ps->sub_valid     = 1;
+                }
+            }
+        }
     }
 }
 

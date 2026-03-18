@@ -7,12 +7,12 @@ BUILDDIR = build
 
 # ── Base flags (SDL3, FFmpeg) ──
 BASE_CFLAGS  = -Wall -Wextra -O2 $(shell pkg-config --cflags sdl3 SDL3_ttf libavformat libavcodec libavutil libswscale libswresample)
-BASE_LDFLAGS = $(shell pkg-config --libs sdl3 SDL3_ttf libavformat libavcodec libavutil libswscale libswresample) -lm
+BASE_LDFLAGS = $(shell pkg-config --libs sdl3 SDL3_ttf libavformat libavcodec libavutil libswscale libswresample) -lm -lz
 
 # If pkg-config doesn't find SDL3_ttf, try sdl3-ttf
 ifeq ($(shell pkg-config --exists SDL3_ttf 2>/dev/null && echo yes),)
   BASE_CFLAGS  = -Wall -Wextra -O2 $(shell pkg-config --cflags sdl3 sdl3-ttf libavformat libavcodec libavutil libswscale libswresample 2>/dev/null)
-  BASE_LDFLAGS = $(shell pkg-config --libs sdl3 sdl3-ttf libavformat libavcodec libavutil libswscale libswresample 2>/dev/null) -lm
+  BASE_LDFLAGS = $(shell pkg-config --libs sdl3 sdl3-ttf libavformat libavcodec libavutil libswscale libswresample 2>/dev/null) -lm -lz
 endif
 
 # ── SDL3_shadercross (bundled on Windows, pkg-config on Linux) ──
