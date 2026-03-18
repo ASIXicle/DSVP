@@ -17,6 +17,7 @@
 
 #include "dsvp.h"
 #include "dsvp_icon.h"
+#include <dirent.h>
 
 /* Platform-specific file dialog */
 #ifdef _WIN32
@@ -106,6 +107,146 @@ static int open_file_dialog(char *out, int out_size) {
     pclose(fp);
     return 0;
 #endif
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Folder Playlist — prev/next file navigation
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Scans the parent directory of the current file for playable media,
+ * sorts alphabetically, and allows navigating to adjacent entries.
+ */
+
+static const char *video_extensions[] = {
+    ".mkv", ".mp4", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v",
+    ".ts", ".m2ts", ".mpg", ".mpeg", ".3gp",
+    ".mp3", ".flac", ".wav", ".aac", ".ogg", ".opus", ".m4a", ".wma",
+    NULL
+};
+
+static int is_media_file(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot) return 0;
+    for (int i = 0; video_extensions[i]; i++) {
+#ifdef _WIN32
+        if (_stricmp(dot, video_extensions[i]) == 0) return 1;
+#else
+        if (strcasecmp(dot, video_extensions[i]) == 0) return 1;
+#endif
+    }
+    return 0;
+}
+
+static int cmp_strings(const void *a, const void *b) {
+    const char *sa = *(const char **)a;
+    const char *sb = *(const char **)b;
+#ifdef _WIN32
+    return _stricmp(sa, sb);
+#else
+    return strcasecmp(sa, sb);
+#endif
+}
+
+static void playlist_free(PlayerState *ps) {
+    if (ps->playlist_files) {
+        for (int i = 0; i < ps->playlist_count; i++)
+            free(ps->playlist_files[i]);
+        free(ps->playlist_files);
+        ps->playlist_files = NULL;
+    }
+    ps->playlist_count = 0;
+    ps->playlist_index = -1;
+}
+
+/* Scan the directory containing `filepath` for playable media files.
+ * Populates ps->playlist_files (sorted), playlist_count, playlist_index. */
+static void playlist_scan(PlayerState *ps) {
+    playlist_free(ps);
+    if (!ps->filepath[0]) return;
+
+    /* Extract directory and filename from filepath */
+    char dir[1024], base[1024];
+    strncpy(dir, ps->filepath, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = '\0';
+
+    /* Find last separator */
+    char *sep = strrchr(dir, '/');
+#ifdef _WIN32
+    char *sep2 = strrchr(dir, '\\');
+    if (sep2 && (!sep || sep2 > sep)) sep = sep2;
+#endif
+    if (sep) {
+        strncpy(base, sep + 1, sizeof(base) - 1);
+        base[sizeof(base) - 1] = '\0';
+        *(sep + 1) = '\0';  /* dir now ends with separator */
+    } else {
+        strncpy(base, dir, sizeof(base) - 1);
+        base[sizeof(base) - 1] = '\0';
+        strcpy(dir, ".");
+    }
+
+    /* Scan directory */
+    DIR *d = opendir(dir);
+    if (!d) {
+        log_msg("playlist_scan: cannot open directory: %s", dir);
+        return;
+    }
+
+    /* First pass: count files */
+    int capacity = 64;
+    char **files = malloc(capacity * sizeof(char *));
+    if (!files) { closedir(d); return; }
+    int count = 0;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;  /* skip hidden */
+        if (!is_media_file(ent->d_name)) continue;
+
+        /* Build full path */
+        char fullpath[2048];
+        snprintf(fullpath, sizeof(fullpath), "%s%s", dir, ent->d_name);
+
+        if (count >= capacity) {
+            capacity *= 2;
+            char **tmp = realloc(files, capacity * sizeof(char *));
+            if (!tmp) break;
+            files = tmp;
+        }
+        files[count] = strdup(fullpath);
+        if (!files[count]) break;
+        count++;
+    }
+    closedir(d);
+
+    if (count == 0) {
+        free(files);
+        return;
+    }
+
+    /* Sort alphabetically */
+    qsort(files, count, sizeof(char *), cmp_strings);
+
+    ps->playlist_files = files;
+    ps->playlist_count = count;
+
+    /* Find current file's index */
+    ps->playlist_index = -1;
+    for (int i = 0; i < count; i++) {
+        /* Compare against full filepath */
+#ifdef _WIN32
+        if (_stricmp(files[i], ps->filepath) == 0) {
+#else
+        if (strcmp(files[i], ps->filepath) == 0) {
+#endif
+            ps->playlist_index = i;
+            break;
+        }
+    }
+
+    log_msg("playlist_scan: %d files in folder, current index=%d",
+            count, ps->playlist_index);
 }
 
 
@@ -306,6 +447,8 @@ int main(int argc, char *argv[]) {
     if (argc > 1) {
         if (player_open(&ps, argv[1]) != 0) {
             log_msg("ERROR: Failed to open: %s", argv[1]);
+        } else {
+            playlist_scan(&ps);
         }
     }
 
@@ -345,6 +488,8 @@ int main(int argc, char *argv[]) {
                         ps.quit = 0;
                         if (player_open(&ps, path) != 0) {
                             log_msg("ERROR: Failed to open: %s", path);
+                        } else {
+                            playlist_scan(&ps);
                         }
                     } else {
                         log_msg("File dialog cancelled");
@@ -440,6 +585,51 @@ int main(int argc, char *argv[]) {
                     ps.seekbar_hide_time = get_time_sec() + 1.5;
                     break;
 
+                case SDLK_N:  /* Next file in folder */
+                case SDLK_B:  /* Previous (Back) file in folder */
+                {
+                    int delta = (ev.key.key == SDLK_N) ? 1 : -1;
+                    if (ps.playlist_count > 0 && ps.playlist_index >= 0) {
+                        int next = ps.playlist_index + delta;
+                        if (next < 0 || next >= ps.playlist_count) {
+                            /* At boundary — show OSD */
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                     "No %s file in folder",
+                                     delta > 0 ? "next" : "previous");
+                            ps.aud_osd_until = get_time_sec() + 2.0;
+                        } else {
+                            /* Save playlist state before close */
+                            char **saved_files = ps.playlist_files;
+                            int saved_count = ps.playlist_count;
+                            int saved_index = next;
+                            ps.playlist_files = NULL; /* prevent close from freeing */
+                            ps.playlist_count = 0;
+
+                            int was_fs = ps.fullscreen;
+                            player_close(&ps);
+                            ps.fullscreen = was_fs;
+
+                            log_msg("Playlist nav: opening [%d/%d] %s",
+                                    saved_index + 1, saved_count,
+                                    saved_files[saved_index]);
+
+                            if (player_open(&ps, saved_files[saved_index]) == 0) {
+                                ps.playlist_files = saved_files;
+                                ps.playlist_count = saved_count;
+                                ps.playlist_index = saved_index;
+                            } else {
+                                log_msg("ERROR: Failed to open: %s",
+                                        saved_files[saved_index]);
+                                /* Restore playlist so user can try again */
+                                ps.playlist_files = saved_files;
+                                ps.playlist_count = saved_count;
+                                ps.playlist_index = saved_index;
+                            }
+                        }
+                    }
+                    break;
+                }
+
                 default:
                     break;
                 }
@@ -460,37 +650,62 @@ int main(int argc, char *argv[]) {
                     }
                 }
 
-                /* Click on seek bar progress track to seek.
+                /* Click on seek bar — buttons and progress track.
                  * Geometry must match overlay.c draw_seekbar() layout:
-                 *   [margin][time][12px][==track==][12px][sep][vol][margin]
-                 * We approximate the text widths since the bitmap font
-                 * helpers live in overlay.c. */
+                 *   [btn_margin][◀][gap][▶][gap][time][12][==track==][12][sep][vol][margin]
+                 * s = UI scale factor (1 windowed, 2 fullscreen) must
+                 * match s_ui_scale in overlay.c. */
                 if (ev.button.button == SDL_BUTTON_LEFT && ps.playing
                         && ps.show_seekbar) {
                     int w_now, h_now;
                     SDL_GetWindowSize(window, &w_now, &h_now);
-                    int bar_h = 30;
+                    int s = ps.fullscreen ? 2 : 1;
+                    int bar_h = 30 * s;
                     int bar_y = h_now - bar_h;
-                    int margin = 20;
+                    int margin = 20 * s;
 
                     if (ev.button.y >= bar_y && ev.button.y <= h_now) {
-                        /* Volume area: "Vol: 100%" ≈ 9 chars × 6px = 54,
-                         * plus margin. Generous to avoid false seeks. */
-                        int vol_area_w = margin + 60;
-                        int sep_x = w_now - vol_area_w - 12;
-                        /* Time text: "0:00:00 / 0:00:00" ≈ 17 chars × 6 = 102 */
-                        int track_x = margin + 110;
-                        int track_w = sep_x - track_x - 12;
+                        /* Button geometry (must match overlay.c) */
+                        int btn_x = 8 * s;
+                        int btn_sz = 8 * s;
+                        int btn_gap = 10 * s;
+                        int btn2_x = btn_x + btn_sz + btn_gap;
+                        int content_x = btn2_x + btn_sz + btn_gap;
 
-                        if (track_w > 20 && ev.button.x >= track_x
-                                && ev.button.x <= track_x + track_w) {
-                            double frac = (double)(ev.button.x - track_x) / track_w;
-                            if (frac < 0.0) frac = 0.0;
-                            if (frac > 1.0) frac = 1.0;
-                            double duration = (ps.fmt_ctx->duration != AV_NOPTS_VALUE)
-                                ? (double)ps.fmt_ctx->duration / AV_TIME_BASE : 0.0;
-                            double target = frac * duration;
-                            player_seek(&ps, target - ps.video_clock);
+                        /* Prev button click area */
+                        if (ev.button.x >= btn_x &&
+                                ev.button.x <= btn_x + btn_sz) {
+                            SDL_Event fake = {0};
+                            fake.type = SDL_EVENT_KEY_DOWN;
+                            fake.key.key = SDLK_B;
+                            SDL_PushEvent(&fake);
+                        }
+                        /* Next button click area */
+                        else if (ev.button.x >= btn2_x &&
+                                ev.button.x <= btn2_x + btn_sz) {
+                            SDL_Event fake = {0};
+                            fake.type = SDL_EVENT_KEY_DOWN;
+                            fake.key.key = SDLK_N;
+                            SDL_PushEvent(&fake);
+                        }
+                        /* Seek track */
+                        else {
+                            int vol_area_w = margin + 60 * s;
+                            int sep_x = w_now - vol_area_w - 12 * s;
+                            /* Time text: ≈ 17 chars × 6px = 102 */
+                            int track_x = content_x + 110 * s;
+                            int track_w = sep_x - track_x - 12 * s;
+
+                            if (track_w > 20 && ev.button.x >= track_x
+                                    && ev.button.x <= track_x + track_w) {
+                                double frac = (double)(ev.button.x - track_x) / track_w;
+                                if (frac < 0.0) frac = 0.0;
+                                if (frac > 1.0) frac = 1.0;
+                                double duration = (ps.fmt_ctx->duration != AV_NOPTS_VALUE)
+                                    ? (double)ps.fmt_ctx->duration / AV_TIME_BASE : 0.0;
+                                double target = frac * duration;
+                                player_seek(&ps, target - ps.video_clock);
+                            }
                         }
                     }
                 }
@@ -705,6 +920,16 @@ int main(int argc, char *argv[]) {
                 video_reblit(&ps);
             }
 
+            /* If playback ended this tick (player_close was called in the
+             * decode loop above), draw idle immediately so the swapchain
+             * gets a frame.  Without this, one tick has no GPU submission
+             * and some compositors (Gamescope/Steam Deck) show a stale
+             * buffer instead of the last presented frame. */
+            if (!ps.playing) {
+                gpu_draw_idle(&ps);
+                SDL_ShowCursor();
+            }
+
 
         } else if (ps.playing && ps.paused) {
             /* Paused — decode pending subs, render overlays, redraw current frame */
@@ -730,6 +955,7 @@ int main(int argc, char *argv[]) {
     /* ── Cleanup ── */
     log_msg("Shutting down");
     if (ps.playing) player_close(&ps);
+    playlist_free(&ps);
     sub_close_font();
     gpu_destroy_pipelines(&ps);
     SDL_ReleaseWindowFromGPUDevice(gpu_device, window);

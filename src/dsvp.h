@@ -246,6 +246,11 @@ typedef struct PlayerState {
     double              diag_max_av_drift;     /* worst A/V drift (signed) */
     double              diag_last_report;      /* time of last periodic log*/
 
+    /* ── Folder playlist (prev/next navigation) ── */
+    char              **playlist_files;      /* sorted full paths          */
+    int                 playlist_count;      /* number of playable files   */
+    int                 playlist_index;      /* current file's index (-1)  */
+
 } PlayerState;
 
 /* ── Packet Queue API ─────────────────────────────────────────────── */

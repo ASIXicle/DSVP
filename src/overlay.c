@@ -333,6 +333,12 @@ static void blit_rgba_scaled(uint8_t *buf, int bw, int bh,
 }
 
 
+/* UI scale factor: 1× in windowed mode, 2× in fullscreen.
+ * Set at the top of overlay_render() and overlay_render_idle()
+ * before any draw calls. Multiplied into all hardcoded pixel
+ * sizes (bar heights, margins, font scales, padding). */
+static int s_ui_scale = 1;
+
 /* ═══════════════════════════════════════════════════════════════════
  * Overlay Components
  * ═══════════════════════════════════════════════════════════════════ */
@@ -349,28 +355,74 @@ static void draw_seekbar(uint8_t *buf, int bw, int bh, PlayerState *ps) {
     if (pos < 0.0) pos = 0.0;
     if (duration > 0.0 && pos > duration) pos = duration;
 
-    int bar_h = 30;
+    int bar_h = 30 * s_ui_scale;
     int bar_y = bh - bar_h;
-    int margin = 20;
+    int margin = 20 * s_ui_scale;
+    int sc = s_ui_scale;  /* shorthand for text scale */
 
     /* Background bar */
     fill_rect(buf, bw, bh, 0, bar_y, bw, bar_h, 0, 0, 0, 160);
 
+    /* ── Prev/Next buttons (far left, before time) ── */
+    int btn_x = 8 * sc;
+    int btn_sz = 8 * sc;         /* triangle bounding box */
+    int btn_gap = 10 * sc;       /* gap between buttons */
+    int btn_cy = bar_y + bar_h / 2;  /* vertical center */
+    int has_prev = (ps->playlist_count > 0 && ps->playlist_index > 0);
+    int has_next = (ps->playlist_count > 0 &&
+                    ps->playlist_index >= 0 &&
+                    ps->playlist_index < ps->playlist_count - 1);
+
+    /* Prev button: left-pointing triangle */
+    {
+        uint8_t br = has_prev ? 200 : 80;
+        uint8_t bg = has_prev ? 200 : 80;
+        uint8_t bb = has_prev ? 200 : 80;
+        for (int row = 0; row < btn_sz; row++) {
+            int half = btn_sz / 2;
+            int dist = (row < half) ? (half - row) : (row - half + 1);
+            int w = btn_sz - dist;
+            if (w < 1) w = 1;
+            int x0 = btn_x + (btn_sz - w);
+            int y0 = btn_cy - btn_sz / 2 + row;
+            fill_rect(buf, bw, bh, x0, y0, w, 1, br, bg, bb, 255);
+        }
+    }
+
+    /* Next button: right-pointing triangle */
+    int btn2_x = btn_x + btn_sz + btn_gap;
+    {
+        uint8_t br = has_next ? 200 : 80;
+        uint8_t bg = has_next ? 200 : 80;
+        uint8_t bb = has_next ? 200 : 80;
+        for (int row = 0; row < btn_sz; row++) {
+            int half = btn_sz / 2;
+            int dist = (row < half) ? (half - row) : (row - half + 1);
+            int w = btn_sz - dist;
+            if (w < 1) w = 1;
+            int y0 = btn_cy - btn_sz / 2 + row;
+            fill_rect(buf, bw, bh, btn2_x, y0, w, 1, br, bg, bb, 255);
+        }
+    }
+
+    /* Content starts after buttons */
+    int content_x = btn2_x + btn_sz + btn_gap;
+
     /* ── Volume area (right side) ── */
     char vol_str[16];
     snprintf(vol_str, sizeof(vol_str), "Vol: %.0f%%", ps->volume * 100.0);
-    int vol_tw = text_width(vol_str, 1);
+    int vol_tw = text_width(vol_str, sc);
     int vol_area_w = vol_tw + margin;  /* right margin included */
     int vol_x = bw - margin - vol_tw;
 
     /* Separator line */
-    int sep_x = bw - vol_area_w - 12;
-    fill_rect(buf, bw, bh, sep_x, bar_y + 6, 1, bar_h - 12, 100, 100, 100, 160);
+    int sep_x = bw - vol_area_w - 12 * sc;
+    fill_rect(buf, bw, bh, sep_x, bar_y + 6 * sc, 1 * sc, bar_h - 12 * sc, 100, 100, 100, 160);
 
-    draw_text(buf, bw, bh, vol_x, bar_y + (bar_h - FONT_H) / 2,
-              vol_str, 1, 180, 180, 180);
+    draw_text(buf, bw, bh, vol_x, bar_y + (bar_h - FONT_H * sc) / 2,
+              vol_str, sc, 180, 180, 180);
 
-    /* ── Time text (left side) ── */
+    /* ── Time text (after buttons) ── */
     int p_h = (int)pos / 3600, p_m = ((int)pos % 3600) / 60, p_s = (int)pos % 60;
     int d_h = (int)duration / 3600, d_m = ((int)duration % 3600) / 60, d_s = (int)duration % 60;
 
@@ -382,15 +434,15 @@ static void draw_seekbar(uint8_t *buf, int bw, int bh, PlayerState *ps) {
         snprintf(time_str, sizeof(time_str), "%d:%02d / %d:%02d",
                  p_m, p_s, d_m, d_s);
 
-    int time_tw = text_width(time_str, 1);
-    draw_text(buf, bw, bh, margin, bar_y + (bar_h - FONT_H) / 2,
-              time_str, 1, 200, 200, 200);
+    int time_tw = text_width(time_str, sc);
+    draw_text(buf, bw, bh, content_x, bar_y + (bar_h - FONT_H * sc) / 2,
+              time_str, sc, 200, 200, 200);
 
     /* ── Progress track (between time and separator) ── */
-    int track_x = margin + time_tw + 12;
-    int track_w = sep_x - track_x - 12;
-    int track_y = bar_y + bar_h / 2 - 2;
-    int track_h = 4;
+    int track_x = content_x + time_tw + 12 * sc;
+    int track_w = sep_x - track_x - 12 * sc;
+    int track_y = bar_y + bar_h / 2 - 2 * sc;
+    int track_h = 4 * sc;
 
     if (track_w > 20) {
         fill_rect(buf, bw, bh, track_x, track_y, track_w, track_h, 80, 80, 80, 200);
@@ -403,9 +455,10 @@ static void draw_seekbar(uint8_t *buf, int bw, int bh, PlayerState *ps) {
                       200, 200, 200, 240);
 
             /* Playhead dot */
-            int dot_x = track_x + fill_w - 4;
-            int dot_y = track_y - 2;
-            fill_rect(buf, bw, bh, dot_x, dot_y, 8, 8, 240, 240, 240, 255);
+            int dot_sz = 8 * sc;
+            int dot_x = track_x + fill_w - dot_sz / 2;
+            int dot_y = track_y - 2 * sc;
+            fill_rect(buf, bw, bh, dot_x, dot_y, dot_sz, dot_sz, 240, 240, 240, 255);
         }
     }
 }
@@ -474,7 +527,8 @@ static void draw_osd(uint8_t *buf, int bw, int bh, const char *text) {
  * Semi-transparent bar at top of screen showing key bindings.
  * Appears with the seek bar, auto-hides together. */
 static void draw_menubar(uint8_t *buf, int bw, int bh) {
-    int bar_h = 22;
+    int sc = s_ui_scale;
+    int bar_h = 22 * sc;
 
     /* Background bar */
     fill_rect(buf, bw, bh, 0, 0, bw, bar_h, 0, 0, 0, 140);
@@ -483,13 +537,13 @@ static void draw_menubar(uint8_t *buf, int bw, int bh) {
     const char *items[] = {
         "[O] Open",  "[Space] Pause",  "[F] Fullscreen",
         "[D] Debug",  "[I] Info",  "[S] Sub",
-        "[A] Audio",  "[Q] Close",  NULL
+        "[A] Audio",  "[B] Prev",  "[N] Next",  "[Q] Close",  NULL
     };
 
-    int margin = 12;
-    int gap = 16;
+    int margin = 12 * sc;
+    int gap = 16 * sc;
     int x = margin;
-    int y = (bar_h - FONT_H) / 2;
+    int y = (bar_h - FONT_H * sc) / 2;
 
     for (int i = 0; items[i]; i++) {
         /* Key notation in brighter color */
@@ -499,16 +553,16 @@ static void draw_menubar(uint8_t *buf, int bw, int bh) {
                 /* Opening bracket + key in accent color */
                 p++;  /* skip '[' */
                 while (*p && *p != ']') {
-                    draw_char(buf, bw, bh, x, y, *p, 1, 180, 200, 240);
-                    x += (FONT_W + FONT_GAP);
+                    draw_char(buf, bw, bh, x, y, *p, sc, 180, 200, 240);
+                    x += (FONT_W + FONT_GAP) * sc;
                     p++;
                 }
                 if (*p == ']') p++;  /* skip ']' */
                 /* Space before label */
-                x += (FONT_W + FONT_GAP) / 2;
+                x += (FONT_W + FONT_GAP) * sc / 2;
             } else {
-                draw_char(buf, bw, bh, x, y, *p, 1, 150, 150, 150);
-                x += (FONT_W + FONT_GAP);
+                draw_char(buf, bw, bh, x, y, *p, sc, 150, 150, 150);
+                x += (FONT_W + FONT_GAP) * sc;
                 p++;
             }
         }
@@ -639,6 +693,8 @@ void overlay_render_idle(PlayerState *ps) {
     int h = (ps->sc_h > 0) ? ps->sc_h : ps->win_h;
     if (w <= 0 || h <= 0) return;
 
+    s_ui_scale = ps->fullscreen ? 2 : 1;
+
     if (gpu_overlay_ensure(ps, w, h) < 0) {
         ps->overlay_active = 0;
         return;
@@ -655,7 +711,8 @@ void overlay_render_idle(PlayerState *ps) {
     memset(s_pixels, 0, buf_size);
 
     /* ── Title: "DSVP" in large bitmap font ── */
-    int title_scale = 6;
+    int S = s_ui_scale;
+    int title_scale = 6 * S;
     const char *title = "DSVP";
     int title_tw = text_width(title, title_scale);
     int title_x = (w - title_tw) / 2;
@@ -664,25 +721,25 @@ void overlay_render_idle(PlayerState *ps) {
               180, 190, 210);
 
     /* ── Version ── */
-    int ver_scale = 1;
+    int ver_scale = 1 * S;
     char ver_str[64];
     snprintf(ver_str, sizeof(ver_str), "v%s", DSVP_VERSION);
     int ver_tw = text_width(ver_str, ver_scale);
-    int ver_y = title_y + FONT_H * title_scale + 16;
+    int ver_y = title_y + FONT_H * title_scale + 16 * S;
     draw_text(s_pixels, w, h, (w - ver_tw) / 2, ver_y, ver_str, ver_scale,
               120, 120, 130);
 
     /* ── Subtitle ── */
-    int sub_scale = 1;
+    int sub_scale = 1 * S;
     const char *subtitle = "Dead Simple Video Player";
     int sub_tw = text_width(subtitle, sub_scale);
-    int sub_y = ver_y + FONT_H * ver_scale + 10;
+    int sub_y = ver_y + FONT_H * ver_scale + 10 * S;
     draw_text(s_pixels, w, h, (w - sub_tw) / 2, sub_y, subtitle, sub_scale,
               100, 100, 110);
 
     /* ── Hotkey reference ── */
-    int key_scale = 2;
-    int key_y = sub_y + FONT_H * sub_scale + 40;
+    int key_scale = 2 * S;
+    int key_y = sub_y + FONT_H * sub_scale + 40 * S;
 
     /* Two-column layout: key on left, description on right */
     static const char *keys[][2] = {
@@ -695,6 +752,7 @@ void overlay_render_idle(PlayerState *ps) {
         { "A",     "Cycle audio tracks" },
         { "Left/Right", "Seek 5s" },
         { "Up/Down",    "Volume" },
+        { "B/N",        "Prev / Next file" },
         { "Q",     "Close / Quit" },
         { NULL, NULL }
     };
@@ -710,7 +768,7 @@ void overlay_render_idle(PlayerState *ps) {
 
     /* Center the key block horizontally */
     int block_x = (w - col_gap - text_width("Toggle fullscreen", key_scale)) / 2;
-    if (block_x < 40) block_x = 40;
+    if (block_x < 40 * S) block_x = 40 * S;
 
     for (int i = 0; keys[i][0]; i++) {
         int y = key_y + i * line_h;
@@ -746,6 +804,8 @@ void overlay_render(PlayerState *ps) {
         ps->overlay_active = 0;
         return;
     }
+
+    s_ui_scale = ps->fullscreen ? 2 : 1;
 
     double now = get_time_sec();
 
