@@ -1235,8 +1235,10 @@ int player_open(PlayerState *ps, const char *filename) {
         ps->video_codec_ctx = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(ps->video_codec_ctx, vs->codecpar);
 
-        /* Force software decode — use all available CPU threads */
-        ps->video_codec_ctx->thread_count = 0; /* auto-detect */
+        /* Force software decode — configurable thread count for tuning */
+        const char *tenv = getenv("DSVP_THREADS");
+        int tcount = tenv ? atoi(tenv) : 0;  /* 0 = FFmpeg auto-detect */
+        ps->video_codec_ctx->thread_count = tcount;
         ps->video_codec_ctx->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
 
         ret = avcodec_open2(ps->video_codec_ctx, codec, NULL);
