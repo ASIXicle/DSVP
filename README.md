@@ -3,11 +3,11 @@
 
 <img alt="DSVPmenu" src="docs/DSVPmenu.png" />
 
-WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer a mpv-style player without configs or intimidation factor. Think of DSVP as a middle-man between VLC and mpv. It's not as SOTA as mpv but should be more "user-friendly". Or less, if you don't have a  keyboard. Should offer better quality than VLC as it uses more modern FFmpeg libraries. It *should* play anything you throw at it.
+WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer a mpv-style player without configs or intimidation factor. Think of DSVP as a middle-man between VLC and mpv. It's not as SOTA as mpv but should be more "user-friendly". Or less, if you don't have a keyboard. Should offer better quality than VLC as it uses more modern FFmpeg libraries. It *should* play anything you throw at it.
 
-There are portable Windows & Debian builds you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/).
+There are portable Windows & Linux builds you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/). The portable tarball bundles all dependencies including FFmpeg 8.1 — just extract and run.
 
-REQUIRES Visual C++ Redistributable runtime (vcruntime140.dll). It's probably already on your PC but you can get it here:
+REQUIRES Visual C++ Redistributable runtime on Windows (vcruntime140.dll). It's probably already on your PC but you can get it here:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170
 
 Claude wrote most of this:
@@ -100,11 +100,11 @@ The binary lands in `build/dsvp.exe` with all required DLLs auto-copied.
 **1. Install system packages:**
 ```bash
 sudo apt install gcc make pkg-config \
-    libavformat-dev libavcodec-dev libswscale-dev \
-    libswresample-dev libavutil-dev \
     libsdl3-dev libsdl3-ttf-dev \
     zlib1g-dev fonts-dejavu-core fonts-noto-cjk zenity
 ```
+
+> **FFmpeg 8.0+ required.** Debian/Ubuntu may ship an older version (check with `ffmpeg -version`). If your system FFmpeg is below 8.0, see [SETUP.md](SETUP.md) for instructions on building FFmpeg 8.1 from source into a local prefix. The portable tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/) bundles FFmpeg 8.1 and requires no system FFmpeg.
 
 **2. SDL3_shadercross** is bundled in `shadercross/SDL3_shadercross-3.0.0-linux-x64/`. No action needed — the Makefile finds it automatically.
 

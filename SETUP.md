@@ -84,15 +84,67 @@ Output: `build/dsvp.exe` plus auto-copied DLLs (SDL3.dll, SDL3_ttf.dll, SDL3_sha
 
 ```bash
 sudo apt install gcc make pkg-config \
-    libavformat-dev libavcodec-dev libswscale-dev \
-    libswresample-dev libavutil-dev \
     libsdl3-dev libsdl3-ttf-dev \
     zlib1g-dev fonts-dejavu-core fonts-noto-cjk zenity
 ```
 
 `fonts-noto-cjk` provides CJK subtitle fallback. `zenity` provides the file-open dialog.
 
-### Step 2: SDL3_shadercross
+### Step 2: FFmpeg 8.0+
+
+DSVP requires FFmpeg 8.0 or newer. Check your system version:
+
+```bash
+ffmpeg -version | head -1
+```
+
+**If your system FFmpeg is 8.0+**, install the dev packages and skip to Step 3:
+
+```bash
+sudo apt install libavformat-dev libavcodec-dev libswscale-dev \
+    libswresample-dev libavutil-dev
+```
+
+**If your system FFmpeg is older (e.g. Debian ships 7.x)**, build FFmpeg 8.1 from source into a local prefix. This does not replace your system FFmpeg — it installs alongside it in your home directory.
+
+```bash
+# Install build dependencies
+sudo apt install build-essential nasm yasm \
+    libx264-dev libx265-dev libvpx-dev libopus-dev
+
+# Download and extract
+cd ~/Documents
+wget https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz
+tar xf ffmpeg-8.1.tar.xz
+cd ffmpeg-8.1
+
+# Configure for decode-only (no CLI tools, no encoders — just the libraries DSVP links against)
+./configure --prefix=$HOME/ffmpeg-8.1-local \
+    --enable-shared --disable-static \
+    --enable-gpl \
+    --disable-programs --disable-doc \
+    --disable-encoders --disable-muxers
+
+# Build and install to ~/ffmpeg-8.1-local/
+make -j$(nproc)
+make install
+```
+
+Then set `PKG_CONFIG_PATH` so the DSVP Makefile finds the local FFmpeg. Add this to your `~/.bashrc` for persistence:
+
+```bash
+export PKG_CONFIG_PATH=$HOME/ffmpeg-8.1-local/lib/pkgconfig:$PKG_CONFIG_PATH
+```
+
+Verify it took effect:
+
+```bash
+source ~/.bashrc
+pkg-config --modversion libavcodec
+# Should print 62.28.100 (FFmpeg 8.1)
+```
+
+### Step 3: SDL3_shadercross
 
 Already bundled in the repo at `shadercross/SDL3_shadercross-3.0.0-linux-x64/`. The Makefile finds it automatically. No action needed.
 
@@ -112,7 +164,7 @@ ln -sf libvkd3d-shader.so.1.17.0 libvkd3d-shader.so.1
 ln -sf libvkd3d-shader.so.1.17.0 libvkd3d-shader.so
 ```
 
-### Step 3: Build
+### Step 4: Build
 
 ```bash
 cd ~/Documents/DSVP/DSVP   # or wherever your clone lives
@@ -121,7 +173,17 @@ make
 
 Output: `build/dsvp`
 
-### Step 4: Run
+If you built FFmpeg from source, the binary will link against the 8.1 `.so` files. At runtime you'll need `LD_LIBRARY_PATH` to find them (or use `package.sh` which bundles everything):
+
+```bash
+# Run directly (with local FFmpeg)
+LD_LIBRARY_PATH=$HOME/ffmpeg-8.1-local/lib ./build/dsvp /path/to/movie.mkv
+
+# Or package for distribution (bundles all libs automatically)
+LD_LIBRARY_PATH=$HOME/ffmpeg-8.1-local/lib ./package.sh
+```
+
+### Step 5: Run
 
 ```bash
 ./build/dsvp                        # idle window, press O to open file
@@ -133,6 +195,8 @@ Output: `build/dsvp`
 **"cannot find -lSDL3_shadercross"** — the `shadercross/` directory is missing or symlinks weren't created. Run `ls -la shadercross/SDL3_shadercross-3.0.0-linux-x64/lib/` and verify `.so` symlinks exist.
 
 **"error while loading shared libraries: libSDL3_shadercross.so.0"** — the runtime linker can't find shadercross. The Makefile sets `-Wl,-rpath` relative to the binary, but if you move the binary out of `build/`, the rpath won't resolve. Run from the repo root or use `LD_LIBRARY_PATH`.
+
+**"error while loading shared libraries: libavformat.so.62"** — you built against FFmpeg 8.1 from source but the runtime linker can't find the `.so` files. Either run with `LD_LIBRARY_PATH=$HOME/ffmpeg-8.1-local/lib` or use the portable tarball from `package.sh` which bundles all libraries.
 
 **Vulkan validation errors** — install `vulkan-tools` and run `vulkaninfo` to verify your GPU supports Vulkan. DSVP forces Vulkan via `SDL_SetHint`.
 
