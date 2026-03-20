@@ -5,7 +5,7 @@
 
 WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer a mpv-style player without configs or intimidation factor. Think of DSVP as a middle-man between VLC and mpv. It's not as SOTA as mpv but should be more "user-friendly". Or less, if you don't have a keyboard. Should offer better quality than VLC as it uses more modern FFmpeg libraries. It *should* play anything you throw at it.
 
-There are portable Windows & Linux builds you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/). The portable tarball bundles all dependencies including FFmpeg 8.1 — just extract and run.
+There are portable Windows, Linux, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/). The portable tarballs bundle all dependencies including FFmpeg 8.1 — just extract and run. The Steam Deck build (see `steamdeck` branch) includes VAAPI hardware decode for HEVC.
 
 REQUIRES Visual C++ Redistributable runtime on Windows (vcruntime140.dll). It's probably already on your PC but you can get it here:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170
@@ -14,7 +14,7 @@ Claude wrote most of this:
 
 ---
 
-
+`![Steam Deck](https://img.shields.io/badge/Steam%20Deck-Supported-1a9fff?logo=steamdeck&logoColor=white)`
 ![Windows](https://img.shields.io/badge/Windows-supported-blue)
 ![Linux](https://img.shields.io/badge/Linux-supported-blue)
 ![macOS](https://img.shields.io/badge/macOS-untested-yellow)
