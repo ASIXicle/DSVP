@@ -1352,12 +1352,10 @@ int player_open(PlayerState *ps, const char *filename) {
 
                 enum AVCodecID cid = vs->codecpar->codec_id;
 
-                if (cid == AV_CODEC_ID_HEVC && fps <= 30.0) {
-                    tcount = 1;
-                } else if (cid == AV_CODEC_ID_H264 && fps >= 50.0) {
-                    tcount = 4;
+                if (cid == AV_CODEC_ID_HEVC) {
+                    tcount = 1;  /* software fallback only (VAAPI handles normal path) */
                 } else {
-                    tcount = 2;
+                    tcount = 8;  /* Deck has 8 HW threads — no contention without HEVC decode */
                 }
                 log_msg("Thread selection: codec=%s fps=%.2f → %d threads (adaptive)",
                         avcodec_get_name(cid), fps, tcount);
