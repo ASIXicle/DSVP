@@ -1235,9 +1235,25 @@ int player_open(PlayerState *ps, const char *filename) {
         ps->video_codec_ctx = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(ps->video_codec_ctx, vs->codecpar);
 
-        /* Force software decode — use all available CPU threads */
-        ps->video_codec_ctx->thread_count = 0; /* auto-detect */
+        /* Thread count: auto-detect, capped at 12 for HEVC.
+         *
+         * FF_THREAD_FRAME buffers N frames before outputting the first.
+         * Pipeline fill latency = N × frame_dur (linear, not log).
+         * At 24fps: 16T=667ms, 12T=500ms, 8T=333ms, 4T=167ms.
+         *
+         * On high-core machines (16T+), the 667ms fill causes permanent
+         * A/V desync on heavy files (4K HEVC 10-bit + TrueHD + 29 streams).
+         * Cap at 12 limits fill to 500ms while retaining decode throughput.
+         * Low-core machines (≤12 cores) are unaffected — auto stays below cap.
+         *
+         * Non-HEVC codecs (VC-1, H.264) are uncapped — their pipeline fill
+         * is small enough that the existing A/V sync handles it fine. */
+        ps->video_codec_ctx->thread_count = 0; /* auto-detect first */
         ps->video_codec_ctx->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+
+        if (codec->id == AV_CODEC_ID_HEVC) {
+            ps->video_codec_ctx->thread_count = 12;
+        }
 
         ret = avcodec_open2(ps->video_codec_ctx, codec, NULL);
         if (ret < 0) {
