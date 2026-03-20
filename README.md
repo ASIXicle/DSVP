@@ -14,11 +14,7 @@ Claude wrote most of this:
 
 ---
 
-`![Steam Deck](https://img.shields.io/badge/Steam%20Deck-Supported-1a9fff?logo=steamdeck&logoColor=white)`
-![Windows](https://img.shields.io/badge/Windows-supported-blue)
-![Linux](https://img.shields.io/badge/Linux-supported-blue)
-![macOS](https://img.shields.io/badge/macOS-untested-yellow)
-
+![Windows](https://img.shields.io/badge/Windows-supported-blue) ![Linux](https://img.shields.io/badge/Linux-supported-blue) ![Steam Deck](https://img.shields.io/badge/Steam_Deck-supported-1a9fff?logo=steam&logoColor=white) ![macOS](https://img.shields.io/badge/macOS-untested-yellow)
 ## Features
 
 - **Reference-quality playback** — Lanczos-2 luma scaling (anti-ringing clamp), Catmull-Rom chroma upsampling (siting-corrected), temporal blue noise dithering, faithful color/gamma/framerate
