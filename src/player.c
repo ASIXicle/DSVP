@@ -1259,13 +1259,27 @@ int player_open(PlayerState *ps, const char *filename) {
     /* ── Open video decoder (SOFTWARE ONLY) ── */
     {
         AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
-        const AVCodec *codec = avcodec_find_decoder(vs->codecpar->codec_id);
+        const AVCodec *codec = NULL;
+
+        /* FFmpeg 8.1's generic 'av1' decoder probes for hardware accel
+         * first and fails catastrophically on systems without AV1 HW
+         * decode (spams "Failed to get pixel format", zero frames output).
+         * Force libdav1d — it's pure software, always works, and is the
+         * reference AV1 decoder. */
+        if (vs->codecpar->codec_id == AV_CODEC_ID_AV1) {
+            codec = avcodec_find_decoder_by_name("libdav1d");
+            if (codec)
+                log_msg("Video codec: libdav1d forced for AV1 (avoiding hw probe)");
+        }
+        if (!codec)
+            codec = avcodec_find_decoder(vs->codecpar->codec_id);
         if (!codec) {
             log_msg("ERROR: Unsupported video codec id=%d", vs->codecpar->codec_id);
             avformat_close_input(&ps->fmt_ctx);
             return -1;
         }
-        log_msg("Video codec: %s (%s)", codec->name, codec->long_name);
+        if (vs->codecpar->codec_id != AV_CODEC_ID_AV1)
+            log_msg("Video codec: %s (%s)", codec->name, codec->long_name);
 
         ps->video_codec_ctx = avcodec_alloc_context3(codec);
         avcodec_parameters_to_context(ps->video_codec_ctx, vs->codecpar);
