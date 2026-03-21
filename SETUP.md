@@ -110,7 +110,7 @@ sudo apt install libavformat-dev libavcodec-dev libswscale-dev \
 ```bash
 # Install build dependencies
 sudo apt install build-essential nasm yasm \
-    libx264-dev libx265-dev libvpx-dev libopus-dev
+    libx264-dev libx265-dev libvpx-dev libopus-dev libdav1d-dev
 
 # Download and extract
 cd ~/Documents
@@ -123,17 +123,19 @@ cd ffmpeg-8.1
     --enable-shared --disable-static \
     --enable-gpl \
     --disable-programs --disable-doc \
-    --disable-encoders --disable-muxers
+    --disable-encoders --disable-muxers \
+    --enable-libdav1d
 
 # Build and install to ~/ffmpeg-8.1-local/
 make -j$(nproc)
 make install
 ```
 
-Then set `PKG_CONFIG_PATH` so the DSVP Makefile finds the local FFmpeg. Add this to your `~/.bashrc` for persistence:
+Then set `PKG_CONFIG_PATH` so the DSVP Makefile finds the local FFmpeg, and `LD_LIBRARY_PATH` so the binary can find the `.so` files at runtime. Add both to your `~/.bashrc` for persistence:
 
 ```bash
 export PKG_CONFIG_PATH=$HOME/ffmpeg-8.1-local/lib/pkgconfig:$PKG_CONFIG_PATH
+export LD_LIBRARY_PATH=$HOME/ffmpeg-8.1-local/lib:$LD_LIBRARY_PATH
 ```
 
 Verify it took effect:
