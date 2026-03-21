@@ -800,10 +800,17 @@ int main(int argc, char *argv[]) {
 
                         /* 1:1 VSync pacing: when content frame rate
                          * matches display refresh (~50-60fps), VSync
-                         * alone provides the pacing heartbeat. A/V
-                         * delay correction at 1:1 causes oscillation
+                         * alone provides the pacing heartbeat. Full
+                         * A/V delay correction at 1:1 causes oscillation
                          * because any jitter triggers multi-decode
-                         * bunching. */
+                         * bunching.
+                         *
+                         * Instead, once the bias EMA has converged
+                         * (~2s of playback), apply a micro-correction:
+                         * 2% of the converged bias per frame.  At 50ms
+                         * bias this is ~1ms/frame on a 16.67ms period —
+                         * too small to cause a tick skip, converges in
+                         * ~1 second. */
                         one_to_one = (pts_delay > 0.001
                                       && pts_delay < 0.020);
 
@@ -814,6 +821,13 @@ int main(int argc, char *argv[]) {
                             } else if (av_diff_c < -threshold) {
                                 delay = 0.0;
                             }
+                        } else if (ps.av_bias_samples >= 120) {
+                            /* Micro-correction: nudge frame_timer toward
+                             * audio clock without triggering oscillation */
+                            double bias = ps.av_bias;
+                            if (bias < -0.200) bias = -0.200;
+                            if (bias >  0.200) bias =  0.200;
+                            delay = pts_delay + bias * 0.02;
                         }
 
                         if (!ps.seek_recovering &&
