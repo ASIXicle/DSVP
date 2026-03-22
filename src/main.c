@@ -386,6 +386,7 @@ static void gpu_draw_idle(PlayerState *ps) {
 
 int main(int argc, char *argv[]) {
     /* ── Initialize logging (before anything else) ── */
+    (void)argv;  /* replaced by CommandLineToArgvW for Unicode support */
     log_init();
     log_msg("Starting DSVP v" DSVP_VERSION " (argc=%d)", argc);
     log_msg("FFmpeg %s (libavcodec %d.%d)", av_version_info(),

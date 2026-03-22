@@ -168,7 +168,10 @@ static const char hlsl_yuv_planar_frag[] =
     "    float2 texSizeUV;\n"
     "    float2 chromaOffset;\n"
     "    float frameCount;\n"
-    "    float _pad1;\n"
+    "    float is_hdr;\n"
+    "    float hdr_peak_nits;\n"
+    "    float hdr_gamut;\n"
+    "    float _pad1, _pad2;\n"
     "};\n"
     "\n"
     "#define PI 3.14159265358979\n"
@@ -734,17 +737,24 @@ static void gpu_destroy_video_textures(PlayerState *ps) {
  */
 
 static void gpu_setup_uniforms(PlayerState *ps) {
-    /* Determine colorspace from metadata or resolution heuristic */
-    int is_bt709 = (ps->vid_h >= 720);
+    /* Determine YCbCr matrix from metadata or resolution heuristic.
+     * Three standards: BT.601 (SD), BT.709 (HD), BT.2020 NCL (UHD/HDR).
+     * color_space tag is authoritative; resolution heuristic is fallback. */
+    int colorspace = (ps->vid_h >= 720) ? 709 : 601;
     if (ps->fmt_ctx) {
         AVCodecParameters *par =
             ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
         if (par->color_space == AVCOL_SPC_BT709)
-            is_bt709 = 1;
+            colorspace = 709;
         else if (par->color_space == AVCOL_SPC_BT470BG ||
                  par->color_space == AVCOL_SPC_SMPTE170M)
-            is_bt709 = 0;
+            colorspace = 601;
+        else if (par->color_space == AVCOL_SPC_BT2020_NCL)
+            colorspace = 2020;
     }
+
+    const char *cs_name = (colorspace == 2020) ? "BT.2020"
+                        : (colorspace == 709)  ? "BT.709" : "BT.601";
 
     /* ── Range parameters ──
      *
@@ -793,8 +803,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         }
 
         log_msg("GPU: uniforms set (%s, 10-bit %s range → shader)",
-                is_bt709 ? "BT.709" : "BT.601",
-                is_full_range ? "full" : "limited");
+                cs_name, is_full_range ? "full" : "limited");
 
     } else if (is_8bit_passthrough) {
         /* 8-bit YUV420P passthrough — range correction in shader.
@@ -812,8 +821,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         }
 
         log_msg("GPU: uniforms set (%s, 8-bit %s range → shader)",
-                is_bt709 ? "BT.709" : "BT.601",
-                is_full_range ? "full" : "limited");
+                cs_name, is_full_range ? "full" : "limited");
 
     } else {
         /* swscale fallback — outputs full-range YUV420P, identity range */
@@ -823,7 +831,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         ps->gpu_uniforms.rangeUV[1] = 1.0f;
 
         log_msg("GPU: uniforms set (%s, full range via swscale)",
-                is_bt709 ? "BT.709" : "BT.601");
+                cs_name);
     }
 
     /* Color matrix: row-major (matches HLSL row_major qualifier).
@@ -836,7 +844,12 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     float *m = ps->gpu_uniforms.colorMatrix;
     memset(m, 0, 16 * sizeof(float));
 
-    if (is_bt709) {
+    if (colorspace == 2020) {
+        /* BT.2020 NCL: Kr=0.2627, Kb=0.0593 */
+        m[ 0] = 1.0f;  m[ 1] =  0.0f;     m[ 2] =  1.4746f;  /* R */
+        m[ 4] = 1.0f;  m[ 5] = -0.1646f;  m[ 6] = -0.5714f;  /* G */
+        m[ 8] = 1.0f;  m[ 9] =  1.8814f;  m[10] =  0.0f;     /* B */
+    } else if (colorspace == 709) {
         /* BT.709: Kr=0.2126, Kb=0.0722 */
         m[ 0] = 1.0f;  m[ 1] =  0.0f;     m[ 2] =  1.5748f;  /* R */
         m[ 4] = 1.0f;  m[ 5] = -0.1873f;  m[ 6] = -0.4681f;  /* G */
@@ -908,7 +921,134 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     }
 
     ps->gpu_uniforms.frameCount = 0.0f;
-    ps->gpu_uniforms._pad1 = 0.0f;
+
+    /* ── HDR Detection & Metadata ──
+     *
+     * HDR detection priority (per industry consensus — mpv, MPC, VLC):
+     *   1. color_trc == SMPTE2084 (PQ) — catches all HDR10 content
+     *   2. DOVI_CONF in coded_side_data — catches DV P5 where color_trc
+     *      is often UNSPECIFIED
+     *   3. color_trc == ARIB_STD_B67 (HLG) — flagged but not processed yet
+     *
+     * Primaries classification (separate from HDR detection):
+     *   - color_primaries == BT2020 → true BT.2020, needs gamut mapping
+     *   - DV P5 with UNSPECIFIED primaries → base layer is BT.709 PQ
+     *     (RPU would transform to BT.2020, but we don't process RPU)
+     *
+     * Peak luminance priority:
+     *   1. MaxCLL from content light level metadata
+     *   2. max_luminance from mastering display metadata
+     *   3. 1000 nit fallback (standard for most HDR10 content)
+     */
+    int is_hdr = 0;
+    int is_dolby_vision = 0;
+    float peak_nits = 0.0f;
+    int has_bt2020_primaries = 0;
+
+    if (ps->fmt_ctx) {
+        AVCodecParameters *par =
+            ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+
+        /* --- Transfer function check --- */
+        if (par->color_trc == AVCOL_TRC_SMPTE2084) {
+            is_hdr = 1;
+            log_msg("HDR: detected PQ transfer (SMPTE ST 2084)");
+        } else if (par->color_trc == AVCOL_TRC_ARIB_STD_B67) {
+            /* HLG — flag for future support, don't activate HDR path yet */
+            log_msg("HDR: detected HLG transfer (not yet processed)");
+        }
+
+        /* --- Dolby Vision fallback (DV P5 often has UNSPECIFIED trc) --- */
+        const AVPacketSideData *dovi_sd = av_packet_side_data_get(
+            par->coded_side_data, par->nb_coded_side_data,
+            AV_PKT_DATA_DOVI_CONF);
+        if (dovi_sd) {
+            is_dolby_vision = 1;
+            if (!is_hdr) {
+                is_hdr = 1;
+                log_msg("HDR: detected Dolby Vision (DOVI conf in stream)");
+            } else {
+                log_msg("HDR: Dolby Vision metadata also present");
+            }
+        }
+
+        /* --- Primaries classification --- */
+        if (par->color_primaries == AVCOL_PRI_BT2020) {
+            has_bt2020_primaries = 1;
+        }
+
+        /* --- Static metadata: peak luminance --- */
+        const AVPacketSideData *cll_sd = av_packet_side_data_get(
+            par->coded_side_data, par->nb_coded_side_data,
+            AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+        if (cll_sd && cll_sd->size >= (int)sizeof(AVContentLightMetadata)) {
+            const AVContentLightMetadata *cll =
+                (const AVContentLightMetadata *)cll_sd->data;
+            if (cll->MaxCLL > 0) {
+                peak_nits = (float)cll->MaxCLL;
+                log_msg("HDR: MaxCLL=%u nits, MaxFALL=%u nits",
+                        cll->MaxCLL, cll->MaxFALL);
+            }
+        }
+
+        if (peak_nits == 0.0f) {
+            const AVPacketSideData *mdm_sd = av_packet_side_data_get(
+                par->coded_side_data, par->nb_coded_side_data,
+                AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
+            if (mdm_sd && mdm_sd->size >= (int)sizeof(AVMasteringDisplayMetadata)) {
+                const AVMasteringDisplayMetadata *mdm =
+                    (const AVMasteringDisplayMetadata *)mdm_sd->data;
+                if (mdm->has_luminance) {
+                    double max_lum = av_q2d(mdm->max_luminance);
+                    if (max_lum > 0.0) {
+                        peak_nits = (float)max_lum;
+                        log_msg("HDR: mastering display max=%.0f nits, min=%.4f nits",
+                                max_lum, av_q2d(mdm->min_luminance));
+                    }
+                }
+                if (mdm->has_primaries) {
+                    log_msg("HDR: mastering primaries: "
+                            "R(%.4f,%.4f) G(%.4f,%.4f) B(%.4f,%.4f) WP(%.4f,%.4f)",
+                            av_q2d(mdm->display_primaries[0][0]),
+                            av_q2d(mdm->display_primaries[0][1]),
+                            av_q2d(mdm->display_primaries[1][0]),
+                            av_q2d(mdm->display_primaries[1][1]),
+                            av_q2d(mdm->display_primaries[2][0]),
+                            av_q2d(mdm->display_primaries[2][1]),
+                            av_q2d(mdm->white_point[0]),
+                            av_q2d(mdm->white_point[1]));
+                }
+            }
+        }
+
+        /* Fallback: no metadata → 1000 nits (standard HDR10 assumption) */
+        if (is_hdr && peak_nits == 0.0f) {
+            peak_nits = 1000.0f;
+            log_msg("HDR: no luminance metadata — using 1000 nit fallback");
+        }
+    }
+
+    /* Gamut classification for the shader:
+     * - DV P5 without explicit BT.2020 primaries: base layer is BT.709 PQ.
+     *   Applying a BT.2020→BT.709 gamut matrix would invert colors.
+     * - True HDR10 with BT.2020 primaries: needs gamut mapping in tone map. */
+    float hdr_gamut = 0.0f; /* 0.0 = BT.709 primaries */
+    if (is_hdr && has_bt2020_primaries) {
+        hdr_gamut = 1.0f;   /* 1.0 = BT.2020 primaries */
+    }
+
+    ps->gpu_uniforms.is_hdr        = is_hdr ? 1.0f : 0.0f;
+    ps->gpu_uniforms.hdr_peak_nits = peak_nits;
+    ps->gpu_uniforms.hdr_gamut     = hdr_gamut;
+    ps->gpu_uniforms._pad1         = 0.0f;
+    ps->gpu_uniforms._pad2         = 0.0f;
+
+    if (is_hdr) {
+        log_msg("GPU: HDR→SDR active (peak=%.0f nits, gamut=%s%s)",
+                peak_nits,
+                has_bt2020_primaries ? "BT.2020" : "BT.709",
+                is_dolby_vision ? ", Dolby Vision" : "");
+    }
 
     static const char *chroma_names[] = {
         "unspecified", "left", "center", "top-left",
@@ -2297,6 +2437,14 @@ void player_build_media_info(PlayerState *ps) {
             } else {
                 off += snprintf(buf + off, sz - off, "Color TRC: %s (assumed)\n",
                     is_hd ? "bt709" : "bt601");
+            }
+
+            /* HDR info from uniforms (already detected at open time) */
+            if (ps->gpu_uniforms.is_hdr > 0.0f) {
+                off += snprintf(buf + off, sz - off,
+                    "HDR: Yes (peak %.0f nits, %s gamut)\n",
+                    ps->gpu_uniforms.hdr_peak_nits,
+                    ps->gpu_uniforms.hdr_gamut > 0.5f ? "BT.2020" : "BT.709");
             }
         }
     }

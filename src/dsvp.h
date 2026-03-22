@@ -25,6 +25,7 @@
 #include <libavutil/channel_layout.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
+#include <libavutil/mastering_display_metadata.h>
 
 /* SDL3 — SDL_MAIN_HANDLED prevents SDL from injecting WinMain */
 #define SDL_MAIN_HANDLED
@@ -90,8 +91,11 @@ typedef struct GPUUniforms {
     float texSizeUV[2];     /* { width, height } of UV textures   8 bytes */
     float chromaOffset[2];  /* chroma siting correction (texels)  8 bytes */
     float frameCount;       /* frame counter for temporal dither  4 bytes */
-    float _pad1;            /* 16-byte alignment for std140       4 bytes */
-} GPUUniforms;              /*                                  112 bytes */
+    float is_hdr;           /* 1.0 = HDR content detected         4 bytes */
+    float hdr_peak_nits;    /* source peak luminance (nits)       4 bytes */
+    float hdr_gamut;        /* 0.0=BT.709, 1.0=BT.2020 primaries 4 bytes */
+    float _pad1, _pad2;     /* std140 alignment to 128 bytes      8 bytes */
+} GPUUniforms;              /*                                  128 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *
