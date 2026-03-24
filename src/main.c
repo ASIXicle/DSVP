@@ -892,13 +892,13 @@ int main(int argc, char *argv[]) {
                     ps.seek_recovering = 0;
                     ps.frame_timer = get_time_sec();
 
-                /* Resume audio now that video has produced its first
-                 * frame — clocks are aligned to the same seek target. */
-                if (ps.audio_stream && !ps.paused)
-                    SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                    /* Resume audio now that video has produced its first
+                     * frame — clocks are aligned to the same seek target. */
+                    if (ps.audio_stream && !ps.paused)
+                        SDL_ResumeAudioStreamDevice(ps.audio_stream);
 
                     log_msg("DIAG: seek recovery complete at %.3fs",
-                        ps.video_clock);
+                            ps.video_clock);
                 }
             }
 
