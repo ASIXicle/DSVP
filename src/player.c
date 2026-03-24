@@ -1759,8 +1759,10 @@ int player_open(PlayerState *ps, const char *filename) {
 
     /* Suppress frame drops until the first frame is displayed.
      * Adapts automatically to any codec's keyframe recovery time. */
-    ps->seek_recovering = 3;
+    ps->seek_recovering = 1;
     ps->video_ready = 0;
+    ps->last_frame_wall  = 0.0;
+    ps->audio_stalled    = 0;
 
     /* ── Reset diagnostics ── */
     ps->diag_frames_displayed = 0;

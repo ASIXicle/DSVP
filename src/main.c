@@ -887,23 +887,52 @@ int main(int argc, char *argv[]) {
             if (new_frame) {
                 video_display(&ps);
                 ps.diag_frames_displayed++;
+                ps.last_frame_wall = now;
 
+                /* Resume from seek: first displayed frame post-seek */
                 if (ps.seek_recovering) {
-                    ps.seek_recovering--;
+                    ps.seek_recovering = 0;
                     ps.frame_timer = get_time_sec();
 
-                    if (ps.seek_recovering == 0) {
-                        /* Resume audio now that video decoder is producing
-                         * frames steadily — VAAPI DPB rebuild is past.
-                         * Waiting for 3 frames prevents a single buffered
-                         * keyframe from clearing recovery prematurely. */
-                        if (ps.audio_stream && !ps.paused)
-                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                    if (ps.audio_stream && !ps.paused)
+                        SDL_ResumeAudioStreamDevice(ps.audio_stream);
 
-                        log_msg("DIAG: seek recovery complete at %.3fs",
-                                ps.video_clock);
-                    }
+                    log_msg("DIAG: seek recovery complete at %.3fs",
+                            ps.video_clock);
                 }
+
+                /* Resume from stall: video is flowing again */
+                if (ps.audio_stalled) {
+                    SDL_ClearAudioStream(ps.audio_stream);
+                    ps.audio_clock      = ps.video_clock;
+                    ps.audio_clock_sync = ps.video_clock;
+                    ps.av_bias          = 0.0;
+                    ps.av_bias_samples  = 0;
+                    ps.frame_timer      = get_time_sec();
+
+                    if (!ps.paused)
+                        SDL_ResumeAudioStreamDevice(ps.audio_stream);
+
+                    ps.audio_stalled = 0;
+                    log_msg("DIAG: audio resumed after stall "
+                            "(re-synced at %.3fs)", ps.video_clock);
+                }
+            }
+
+            /* Stall watchdog: if 200ms passes without a displayed frame
+             * during active playback, pause audio to prevent drift.
+             * VAAPI can stall for seconds rebuilding its DPB after seeks
+             * or on complex GOPs — audio must not run free during that. */
+            if (ps.playing && !ps.paused && !ps.seek_recovering
+                    && !ps.audio_stalled && ps.audio_stream_idx >= 0
+                    && ps.last_frame_wall > 0.0
+                    && now - ps.last_frame_wall > 0.2) {
+                SDL_PauseAudioStreamDevice(ps.audio_stream);
+                ps.audio_stalled = 1;
+                log_msg("DIAG: audio paused — video stall detected "
+                        "(%.0fms gap at %.3fs)",
+                        (now - ps.last_frame_wall) * 1000.0,
+                        ps.video_clock);
             }
             /* Periodic diagnostics (every 10 seconds) */
             if (ps.playing && now - ps.diag_last_report >= 10.0) {
