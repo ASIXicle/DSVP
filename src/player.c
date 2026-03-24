@@ -1986,9 +1986,12 @@ int demux_thread_func(void *arg) {
             ps->av_bias = 0.0;
             ps->av_bias_samples = 0;
 
-            /* Resume audio playback */
-            if (ps->audio_stream && !ps->paused)
-                SDL_ResumeAudioStreamDevice(ps->audio_stream);
+            /* Flush any pre-seek audio still queued in SDL pipeline.
+             * Audio stays PAUSED until the first video frame is displayed
+             * (main.c seek_recovering clear) — prevents audio clock from
+             * running ahead while VAAPI rebuilds its DPB after a seek. */
+            if (ps->audio_stream)
+                SDL_ClearAudioStream(ps->audio_stream);
 
             log_msg("Demux: seek complete");
         }
