@@ -25,6 +25,4 @@ WORKING.txt
 dsvp.log
 *.zip
 *.tar.gz
-*.patchtest_*.sh
-test_*.sh
-test_logs/
+*.patchDSVP_deck-*/
