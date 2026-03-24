@@ -184,7 +184,6 @@ typedef struct PlayerState {
     int                 seek_request;     /* 1 = seek pending           */
     int                 seek_flags;
     int                 seek_recovering;  /* 1 = waiting for first displayed frame post-seek */
-    int                 seek_recovering;  /* 1 = waiting for first displayed frame post-seek */
     double              last_frame_wall;  /* wall-clock of last displayed frame */
     int                 audio_stalled;    /* 1 = audio paused due to video stall */
 
