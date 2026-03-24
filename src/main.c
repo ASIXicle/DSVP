@@ -904,7 +904,7 @@ int main(int argc, char *argv[]) {
                                 ps.video_clock);
                     }
                 }
-
+            }
             /* Periodic diagnostics (every 10 seconds) */
             if (ps.playing && now - ps.diag_last_report >= 10.0) {
                 double av_now = (ps.audio_stream_idx >= 0)
