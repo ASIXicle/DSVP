@@ -920,176 +920,151 @@ int main(int argc, char *argv[]) {
              * video_reblit() re-draws the last frame without uploading. */
             double now = get_time_sec();
             int new_frame = 0;
-            int decoded_this_tick = 0;
 
-            /* max_catchup caps burst decodes per VSync tick.
+            /* ── Consume decoded frame from decode thread ──
              *
-             * For 1:1 content (60fps on 60Hz): max_catchup=1.
-             * VSync provides the pacing heartbeat — decode exactly one
-             * frame per tick. If an I-frame decode misses the VSync
-             * deadline, the previous frame holds for one extra VSync
-             * (imperceptible 16ms repeat) and frame_timer catches up
-             * naturally next tick. No burst, no cascade, no phantom
-             * skips. The micro-correction and snap-forward handle drift.
+             * The decode thread runs video_decode_frame() asynchronously
+             * and writes one frame into ps.decoded_frame.  The main loop
+             * consumes it here when frame_timer permits, then signals
+             * the decode thread to decode the next frame.
              *
-             * For non-1:1 content (24fps on 60Hz): max_catchup=4.
-             * frame_timer advances at 41.67ms but the VSync loop runs
-             * at 16.67ms, so most ticks have no decode and occasional
-             * ticks need 2+ decodes. Heavy I-frames can occasionally
-             * need bursts of 3-4 to recover.
-             *
-             * Detection: frame_last_delay < 20ms = 1:1 (same check as
-             * one_to_one inside the loop). Defaults to 4 at playback
-             * start (frame_last_delay=0) until first frame establishes
-             * the cadence. */
+             * On ticks with no new frame (the common case at 24fps on
+             * 60/120/144Hz), the main loop falls through to video_reblit()
+             * which keeps the compositor fed at display refresh rate.
+             * This eliminates the 22-37ms VAAPI decode stall that was
+             * blocking reblits and causing visible judder. */
+
             int is_1to1 = (ps.frame_last_delay > 0.001
                            && ps.frame_last_delay < 0.020);
-            int max_catchup = is_1to1 ? 1 : 4;
-            while (now >= ps.frame_timer && max_catchup-- > 0) {
-#ifdef DSVP_PROFILE
-                double t_dec0 = get_time_sec();
-#endif
-                int vret = video_decode_frame(&ps);
-#ifdef DSVP_PROFILE
-                if (vret > 0) {
-                    double dec_ms = (get_time_sec() - t_dec0) * 1000.0;
-                    ps.prof_decode_ms = dec_ms;
-                    ps.prof_sum_decode += dec_ms;
-                    if (dec_ms > ps.prof_max_decode)
-                        ps.prof_max_decode = dec_ms;
-                    /* Log decode spikes that approach frame budget.
-                     * Threshold: 80% of content frame period.
-                     * 24fps → 33ms, 60fps → 13ms. */
-                    double dec_thr = ps.frame_last_delay > 0.001
-                        ? ps.frame_last_delay * 800.0 : 13.0;
-                    if (dec_ms > dec_thr)
-                        log_msg("PROF SPIKE: decode=%.1fms (frame %d)",
-                                dec_ms, ps.diag_frames_decoded);
-                }
-#endif
-                if (vret > 0) {
-                    decoded_this_tick++;
-                    ps.diag_frames_decoded++;
 
-                    /* Compute inter-frame delay from PTS */
-                    double pts_delay = ps.video_clock - ps.frame_last_pts;
-                    if (pts_delay <= 0.0 || pts_delay >= 1.0)
-                        pts_delay = ps.frame_last_delay;
-                    ps.frame_last_pts   = ps.video_clock;
-                    ps.frame_last_delay = pts_delay;
+            SDL_LockMutex(ps.decode_mutex);
+            int frame_avail = ps.decode_frame_ready;
 
-                    /* A/V sync adjustment */
-                    double delay = pts_delay;
-                    double av_diff = 0.0;
-                    double av_diff_c = 0.0;
-                    int one_to_one = 0;
-                    if (ps.audio_stream_idx >= 0) {
-                        av_diff = ps.video_clock - ps.audio_clock_sync;
+            if (frame_avail && now >= ps.frame_timer) {
+                /* ── Move decoded frame → video_frame ── */
+                av_frame_unref(ps.video_frame);
+                av_frame_move_ref(ps.video_frame, ps.decoded_frame);
+                ps.video_clock = ps.decoded_pts;
+                ps.decode_frame_ready = 0;
+                SDL_SignalCondition(ps.decode_cond);
+                SDL_UnlockMutex(ps.decode_mutex);
 
-                        /* Adaptive bias correction: EMA of av_diff
-                         * absorbs systematic OS audio pipeline latency.
-                         * Only the catch-up (negative) branch uses the
-                         * corrected value — the slow-down (positive)
-                         * branch uses raw av_diff to avoid overcorrection. */
-                        if (!ps.seek_recovering) {
-                            ps.av_bias = ps.av_bias * 0.95 + av_diff * 0.05;
-                            ps.av_bias_samples++;
-                        }
-                        av_diff_c = av_diff;
-                        if (ps.av_bias_samples >= 60) {
-                            double bias = ps.av_bias;
-                            if (bias < -0.200) bias = -0.200;
-                            if (bias >  0.200) bias =  0.200;
-                            av_diff_c = av_diff - bias;
-                        }
+                ps.diag_frames_decoded++;
 
-                        /* 1:1 VSync pacing: when content frame rate
-                         * matches display refresh (~50-60fps), VSync
-                         * alone provides the pacing heartbeat. Full
-                         * A/V delay correction at 1:1 causes oscillation
-                         * because any jitter triggers multi-decode
-                         * bunching.
-                         *
-                         * Instead, once the bias EMA has converged
-                         * (~2s of playback), apply a micro-correction:
-                         * 2% of the converged bias per frame.  At 50ms
-                         * bias this is ~1ms/frame on a 16.67ms period —
-                         * too small to cause a tick skip, converges in
-                         * ~1 second. */
-                        one_to_one = (pts_delay > 0.001
-                                      && pts_delay < 0.020);
+                /* Compute inter-frame delay from PTS */
+                double pts_delay = ps.video_clock - ps.frame_last_pts;
+                if (pts_delay <= 0.0 || pts_delay >= 1.0)
+                    pts_delay = ps.frame_last_delay;
+                ps.frame_last_pts   = ps.video_clock;
+                ps.frame_last_delay = pts_delay;
 
-                        double threshold = fmax(pts_delay, 0.01);
-                        if (!one_to_one) {
-                            if (av_diff > threshold) {
-                                delay = pts_delay + av_diff;
-                            } else if (av_diff_c < -threshold) {
-                                delay = 0.0;
-                            }
-                        } else if (ps.av_bias_samples >= 120) {
-                            /* Micro-correction: nudge frame_timer toward
-                             * audio clock without triggering oscillation */
-                            double bias = ps.av_bias;
-                            if (bias < -0.200) bias = -0.200;
-                            if (bias >  0.200) bias =  0.200;
-                            delay = pts_delay + bias * 0.02;
-                        }
+                /* A/V sync adjustment */
+                double delay = pts_delay;
+                double av_diff = 0.0;
+                double av_diff_c = 0.0;
+                int one_to_one = 0;
+                if (ps.audio_stream_idx >= 0) {
+                    av_diff = ps.video_clock - ps.audio_clock_sync;
 
-                        if (!ps.seek_recovering &&
-                                fabs(av_diff) > fabs(ps.diag_max_av_drift))
-                            ps.diag_max_av_drift = av_diff;
+                    /* Adaptive bias correction: EMA of av_diff
+                     * absorbs systematic OS audio pipeline latency.
+                     * Only the catch-up (negative) branch uses the
+                     * corrected value — the slow-down (positive)
+                     * branch uses raw av_diff to avoid overcorrection. */
+                    if (!ps.seek_recovering) {
+                        ps.av_bias = ps.av_bias * 0.95 + av_diff * 0.05;
+                        ps.av_bias_samples++;
+                    }
+                    av_diff_c = av_diff;
+                    if (ps.av_bias_samples >= 60) {
+                        double bias = ps.av_bias;
+                        if (bias < -0.200) bias = -0.200;
+                        if (bias >  0.200) bias =  0.200;
+                        av_diff_c = av_diff - bias;
                     }
 
-                    /* Minimum delay floor */
-                    double min_delay = ps.frame_last_delay * 0.5;
-                    if (delay < min_delay)
-                        delay = min_delay;
-
-                    ps.frame_timer += delay;
-                    new_frame = 1;
-
-                    /* Drop frame if video is genuinely behind audio.
+                    /* 1:1 VSync pacing: when content frame rate
+                     * matches display refresh (~50-60fps), VSync
+                     * alone provides the pacing heartbeat. Full
+                     * A/V delay correction at 1:1 causes oscillation
+                     * because any jitter triggers multi-decode
+                     * bunching.
                      *
-                     * At 1:1 (content fps ≈ display refresh), drops are
-                     * DISABLED. VSync provides the pacing heartbeat and
-                     * the snap-forward handles genuine stalls. The raw
-                     * av_diff at 1:1 includes a fixed pipeline offset
-                     * (decode latency + OS audio buffering) that isn't
-                     * growing drift — the decoder IS keeping up. Dropping
-                     * on that offset replaces smooth 60fps video with a
-                     * frozen frame, which is far worse than the offset.
-                     *
-                     * For non-1:1 content (e.g. 24fps on 60Hz), the
-                     * accumulator-based timing needs active correction,
-                     * so bias-corrected drops still apply at -50ms. */
-                    if (!one_to_one && ps.audio_stream_idx >= 0
-                            && !ps.seek_recovering) {
-                        double drop_diff = (ps.av_bias_samples >= 60)
-                                           ? av_diff_c : av_diff;
-                        if (drop_diff < -0.05) {
-                            new_frame = 0;
-                            ps.diag_frames_dropped++;
-                            log_msg("DIAG: frame dropped at %.3fs "
-                                    "(A/V drift: %.1fms)",
-                                    ps.video_clock, av_diff * 1000.0);
-                        }
-                    }
-                } else {
-                    if (vret < 0) {
-                        log_msg("Video decode error at clock=%.3f",
-                                ps.video_clock);
-                    } else if (ps.eof && ps.video_pq.nb_packets == 0
-                                    && ps.audio_pq.nb_packets == 0) {
-                        log_msg("Playback finished, returning to idle");
-                        player_close(&ps);
-                        ps.quit = 0;
-                    }
-                    break;
-                }
-            }
+                     * Instead, once the bias EMA has converged
+                     * (~2s of playback), apply a micro-correction:
+                     * 2% of the converged bias per frame.  At 50ms
+                     * bias this is ~1ms/frame on a 16.67ms period —
+                     * too small to cause a tick skip, converges in
+                     * ~1 second. */
+                    one_to_one = (pts_delay > 0.001
+                                  && pts_delay < 0.020);
 
-            if (decoded_this_tick > 1) {
-                ps.diag_multi_decodes++;
+                    double threshold = fmax(pts_delay, 0.01);
+                    if (!one_to_one) {
+                        if (av_diff > threshold) {
+                            delay = pts_delay + av_diff;
+                        } else if (av_diff_c < -threshold) {
+                            delay = 0.0;
+                        }
+                    } else if (ps.av_bias_samples >= 120) {
+                        /* Micro-correction: nudge frame_timer toward
+                         * audio clock without triggering oscillation */
+                        double bias = ps.av_bias;
+                        if (bias < -0.200) bias = -0.200;
+                        if (bias >  0.200) bias =  0.200;
+                        delay = pts_delay + bias * 0.02;
+                    }
+
+                    if (!ps.seek_recovering &&
+                            fabs(av_diff) > fabs(ps.diag_max_av_drift))
+                        ps.diag_max_av_drift = av_diff;
+                }
+
+                /* Minimum delay floor */
+                double min_delay = ps.frame_last_delay * 0.5;
+                if (delay < min_delay)
+                    delay = min_delay;
+
+                ps.frame_timer += delay;
+                new_frame = 1;
+
+                /* Drop frame if video is genuinely behind audio.
+                 *
+                 * At 1:1 (content fps ≈ display refresh), drops are
+                 * DISABLED. VSync provides the pacing heartbeat and
+                 * the snap-forward handles genuine stalls. The raw
+                 * av_diff at 1:1 includes a fixed pipeline offset
+                 * (decode latency + OS audio buffering) that isn't
+                 * growing drift — the decoder IS keeping up. Dropping
+                 * on that offset replaces smooth 60fps video with a
+                 * frozen frame, which is far worse than the offset.
+                 *
+                 * For non-1:1 content (e.g. 24fps on 60Hz), the
+                 * accumulator-based timing needs active correction,
+                 * so bias-corrected drops still apply at -50ms. */
+                if (!one_to_one && ps.audio_stream_idx >= 0
+                        && !ps.seek_recovering) {
+                    double drop_diff = (ps.av_bias_samples >= 60)
+                                       ? av_diff_c : av_diff;
+                    if (drop_diff < -0.05) {
+                        new_frame = 0;
+                        ps.diag_frames_dropped++;
+                        log_msg("DIAG: frame dropped at %.3fs "
+                                "(A/V drift: %.1fms)",
+                                ps.video_clock, av_diff * 1000.0);
+                    }
+                }
+            } else {
+                SDL_UnlockMutex(ps.decode_mutex);
+
+                /* EOF detection: decode thread drained, no packets left */
+                if (!frame_avail && ps.eof && ps.decode_eof
+                        && ps.video_pq.nb_packets == 0
+                        && ps.audio_pq.nb_packets == 0) {
+                    log_msg("Playback finished, returning to idle");
+                    player_close(&ps);
+                    ps.quit = 0;
+                }
             }
 
             /* Snap forward on extreme stall */
@@ -1156,14 +1131,13 @@ int main(int argc, char *argv[]) {
                 double av_now = (ps.audio_stream_idx >= 0)
                     ? ps.video_clock - ps.audio_clock_sync : 0.0;
                 log_msg("DIAG: [%.0fs] decoded=%d displayed=%d "
-                        "dropped=%d multi_ticks=%d snaps=%d "
+                        "dropped=%d snaps=%d "
                         "A/V=%.1fms peak=%.1fms bias=%.1fms "
                         "pacing=%s",
                         ps.video_clock,
                         ps.diag_frames_decoded,
                         ps.diag_frames_displayed,
                         ps.diag_frames_dropped,
-                        ps.diag_multi_decodes,
                         ps.diag_timer_snaps,
                         av_now * 1000.0,
                         ps.diag_max_av_drift * 1000.0,

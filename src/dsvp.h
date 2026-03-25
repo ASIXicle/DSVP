@@ -221,6 +221,23 @@ typedef struct PlayerState {
     SDL_Mutex          *seek_mutex;    /* protects codec flush vs decode  */
     int                 seeking;       /* 1 = flush in progress, skip decode */
 
+    /* ── Decode thread (async video decode) ──
+     *
+     * Moves video_decode_frame() off the main loop into a background
+     * thread.  The thread continuously decodes one frame ahead into
+     * decoded_frame.  Ownership is gated by decode_frame_ready:
+     *   ready == 0  →  decode thread may write decoded_frame
+     *   ready == 1  →  main loop may consume decoded_frame
+     * The main loop signals decode_cond after consuming so the decode
+     * thread can proceed to the next frame. */
+    SDL_Thread         *decode_thread;
+    SDL_Mutex          *decode_mutex;       /* protects decoded_frame handoff    */
+    SDL_Condition      *decode_cond;        /* signal decode thread after consume */
+    AVFrame            *decoded_frame;      /* decode thread's output buffer     */
+    double              decoded_pts;        /* PTS of decoded_frame              */
+    int                 decode_frame_ready; /* 1 = decoded_frame has new frame   */
+    int                 decode_eof;         /* 1 = decoder drained, no more frames */
+
     /* ── Playback state ── */
     int                 playing;          /* 1 = file is loaded/playing */
     int                 paused;
@@ -331,6 +348,7 @@ void  pq_flush(PacketQueue *q);
 int   player_open(PlayerState *ps, const char *filename);
 void  player_close(PlayerState *ps);
 int   demux_thread_func(void *arg);
+int   decode_thread_func(void *arg);
 int   video_decode_frame(PlayerState *ps);
 void  video_display(PlayerState *ps);
 void  video_reblit(PlayerState *ps);

@@ -2195,6 +2195,18 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->seek_mutex = SDL_CreateMutex();
     ps->seeking    = 0;
 
+    /* ── Decode thread setup ── */
+    ps->decoded_frame = av_frame_alloc();
+    if (!ps->decoded_frame) {
+        log_msg("ERROR: Failed to allocate decoded_frame");
+        player_close(ps);
+        return -1;
+    }
+    ps->decode_mutex = SDL_CreateMutex();
+    ps->decode_cond  = SDL_CreateCondition();
+    ps->decode_frame_ready = 0;
+    ps->decode_eof = 0;
+
     /* ── Init timing ── */
     ps->frame_timer      = get_time_sec();
     ps->frame_last_delay = 0.04;   /* assume ~25fps initially */
@@ -2231,6 +2243,9 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->playing = 1;
     ps->paused  = 0;
     ps->demux_thread = SDL_CreateThread(demux_thread_func, "demux", ps);
+
+    /* ── Start decode thread ── */
+    ps->decode_thread = SDL_CreateThread(decode_thread_func, "decode", ps);
 
     /* Build media info string */
     player_build_media_info(ps);
@@ -2269,6 +2284,13 @@ void player_close(PlayerState *ps) {
     SDL_SignalCondition(ps->video_pq.cond);
     SDL_SignalCondition(ps->audio_pq.cond);
 
+    /* Wake and wait for decode thread (must exit before codec free) */
+    if (ps->decode_cond)  SDL_SignalCondition(ps->decode_cond);
+    if (ps->decode_thread) {
+        SDL_WaitThread(ps->decode_thread, NULL);
+        ps->decode_thread = NULL;
+    }
+
     /* Wait for demux thread */
     if (ps->demux_thread) {
         SDL_WaitThread(ps->demux_thread, NULL);
@@ -2289,6 +2311,11 @@ void player_close(PlayerState *ps) {
 
     /* Destroy seek mutex */
     if (ps->seek_mutex) { SDL_DestroyMutex(ps->seek_mutex); ps->seek_mutex = NULL; }
+
+    /* Destroy decode thread resources */
+    if (ps->decode_mutex) { SDL_DestroyMutex(ps->decode_mutex); ps->decode_mutex = NULL; }
+    if (ps->decode_cond)  { SDL_DestroyCondition(ps->decode_cond); ps->decode_cond = NULL; }
+    if (ps->decoded_frame) av_frame_free(&ps->decoded_frame);
 
     /* Free frames */
     if (ps->video_frame)  av_frame_free(&ps->video_frame);
@@ -2330,6 +2357,8 @@ void player_close(PlayerState *ps) {
     ps->seek_request       = 0;
     ps->seeking            = 0;
     ps->seek_recovering    = 0;
+    ps->decode_frame_ready = 0;
+    ps->decode_eof         = 0;
     ps->video_ready        = 0;
     ps->show_debug         = 0;
     ps->show_info          = 0;
@@ -2425,6 +2454,16 @@ int demux_thread_func(void *arg) {
                 ps->audio_clock_sync = seek_pos;
                 ps->video_clock = seek_pos;
             }
+
+            /* Flush the decode thread's frame buffer.
+             * Safe: seek_mutex is held, so decode thread can't be mid-decode.
+             * Signal the cond to wake decode thread if it was waiting. */
+            SDL_LockMutex(ps->decode_mutex);
+            av_frame_unref(ps->decoded_frame);
+            ps->decode_frame_ready = 0;
+            ps->decode_eof = 0;
+            SDL_SignalCondition(ps->decode_cond);
+            SDL_UnlockMutex(ps->decode_mutex);
 
             ps->seeking = 0;
             SDL_UnlockMutex(ps->seek_mutex);
@@ -2568,6 +2607,142 @@ int video_decode_frame(PlayerState *ps) {
         av_packet_unref(&pkt);
     }
 }
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Decode Thread
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Runs video_decode_frame() logic in a background thread, feeding
+ * one decoded frame at a time to the main loop via decoded_frame.
+ *
+ * The main loop consumes the frame when frame_timer permits, then
+ * signals decode_cond so this thread can decode the next one.
+ * This decouples the 22-37ms VAAPI decode+readback from the
+ * VSync-driven main loop, allowing continuous reblits at display
+ * refresh rate (60Hz, 120Hz, 144Hz, etc.).
+ */
+
+int decode_thread_func(void *arg) {
+    PlayerState *ps = (PlayerState *)arg;
+    log_msg("Decode thread started");
+
+    while (!ps->quit) {
+        /* ── Wait until main loop consumed the previous frame ── */
+        SDL_LockMutex(ps->decode_mutex);
+        while (ps->decode_frame_ready && !ps->quit && !ps->seeking)
+            SDL_WaitCondition(ps->decode_cond, ps->decode_mutex);
+        SDL_UnlockMutex(ps->decode_mutex);
+
+        if (ps->quit) break;
+
+        /* Skip decode when paused, seeking, or not playing */
+        if (ps->seeking || !ps->playing || ps->paused) {
+            SDL_Delay(1);
+            continue;
+        }
+
+        /* ── Lock seek_mutex to prevent codec flush mid-decode ──
+         * TryLock: if the demux thread is seeking (holds the mutex),
+         * we yield instead of blocking — same pattern as the old
+         * synchronous video_decode_frame(). */
+        if (!SDL_TryLockMutex(ps->seek_mutex)) {
+            SDL_Delay(1);
+            continue;
+        }
+
+        int got_frame = 0;
+#ifdef DSVP_PROFILE
+        double t_dec0 = get_time_sec();
+#endif
+
+        for (;;) {
+            /* Try to receive a decoded frame.
+             * VAAPI path: receive into hw_frame, then transfer to
+             * decoded_frame (GPU→CPU readback — the expensive part). */
+            AVFrame *recv_frame = ps->vaapi_active
+                                  ? ps->hw_frame : ps->decoded_frame;
+            int ret = avcodec_receive_frame(ps->video_codec_ctx, recv_frame);
+            if (ret == 0) {
+                if (ps->vaapi_active) {
+                    av_frame_unref(ps->decoded_frame);
+                    ret = av_hwframe_transfer_data(
+                              ps->decoded_frame, ps->hw_frame, 0);
+                    if (ret < 0) {
+                        log_msg("ERROR: av_hwframe_transfer_data: %s",
+                                av_err2str(ret));
+                        av_frame_unref(ps->hw_frame);
+                        SDL_UnlockMutex(ps->seek_mutex);
+                        SDL_Delay(1);
+                        goto next_iter;
+                    }
+                    av_frame_copy_props(ps->decoded_frame, ps->hw_frame);
+                    av_frame_unref(ps->hw_frame);
+                }
+
+                /* Compute PTS */
+                AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
+                int64_t frame_pts = ps->decoded_frame->best_effort_timestamp;
+                if (frame_pts == AV_NOPTS_VALUE)
+                    frame_pts = ps->decoded_frame->pts;
+                double pts = (frame_pts != AV_NOPTS_VALUE)
+                    ? (double)frame_pts * av_q2d(vs->time_base) : 0.0;
+
+                ps->decoded_pts = pts;
+                got_frame = 1;
+                break;
+            }
+            if (ret != AVERROR(EAGAIN)) {
+                /* AVERROR_EOF = decoder fully drained */
+                if (ret == AVERROR_EOF)
+                    ps->decode_eof = 1;
+                break;
+            }
+
+            /* Need more packets from the queue */
+            AVPacket pkt;
+            ret = pq_get(&ps->video_pq, &pkt, 0);
+            if (ret <= 0) break;  /* no packets available */
+            avcodec_send_packet(ps->video_codec_ctx, &pkt);
+            av_packet_unref(&pkt);
+        }
+
+        SDL_UnlockMutex(ps->seek_mutex);
+
+#ifdef DSVP_PROFILE
+        if (got_frame) {
+            double dec_ms = (get_time_sec() - t_dec0) * 1000.0;
+            ps->prof_decode_ms = dec_ms;
+            ps->prof_sum_decode += dec_ms;
+            if (dec_ms > ps->prof_max_decode)
+                ps->prof_max_decode = dec_ms;
+            /* Log decode spikes that approach frame budget.
+             * Threshold: 80% of content frame period.
+             * 24fps → 33ms, 60fps → 13ms. */
+            double dec_thr = ps->frame_last_delay > 0.001
+                ? ps->frame_last_delay * 800.0 : 13.0;
+            if (dec_ms > dec_thr)
+                log_msg("PROF SPIKE: decode=%.1fms", dec_ms);
+        }
+#endif
+
+        if (got_frame) {
+            /* Hand off to main loop */
+            SDL_LockMutex(ps->decode_mutex);
+            ps->decode_frame_ready = 1;
+            SDL_UnlockMutex(ps->decode_mutex);
+        } else {
+            SDL_Delay(1); /* no packets or error — yield */
+        }
+
+next_iter:
+        (void)0;  /* label requires a statement */
+    }
+
+    log_msg("Decode thread exiting");
+    return 0;
+}
+
 
 /* Compute the letterboxed display rectangle for the video.
  * Maintains aspect ratio within the current window, centering with
