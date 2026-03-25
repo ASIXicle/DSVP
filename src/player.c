@@ -1747,82 +1747,53 @@ static enum AVPixelFormat vaapi_get_format(AVCodecContext *ctx,
 #define DSVP_VK_QFI_OFFSET         1984
 #define DSVP_VK_QUEUE_OFFSET       1992
 
-/* SDL_GPUTexture → VkImage (to be probed at init)
+/* SDL_GPUTexture → VkImage extraction
  *
- * SDL_GPUTexture* is actually VulkanTextureContainer*.
- * Internal layout varies between SDL3 versions, so we probe at runtime
- * using two test textures of different sizes.
+ * SDL_GPUTexture* is actually VulkanTextureContainer* (internal to SDL3).
+ * We need VkImage for DMA-BUF copy targets.
  *
- * Possible dereference chains (version-dependent):
- *   2-level: container[A] → ptr[B] → VkImage
- *   3-level: container[A] → ptr[B] → ptr[C] → VkImage
+ * Struct layout from SDL3 3.4.2 source (src/gpu/vulkan/SDL_gpu_vulkan.c):
  *
- * We scan offsets 0-256 for each level, validating via
- * vkGetImageMemoryRequirements. Both textures must produce sane results
- * at the same offsets with different memory sizes. */
+ *   VulkanTextureContainer {
+ *       TextureCommonHeader header;         // 36B (SDL_GPUTextureCreateInfo)
+ *       // 4B padding (align ptr to 8)
+ *       VulkanTexture *activeTexture;       // offset 40
+ *       ...
+ *   };
+ *
+ *   VulkanTexture {
+ *       VulkanTextureContainer *container;  // offset 0
+ *       Uint32 containerIndex;              // offset 8, +4B padding
+ *       VulkanMemoryUsedRegion *usedRegion; // offset 16
+ *       VkImage image;                      // offset 24  ← target
+ *       ...
+ *   };
+ *
+ * Chain: container[+40] → activeTexture[+24] → VkImage
+ * Validated at init with two test textures of different sizes. */
 
-/* Stored after successful probe (set by vaapi_zerocopy_probe_vkimage) */
-static int s_tex_offset_a = -1;  /* container → first pointer */
-static int s_tex_offset_b = -1;  /* first ptr → second pointer or VkImage */
-static int s_tex_offset_c = -1;  /* second ptr → VkImage (-1 = 2-level) */
+#define DSVP_TEX_CONTAINER_TO_ACTIVE  40  /* VulkanTextureContainer → VulkanTexture* */
+#define DSVP_TEX_ACTIVE_TO_VKIMAGE    24  /* VulkanTexture → VkImage */
+
+static int s_tex_offsets_valid = 0;  /* 1 after successful validation */
 
 
-/* Check if a pointer value looks like a valid heap/mmap address.
- * On x86_64 Linux, user-space addresses are typically 0x5xxx-0x7fff range. */
-static inline int looks_like_ptr(uintptr_t val) {
-    return val >= 0x10000 && val < 0x800000000000ULL && (val & 7) == 0;
-}
-
-
-/* Try to extract VkImage from SDL_GPUTexture using discovered offsets. */
+/* Extract VkImage from SDL_GPUTexture using known struct offsets. */
 static VkImage sdl_texture_to_vkimage(SDL_GPUTexture *tex)
 {
-    uint8_t *p = (uint8_t *)tex;
-
-    /* Dereference chain: p → [A] → ptr1 → [B] → ptr2/VkImage → [C] → VkImage */
-    uint8_t *ptr1 = *(uint8_t **)(p + s_tex_offset_a);
-
-    if (s_tex_offset_c >= 0) {
-        /* 3-level: ptr1[B] → ptr2, ptr2[C] → VkImage */
-        uint8_t *ptr2 = *(uint8_t **)(ptr1 + s_tex_offset_b);
-        return *(VkImage *)(ptr2 + s_tex_offset_c);
-    } else {
-        /* 2-level: ptr1[B] → VkImage */
-        return *(VkImage *)(ptr1 + s_tex_offset_b);
-    }
+    uint8_t *container = (uint8_t *)tex;
+    uint8_t *active = *(uint8_t **)(container + DSVP_TEX_CONTAINER_TO_ACTIVE);
+    return *(VkImage *)(active + DSVP_TEX_ACTIVE_TO_VKIMAGE);
 }
 
 
-/* Validate a VkImage candidate: sane memory requirements for a small texture.
- * Returns memreq.size on success (> 0), 0 on failure. */
-static VkDeviceSize validate_vkimage(VkDevice dev, VkImage candidate)
+/* Validate VkImage extraction by checking memory requirements.
+ * Creates two test textures (4×4 and 16×16), extracts VkImage from each
+ * using the hardcoded offsets, and verifies both produce sane memory
+ * requirements with the larger texture needing more memory.
+ * Returns 0 on success, -1 on failure. */
+static int vaapi_zerocopy_validate_vkimage(PlayerState *ps)
 {
-    if ((uintptr_t)candidate < 0x1000)
-        return 0;  /* null or very small = not a handle */
-
-    VkMemoryRequirements mem_req;
-    vkGetImageMemoryRequirements(dev, candidate, &mem_req);
-
-    /* Sane: size < 1MB for a tiny test texture, alignment is power-of-2 */
-    if (mem_req.size == 0 || mem_req.size > 1048576)
-        return 0;
-    if (mem_req.alignment == 0 || (mem_req.alignment & (mem_req.alignment - 1)) != 0)
-        return 0;
-    if (mem_req.memoryTypeBits == 0)
-        return 0;
-
-    return mem_req.size;
-}
-
-
-/* ── Probe VkImage offsets by scanning two test textures ──
- *
- * Creates two SDL_GPUTextures (4×4 and 16×16 R16_UNORM), then scans
- * memory to find the dereference chain that yields valid VkImage handles
- * with different memory sizes. Both must succeed at identical offsets. */
-static int vaapi_zerocopy_probe_vkimage(PlayerState *ps)
-{
-    /* Create two test textures of different sizes */
     SDL_GPUTextureCreateInfo ti;
     SDL_zero(ti);
     ti.type   = SDL_GPU_TEXTURETYPE_2D;
@@ -1838,84 +1809,61 @@ static int vaapi_zerocopy_probe_vkimage(PlayerState *ps)
     SDL_GPUTexture *tex_large = SDL_CreateGPUTexture(ps->gpu_device, &ti);
 
     if (!tex_small || !tex_large) {
-        log_msg("ZEROCOPY probe: test texture creation failed");
+        log_msg("ZEROCOPY validate: test texture creation failed");
         if (tex_small) SDL_ReleaseGPUTexture(ps->gpu_device, tex_small);
         if (tex_large) SDL_ReleaseGPUTexture(ps->gpu_device, tex_large);
         return -1;
     }
 
-    uint8_t *p_small = (uint8_t *)tex_small;
-    uint8_t *p_large = (uint8_t *)tex_large;
-    int found = 0;
-
-    /* ── Try 2-level dereference: tex[A] → ptr[B] → VkImage ── */
-    for (int a = 0; a <= 256 && !found; a += 8) {
-        uintptr_t ptr1_s = *(uintptr_t *)(p_small + a);
-        uintptr_t ptr1_l = *(uintptr_t *)(p_large + a);
-        if (!looks_like_ptr(ptr1_s) || !looks_like_ptr(ptr1_l))
-            continue;
-
-        for (int b = 0; b <= 64 && !found; b += 8) {
-            VkImage img_s = *(VkImage *)((uint8_t *)ptr1_s + b);
-            VkImage img_l = *(VkImage *)((uint8_t *)ptr1_l + b);
-
-            VkDeviceSize sz_s = validate_vkimage(ps->vk_device, img_s);
-            VkDeviceSize sz_l = validate_vkimage(ps->vk_device, img_l);
-
-            if (sz_s > 0 && sz_l > 0 && sz_l > sz_s) {
-                s_tex_offset_a = a;
-                s_tex_offset_b = b;
-                s_tex_offset_c = -1;
-                log_msg("ZEROCOPY probe: 2-level VkImage at [+%d][+%d] "
-                        "(4x4=%zu, 16x16=%zu bytes)",
-                        a, b, (size_t)sz_s, (size_t)sz_l);
-                found = 1;
-            }
-        }
+    /* Verify the activeTexture pointer at offset 40 looks valid */
+    uint8_t *active_s = *(uint8_t **)((uint8_t *)tex_small + DSVP_TEX_CONTAINER_TO_ACTIVE);
+    uint8_t *active_l = *(uint8_t **)((uint8_t *)tex_large + DSVP_TEX_CONTAINER_TO_ACTIVE);
+    if (!active_s || !active_l) {
+        log_msg("ZEROCOPY validate: activeTexture is NULL — readback fallback");
+        SDL_ReleaseGPUTexture(ps->gpu_device, tex_small);
+        SDL_ReleaseGPUTexture(ps->gpu_device, tex_large);
+        return -1;
     }
 
-    /* ── Try 3-level dereference: tex[A] → ptr[B] → ptr[C] → VkImage ── */
-    for (int a = 0; a <= 256 && !found; a += 8) {
-        uintptr_t ptr1_s = *(uintptr_t *)(p_small + a);
-        uintptr_t ptr1_l = *(uintptr_t *)(p_large + a);
-        if (!looks_like_ptr(ptr1_s) || !looks_like_ptr(ptr1_l))
-            continue;
+    /* Extract VkImages at offset 24 within VulkanTexture */
+    VkImage img_s = *(VkImage *)(active_s + DSVP_TEX_ACTIVE_TO_VKIMAGE);
+    VkImage img_l = *(VkImage *)(active_l + DSVP_TEX_ACTIVE_TO_VKIMAGE);
 
-        for (int b = 0; b <= 64 && !found; b += 8) {
-            uintptr_t ptr2_s = *(uintptr_t *)((uint8_t *)ptr1_s + b);
-            uintptr_t ptr2_l = *(uintptr_t *)((uint8_t *)ptr1_l + b);
-            if (!looks_like_ptr(ptr2_s) || !looks_like_ptr(ptr2_l))
-                continue;
+    /* Validate via vkGetImageMemoryRequirements */
+    VkMemoryRequirements req_s, req_l;
+    vkGetImageMemoryRequirements(ps->vk_device, img_s, &req_s);
+    vkGetImageMemoryRequirements(ps->vk_device, img_l, &req_l);
 
-            for (int c = 0; c <= 32 && !found; c += 8) {
-                VkImage img_s = *(VkImage *)((uint8_t *)ptr2_s + c);
-                VkImage img_l = *(VkImage *)((uint8_t *)ptr2_l + c);
+    int ok = 1;
 
-                VkDeviceSize sz_s = validate_vkimage(ps->vk_device, img_s);
-                VkDeviceSize sz_l = validate_vkimage(ps->vk_device, img_l);
-
-                if (sz_s > 0 && sz_l > 0 && sz_l > sz_s) {
-                    s_tex_offset_a = a;
-                    s_tex_offset_b = b;
-                    s_tex_offset_c = c;
-                    log_msg("ZEROCOPY probe: 3-level VkImage at [+%d][+%d][+%d] "
-                            "(4x4=%zu, 16x16=%zu bytes)",
-                            a, b, c, (size_t)sz_s, (size_t)sz_l);
-                    found = 1;
-                }
-            }
-        }
-    }
+    /* Sanity: sizes should be small (< 1MB for tiny textures) and non-zero */
+    if (req_s.size == 0 || req_s.size > 1048576) ok = 0;
+    if (req_l.size == 0 || req_l.size > 1048576) ok = 0;
+    /* Larger texture must need more memory */
+    if (req_l.size <= req_s.size) ok = 0;
+    /* Alignment must be power of 2 */
+    if (req_s.alignment == 0 || (req_s.alignment & (req_s.alignment - 1)) != 0) ok = 0;
+    /* Must have compatible memory types */
+    if (req_s.memoryTypeBits == 0 || req_l.memoryTypeBits == 0) ok = 0;
 
     SDL_ReleaseGPUTexture(ps->gpu_device, tex_small);
     SDL_ReleaseGPUTexture(ps->gpu_device, tex_large);
 
-    if (!found) {
-        log_msg("ZEROCOPY probe: VkImage offset not found — readback fallback");
+    if (ok) {
+        s_tex_offsets_valid = 1;
+        log_msg("ZEROCOPY validate: VkImage at container[+%d][+%d] confirmed "
+                "(4x4=%zu, 16x16=%zu bytes)",
+                DSVP_TEX_CONTAINER_TO_ACTIVE, DSVP_TEX_ACTIVE_TO_VKIMAGE,
+                (size_t)req_s.size, (size_t)req_l.size);
+        return 0;
+    } else {
+        log_msg("ZEROCOPY validate: VkImage extraction failed "
+                "(4x4: size=%zu align=%zu bits=0x%x, "
+                "16x16: size=%zu align=%zu bits=0x%x) — readback fallback",
+                (size_t)req_s.size, (size_t)req_s.alignment, req_s.memoryTypeBits,
+                (size_t)req_l.size, (size_t)req_l.alignment, req_l.memoryTypeBits);
         return -1;
     }
-
-    return 0;
 }
 
 
@@ -1944,8 +1892,8 @@ int vaapi_zerocopy_init(PlayerState *ps)
         return -1;
     }
 
-    /* Probe VkImage extraction from SDL_GPUTexture */
-    if (vaapi_zerocopy_probe_vkimage(ps) < 0)
+    /* Validate VkImage extraction from SDL_GPUTexture (source-verified offsets) */
+    if (vaapi_zerocopy_validate_vkimage(ps) < 0)
         return -1;
 
     /* Get VADisplay from FFmpeg's hw_device_ctx */
