@@ -1747,70 +1747,174 @@ static enum AVPixelFormat vaapi_get_format(AVCodecContext *ctx,
 #define DSVP_VK_QFI_OFFSET         1984
 #define DSVP_VK_QUEUE_OFFSET       1992
 
-/* SDL_GPUTexture → VkImage (to be validated at init)
+/* SDL_GPUTexture → VkImage (to be probed at init)
  *
  * SDL_GPUTexture* is actually VulkanTextureContainer*.
- * VulkanTextureContainer layout:
- *   +0:  TextureCommonHeader { SDL_GPUTextureCreateInfo } = 36 bytes
- *   +36: 4 bytes padding (align to 8 for pointer)
- *   +40: VulkanTexture *activeTexture
+ * Internal layout varies between SDL3 versions, so we probe at runtime
+ * using two test textures of different sizes.
  *
- * VulkanTexture layout:
- *   +0: VkImage image
- */
-#define DSVP_TEX_ACTIVE_OFFSET     40   /* VulkanTextureContainer → VulkanTexture* */
-#define DSVP_TEX_IMAGE_OFFSET      0    /* VulkanTexture → VkImage */
+ * Possible dereference chains (version-dependent):
+ *   2-level: container[A] → ptr[B] → VkImage
+ *   3-level: container[A] → ptr[B] → ptr[C] → VkImage
+ *
+ * We scan offsets 0-256 for each level, validating via
+ * vkGetImageMemoryRequirements. Both textures must produce sane results
+ * at the same offsets with different memory sizes. */
+
+/* Stored after successful probe (set by vaapi_zerocopy_probe_vkimage) */
+static int s_tex_offset_a = -1;  /* container → first pointer */
+static int s_tex_offset_b = -1;  /* first ptr → second pointer or VkImage */
+static int s_tex_offset_c = -1;  /* second ptr → VkImage (-1 = 2-level) */
 
 
-/* Extract VkImage from an SDL_GPUTexture using probed offsets. */
-static VkImage sdl_texture_to_vkimage(SDL_GPUTexture *tex)
-{
-    uint8_t *container = (uint8_t *)tex;
-    uint8_t *active = *(uint8_t **)(container + DSVP_TEX_ACTIVE_OFFSET);
-    return *(VkImage *)(active + DSVP_TEX_IMAGE_OFFSET);
+/* Check if a pointer value looks like a valid heap/mmap address.
+ * On x86_64 Linux, user-space addresses are typically 0x5xxx-0x7fff range. */
+static inline int looks_like_ptr(uintptr_t val) {
+    return val >= 0x10000 && val < 0x800000000000ULL && (val & 7) == 0;
 }
 
 
-/* ── Validate VkImage extraction by creating a test texture ──
+/* Try to extract VkImage from SDL_GPUTexture using discovered offsets. */
+static VkImage sdl_texture_to_vkimage(SDL_GPUTexture *tex)
+{
+    uint8_t *p = (uint8_t *)tex;
+
+    /* Dereference chain: p → [A] → ptr1 → [B] → ptr2/VkImage → [C] → VkImage */
+    uint8_t *ptr1 = *(uint8_t **)(p + s_tex_offset_a);
+
+    if (s_tex_offset_c >= 0) {
+        /* 3-level: ptr1[B] → ptr2, ptr2[C] → VkImage */
+        uint8_t *ptr2 = *(uint8_t **)(ptr1 + s_tex_offset_b);
+        return *(VkImage *)(ptr2 + s_tex_offset_c);
+    } else {
+        /* 2-level: ptr1[B] → VkImage */
+        return *(VkImage *)(ptr1 + s_tex_offset_b);
+    }
+}
+
+
+/* Validate a VkImage candidate: sane memory requirements for a small texture.
+ * Returns memreq.size on success (> 0), 0 on failure. */
+static VkDeviceSize validate_vkimage(VkDevice dev, VkImage candidate)
+{
+    if ((uintptr_t)candidate < 0x1000)
+        return 0;  /* null or very small = not a handle */
+
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(dev, candidate, &mem_req);
+
+    /* Sane: size < 1MB for a tiny test texture, alignment is power-of-2 */
+    if (mem_req.size == 0 || mem_req.size > 1048576)
+        return 0;
+    if (mem_req.alignment == 0 || (mem_req.alignment & (mem_req.alignment - 1)) != 0)
+        return 0;
+    if (mem_req.memoryTypeBits == 0)
+        return 0;
+
+    return mem_req.size;
+}
+
+
+/* ── Probe VkImage offsets by scanning two test textures ──
  *
- * Creates a small R16_UNORM texture, extracts the VkImage candidate,
- * and validates it via vkGetImageMemoryRequirements (valid VkImage
- * with expected dimensions → success). */
+ * Creates two SDL_GPUTextures (4×4 and 16×16 R16_UNORM), then scans
+ * memory to find the dereference chain that yields valid VkImage handles
+ * with different memory sizes. Both must succeed at identical offsets. */
 static int vaapi_zerocopy_probe_vkimage(PlayerState *ps)
 {
+    /* Create two test textures of different sizes */
     SDL_GPUTextureCreateInfo ti;
     SDL_zero(ti);
     ti.type   = SDL_GPU_TEXTURETYPE_2D;
     ti.format = SDL_GPU_TEXTUREFORMAT_R16_UNORM;
-    ti.width  = 4;
-    ti.height = 4;
     ti.layer_count_or_depth = 1;
     ti.num_levels = 1;
     ti.usage  = SDL_GPU_TEXTUREUSAGE_SAMPLER;
 
-    SDL_GPUTexture *test = SDL_CreateGPUTexture(ps->gpu_device, &ti);
-    if (!test) {
-        log_msg("ZEROCOPY: probe texture creation failed");
+    ti.width = 4; ti.height = 4;
+    SDL_GPUTexture *tex_small = SDL_CreateGPUTexture(ps->gpu_device, &ti);
+
+    ti.width = 16; ti.height = 16;
+    SDL_GPUTexture *tex_large = SDL_CreateGPUTexture(ps->gpu_device, &ti);
+
+    if (!tex_small || !tex_large) {
+        log_msg("ZEROCOPY probe: test texture creation failed");
+        if (tex_small) SDL_ReleaseGPUTexture(ps->gpu_device, tex_small);
+        if (tex_large) SDL_ReleaseGPUTexture(ps->gpu_device, tex_large);
         return -1;
     }
 
-    VkImage candidate = sdl_texture_to_vkimage(test);
+    uint8_t *p_small = (uint8_t *)tex_small;
+    uint8_t *p_large = (uint8_t *)tex_large;
+    int found = 0;
 
-    /* Validate: vkGetImageMemoryRequirements returns non-zero size
-     * for a valid VkImage. A garbage handle would cause a driver error
-     * or return 0. */
-    VkMemoryRequirements mem_req;
-    vkGetImageMemoryRequirements(ps->vk_device, candidate, &mem_req);
+    /* ── Try 2-level dereference: tex[A] → ptr[B] → VkImage ── */
+    for (int a = 0; a <= 256 && !found; a += 8) {
+        uintptr_t ptr1_s = *(uintptr_t *)(p_small + a);
+        uintptr_t ptr1_l = *(uintptr_t *)(p_large + a);
+        if (!looks_like_ptr(ptr1_s) || !looks_like_ptr(ptr1_l))
+            continue;
 
-    SDL_ReleaseGPUTexture(ps->gpu_device, test);
+        for (int b = 0; b <= 64 && !found; b += 8) {
+            VkImage img_s = *(VkImage *)((uint8_t *)ptr1_s + b);
+            VkImage img_l = *(VkImage *)((uint8_t *)ptr1_l + b);
 
-    if (mem_req.size == 0) {
-        log_msg("ZEROCOPY: VkImage probe failed (size=0) — offset mismatch?");
+            VkDeviceSize sz_s = validate_vkimage(ps->vk_device, img_s);
+            VkDeviceSize sz_l = validate_vkimage(ps->vk_device, img_l);
+
+            if (sz_s > 0 && sz_l > 0 && sz_l > sz_s) {
+                s_tex_offset_a = a;
+                s_tex_offset_b = b;
+                s_tex_offset_c = -1;
+                log_msg("ZEROCOPY probe: 2-level VkImage at [+%d][+%d] "
+                        "(4x4=%zu, 16x16=%zu bytes)",
+                        a, b, (size_t)sz_s, (size_t)sz_l);
+                found = 1;
+            }
+        }
+    }
+
+    /* ── Try 3-level dereference: tex[A] → ptr[B] → ptr[C] → VkImage ── */
+    for (int a = 0; a <= 256 && !found; a += 8) {
+        uintptr_t ptr1_s = *(uintptr_t *)(p_small + a);
+        uintptr_t ptr1_l = *(uintptr_t *)(p_large + a);
+        if (!looks_like_ptr(ptr1_s) || !looks_like_ptr(ptr1_l))
+            continue;
+
+        for (int b = 0; b <= 64 && !found; b += 8) {
+            uintptr_t ptr2_s = *(uintptr_t *)((uint8_t *)ptr1_s + b);
+            uintptr_t ptr2_l = *(uintptr_t *)((uint8_t *)ptr1_l + b);
+            if (!looks_like_ptr(ptr2_s) || !looks_like_ptr(ptr2_l))
+                continue;
+
+            for (int c = 0; c <= 32 && !found; c += 8) {
+                VkImage img_s = *(VkImage *)((uint8_t *)ptr2_s + c);
+                VkImage img_l = *(VkImage *)((uint8_t *)ptr2_l + c);
+
+                VkDeviceSize sz_s = validate_vkimage(ps->vk_device, img_s);
+                VkDeviceSize sz_l = validate_vkimage(ps->vk_device, img_l);
+
+                if (sz_s > 0 && sz_l > 0 && sz_l > sz_s) {
+                    s_tex_offset_a = a;
+                    s_tex_offset_b = b;
+                    s_tex_offset_c = c;
+                    log_msg("ZEROCOPY probe: 3-level VkImage at [+%d][+%d][+%d] "
+                            "(4x4=%zu, 16x16=%zu bytes)",
+                            a, b, c, (size_t)sz_s, (size_t)sz_l);
+                    found = 1;
+                }
+            }
+        }
+    }
+
+    SDL_ReleaseGPUTexture(ps->gpu_device, tex_small);
+    SDL_ReleaseGPUTexture(ps->gpu_device, tex_large);
+
+    if (!found) {
+        log_msg("ZEROCOPY probe: VkImage offset not found — readback fallback");
         return -1;
     }
 
-    log_msg("ZEROCOPY: VkImage probe OK (size=%zu, align=%zu)",
-            (size_t)mem_req.size, (size_t)mem_req.alignment);
     return 0;
 }
 
