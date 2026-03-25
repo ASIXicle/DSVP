@@ -38,6 +38,16 @@
 /* SDL3 shadercross — runtime HLSL→SPIRV→native compilation */
 #include <SDL3_shadercross/SDL_shadercross.h>
 
+/* ── VAAPI zero-copy interop (Linux only) ─────────────────────────── */
+#ifndef _WIN32
+  #include <vulkan/vulkan.h>
+  #include <va/va.h>
+  #include <va/va_drm.h>
+  #include <va/va_drmcommon.h>  /* VADRMPRIMESurfaceDescriptor */
+  #include <libavutil/hwcontext_vaapi.h> /* AVVAAPIDeviceContext */
+  #include <unistd.h>  /* dup(), close() for DMA-BUF fd management */
+#endif
+
 /* ── Constants ──────────────────────────────────────────────────────── */
 
 #define DSVP_VERSION        "0.1.8-beta"
@@ -113,7 +123,9 @@ typedef struct GPUUniforms {
     float dovi_out_r0[4];   /* output row 0 [m,m,m,0] (lms→2020) 16 bytes */
     float dovi_out_r1[4];   /* output row 1 [m,m,m,0]            16 bytes */
     float dovi_out_r2[4];   /* output row 2 [m,m,m,0]            16 bytes */
-} GPUUniforms;              /*                                  256 bytes */
+    float is_semiplanar;    /* 1.0 = UV from single R16G16 tex    4 bytes */
+    float _pad[3];          /* pad to 16-byte alignment          12 bytes */
+} GPUUniforms;              /*                                  272 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *
@@ -141,6 +153,18 @@ typedef struct PlayerState {
     uint8_t            *p010_v_plane;     /* deinterleaved V from P010 UV       */
     int                 vaapi_active;     /* 1 = current file uses VAAPI decode */
     int                 vaapi_nv12;       /* 1 = VAAPI outputs NV12 (8-bit)     */
+
+    /* ── VAAPI zero-copy interop (Linux, HEVC 10-bit P010) ── */
+#ifndef _WIN32
+    int                 vaapi_zerocopy;   /* 1 = DMA-BUF→Vulkan path active     */
+    VkDevice            vk_device;        /* extracted from SDL_GPU              */
+    VkQueue             vk_queue;         /* graphics queue                      */
+    uint32_t            vk_queue_family;  /* queue family index                  */
+    VkCommandPool       vk_cmd_pool;      /* for DMA-BUF copy commands           */
+    VkCommandBuffer     vk_cmd_buf;       /* reused each frame                   */
+    VADisplay           va_display;       /* VAAPI display for surface export    */
+    int                 vk_tex_image_offset; /* offset: SDL_GPUTexture → VkImage */
+#endif
 
     /* ── Audio decode ── */
     AVCodecContext     *audio_codec_ctx;
@@ -179,6 +203,7 @@ typedef struct PlayerState {
     SDL_GPUTexture             *gpu_tex_y;           /* Y plane          */
     SDL_GPUTexture             *gpu_tex_u;           /* U plane          */
     SDL_GPUTexture             *gpu_tex_v;           /* V plane          */
+    SDL_GPUTexture             *gpu_tex_uv;          /* UV interleaved (R16G16, zero-copy) */
     SDL_GPUTexture         *gpu_tex_noise;           /* 64×64 blue noise dither (app lifetime) */
     SDL_GPUTransferBuffer      *gpu_xfer_y;          /* CPU→GPU staging  */
     SDL_GPUTransferBuffer      *gpu_xfer_u;

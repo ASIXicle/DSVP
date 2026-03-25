@@ -481,11 +481,54 @@ int main(int argc, char *argv[]) {
 #else
     bool gpu_debug = false;
 #endif
+
+#if defined(__linux__) && !defined(__APPLE__)
+    /* ── Linux: Request DMA-BUF import extensions for VAAPI zero-copy ──
+     *
+     * SDL_CreateGPUDeviceWithProperties lets us pass SDL_GPUVulkanOptions
+     * to request additional Vulkan device extensions at creation time.
+     * These are required for importing VAAPI decoded surfaces as VkImages
+     * via DMA-BUF, eliminating the 35-42ms GPU→CPU readback.
+     *
+     * If the extensions aren't available, SDL falls back to a device
+     * without them — we detect this later and use the readback path. */
+    const char *vk_ext_names[] = {
+        "VK_KHR_external_memory",
+        "VK_KHR_external_memory_fd",
+        "VK_EXT_external_memory_dma_buf",
+        "VK_EXT_image_drm_format_modifier",
+    };
+    SDL_GPUVulkanOptions vk_opts;
+    SDL_zero(vk_opts);
+    vk_opts.device_extension_count = 4;
+    vk_opts.device_extension_names = vk_ext_names;
+
+    SDL_PropertiesID gpu_props = SDL_CreateProperties();
+    SDL_SetBooleanProperty(gpu_props,
+        SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, gpu_debug);
+    SDL_SetBooleanProperty(gpu_props,
+        SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
+    SDL_SetStringProperty(gpu_props,
+        SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, "vulkan");
+    SDL_SetPointerProperty(gpu_props,
+        SDL_PROP_GPU_DEVICE_CREATE_VULKAN_OPTIONS_POINTER, &vk_opts);
+
+    SDL_GPUDevice *gpu_device = SDL_CreateGPUDeviceWithProperties(gpu_props);
+    SDL_DestroyProperties(gpu_props);
+
+    if (!gpu_device) {
+        /* Extension request may have caused failure — retry without */
+        log_msg("GPU: device creation with DMA-BUF extensions failed, retrying basic...");
+        gpu_device = SDL_CreateGPUDevice(
+            SDL_ShaderCross_GetSPIRVShaderFormats(), gpu_debug, NULL);
+    }
+#else
     SDL_GPUDevice *gpu_device = SDL_CreateGPUDevice(
         SDL_ShaderCross_GetSPIRVShaderFormats(),
         gpu_debug,
         NULL    /* preferred driver — vulkan (set by hint above) */
     );
+#endif
     if (!gpu_device) {
         fprintf(stderr, "[DSVP] Cannot create GPU device: %s\n", SDL_GetError());
         SDL_DestroyWindow(window);

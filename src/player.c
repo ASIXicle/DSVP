@@ -152,8 +152,8 @@ static const char hlsl_fullscreen_vert[] =
  * SampleLevel(s, uv, 0) forces mip level 0. */
 static const char hlsl_yuv_planar_frag[] =
     "Texture2D<float> texY : register(t0, space2);\n"
-    "Texture2D<float> texU : register(t1, space2);\n"
-    "Texture2D<float> texV : register(t2, space2);\n"
+    "Texture2D<float2> texU : register(t1, space2);\n"
+    "Texture2D<float2> texV : register(t2, space2);\n"
     "Texture2D<float> texNoise : register(t3, space2);\n"
     "SamplerState sampY : register(s0, space2);\n"
     "SamplerState sampU : register(s1, space2);\n"
@@ -187,6 +187,7 @@ static const char hlsl_yuv_planar_frag[] =
     "    float4 dovi_out_r0;\n"
     "    float4 dovi_out_r1;\n"
     "    float4 dovi_out_r2;\n"
+    "    float is_semiplanar;\n"
     "};\n"
     "\n"
     "#define PI 3.14159265358979\n"
@@ -235,7 +236,7 @@ static const char hlsl_yuv_planar_frag[] =
     "/* Catmull-Rom (bicubic) 4x4 tap filter for chroma planes.\n"
     " * Smoother than bilinear without the ringing of Lanczos.\n"
     " * Standard for chroma upscaling in quality video players (mpv). */\n"
-    "float sample_catmull(Texture2D<float> tex, SamplerState samp,\n"
+    "float sample_catmull(Texture2D<float2> tex, SamplerState samp,\n"
     "                     float2 uv, float2 tex_size) {\n"
     "    float2 pos  = uv * tex_size - 0.5;\n"
     "    float2 base = floor(pos);\n"
@@ -263,6 +264,39 @@ static const char hlsl_yuv_planar_frag[] =
     "    }\n"
     "\n"
     "    return (wsum > 0.0) ? result / wsum : 0.0;\n"
+    "}\n"
+    "\n"
+    "/* Catmull-Rom returning float2 — for semi-planar UV (R16G16_UNORM).\n"
+    " * Reads .rg from each tap: .r = U (Cb), .g = V (Cr).\n"
+    " * Same filter weights as sample_catmull, just operates on 2 channels. */\n"
+    "float2 sample_catmull_rg(Texture2D<float2> tex, SamplerState samp,\n"
+    "                         float2 uv, float2 tex_size) {\n"
+    "    float2 pos  = uv * tex_size - 0.5;\n"
+    "    float2 base = floor(pos);\n"
+    "    float2 f    = pos - base;\n"
+    "\n"
+    "    float2 result = float2(0.0, 0.0);\n"
+    "    float wsum   = 0.0;\n"
+    "\n"
+    "    [unroll] for (int j = -1; j <= 2; j++) {\n"
+    "        float t = abs(float(j) - f.y);\n"
+    "        float wy = (t <= 1.0)\n"
+    "            ? (1.5 * t * t * t - 2.5 * t * t + 1.0)\n"
+    "            : (-0.5 * t * t * t + 2.5 * t * t - 4.0 * t + 2.0);\n"
+    "        [unroll] for (int i = -1; i <= 2; i++) {\n"
+    "            float s = abs(float(i) - f.x);\n"
+    "            float wx = (s <= 1.0)\n"
+    "                ? (1.5 * s * s * s - 2.5 * s * s + 1.0)\n"
+    "                : (-0.5 * s * s * s + 2.5 * s * s - 4.0 * s + 2.0);\n"
+    "            float w = wx * wy;\n"
+    "            float2 tc = (base + float2(float(i), float(j)) + 0.5)\n"
+    "                        / tex_size;\n"
+    "            result += tex.SampleLevel(samp, tc, 0).rg * w;\n"
+    "            wsum   += w;\n"
+    "        }\n"
+    "    }\n"
+    "\n"
+    "    return (wsum > 0.0) ? result / wsum : float2(0.0, 0.0);\n"
     "}\n"
     "\n"
     "/* PQ EOTF (SMPTE ST 2084 inverse): PQ code values [0,1] → linear\n"
@@ -298,8 +332,18 @@ static const char hlsl_yuv_planar_frag[] =
     "\n"
     "    /* Lanczos-2 for luma, Catmull-Rom for chroma */\n"
     "    float y  = sample_lanczos(texY, sampY, uv, texSizeY);\n"
-    "    float cb = sample_catmull(texU, sampU, uv_chroma, texSizeUV);\n"
-    "    float cr = sample_catmull(texV, sampV, uv_chroma, texSizeUV);\n"
+    "    float cb, cr;\n"
+    "    if (is_semiplanar > 0.5) {\n"
+    "        /* Semi-planar: texU is R16G16_UNORM with interleaved UV.\n"
+    "         * .r = Cb (U), .g = Cr (V). Single texture, one sample. */\n"
+    "        float2 uv_val = sample_catmull_rg(texU, sampU, uv_chroma, texSizeUV);\n"
+    "        cb = uv_val.r;\n"
+    "        cr = uv_val.g;\n"
+    "    } else {\n"
+    "        /* Planar: separate R16/R8 textures for U and V */\n"
+    "        cb = sample_catmull(texU, sampU, uv_chroma, texSizeUV);\n"
+    "        cr = sample_catmull(texV, sampV, uv_chroma, texSizeUV);\n"
+    "    }\n"
     "\n"
     "    y  = (y  - rangeY.x)  * rangeY.y;\n"
     "    cb = (cb - rangeUV.x) * rangeUV.y;\n"
@@ -854,6 +898,30 @@ static int gpu_create_video_textures(PlayerState *ps) {
         return -1;
     }
 
+    /* UV interleaved texture for zero-copy (R16G16_UNORM, half res).
+     * Only created when VAAPI zero-copy is active for P010 content.
+     * The shader reads .r = U, .g = V from this single texture. */
+#ifndef _WIN32
+    if (ps->vaapi_zerocopy && is_10bit) {
+        SDL_GPUTextureCreateInfo uv_info;
+        SDL_zero(uv_info);
+        uv_info.type   = SDL_GPU_TEXTURETYPE_2D;
+        uv_info.format = SDL_GPU_TEXTUREFORMAT_R16G16_UNORM;
+        uv_info.width  = cw;
+        uv_info.height = ch;
+        uv_info.layer_count_or_depth = 1;
+        uv_info.num_levels = 1;
+        uv_info.usage  = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        ps->gpu_tex_uv = SDL_CreateGPUTexture(ps->gpu_device, &uv_info);
+        if (!ps->gpu_tex_uv) {
+            log_msg("ZEROCOPY: failed to create UV texture — readback fallback");
+            ps->vaapi_zerocopy = 0;
+        } else {
+            log_msg("GPU: zero-copy UV texture created (R16G16_UNORM %dx%d)", cw, ch);
+        }
+    }
+#endif
+
     /* Transfer buffers (CPU→GPU staging) */
     SDL_GPUTransferBufferCreateInfo xfer_info;
     SDL_zero(xfer_info);
@@ -884,6 +952,7 @@ static void gpu_destroy_video_textures(PlayerState *ps) {
     if (ps->gpu_tex_y)  { SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_y);  ps->gpu_tex_y  = NULL; }
     if (ps->gpu_tex_u)  { SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_u);  ps->gpu_tex_u  = NULL; }
     if (ps->gpu_tex_v)  { SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_v);  ps->gpu_tex_v  = NULL; }
+    if (ps->gpu_tex_uv) { SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_uv); ps->gpu_tex_uv = NULL; }
     if (ps->gpu_xfer_y) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_y); ps->gpu_xfer_y = NULL; }
     if (ps->gpu_xfer_u) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_u); ps->gpu_xfer_u = NULL; }
     if (ps->gpu_xfer_v) { SDL_ReleaseGPUTransferBuffer(ps->gpu_device, ps->gpu_xfer_v); ps->gpu_xfer_v = NULL; }
@@ -1647,6 +1716,544 @@ static enum AVPixelFormat vaapi_get_format(AVCodecContext *ctx,
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * VAAPI Zero-Copy Interop (Linux only)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Eliminates the 35-42ms av_hwframe_transfer_data GPU→CPU readback
+ * by importing the VAAPI decoded surface directly into Vulkan via
+ * DMA-BUF file descriptors.
+ *
+ * Flow per frame:
+ *   1. vaSyncSurface (ensure decode complete)
+ *   2. vaExportSurfaceHandle → DMA-BUF fds + DRM format info
+ *   3. Import as VkImage via VkImportMemoryFdInfoKHR
+ *   4. vkCmdCopyImage → existing SDL_GPU textures
+ *   5. SDL_GPU render pass samples the textures (same queue = ordered)
+ *
+ * Requires SDL3 ≥ 3.4.0 for SDL_GPUVulkanOptions.
+ * Requires Vulkan extensions: VK_KHR_external_memory_fd,
+ *   VK_EXT_external_memory_dma_buf, VK_EXT_image_drm_format_modifier.
+ */
+
+#ifndef _WIN32
+
+/* ── SDL_GPU Internal Struct Offsets (SDL3 3.4.2, x86_64 Linux) ── */
+
+/* SDL_GPUDevice[+664] → VulkanRenderer* (validated in session 11) */
+#define DSVP_VK_WRAPPER_OFFSET     664
+#define DSVP_VK_INSTANCE_OFFSET    0
+#define DSVP_VK_PHYSDEV_OFFSET     8
+#define DSVP_VK_DEVICE_OFFSET      1392
+#define DSVP_VK_QFI_OFFSET         1984
+#define DSVP_VK_QUEUE_OFFSET       1992
+
+/* SDL_GPUTexture → VkImage (to be validated at init)
+ *
+ * SDL_GPUTexture* is actually VulkanTextureContainer*.
+ * VulkanTextureContainer layout:
+ *   +0:  TextureCommonHeader { SDL_GPUTextureCreateInfo } = 36 bytes
+ *   +36: 4 bytes padding (align to 8 for pointer)
+ *   +40: VulkanTexture *activeTexture
+ *
+ * VulkanTexture layout:
+ *   +0: VkImage image
+ */
+#define DSVP_TEX_ACTIVE_OFFSET     40   /* VulkanTextureContainer → VulkanTexture* */
+#define DSVP_TEX_IMAGE_OFFSET      0    /* VulkanTexture → VkImage */
+
+
+/* Extract VkImage from an SDL_GPUTexture using probed offsets. */
+static VkImage sdl_texture_to_vkimage(SDL_GPUTexture *tex)
+{
+    uint8_t *container = (uint8_t *)tex;
+    uint8_t *active = *(uint8_t **)(container + DSVP_TEX_ACTIVE_OFFSET);
+    return *(VkImage *)(active + DSVP_TEX_IMAGE_OFFSET);
+}
+
+
+/* ── Validate VkImage extraction by creating a test texture ──
+ *
+ * Creates a small R16_UNORM texture, extracts the VkImage candidate,
+ * and validates it via vkGetImageMemoryRequirements (valid VkImage
+ * with expected dimensions → success). */
+static int vaapi_zerocopy_probe_vkimage(PlayerState *ps)
+{
+    SDL_GPUTextureCreateInfo ti;
+    SDL_zero(ti);
+    ti.type   = SDL_GPU_TEXTURETYPE_2D;
+    ti.format = SDL_GPU_TEXTUREFORMAT_R16_UNORM;
+    ti.width  = 4;
+    ti.height = 4;
+    ti.layer_count_or_depth = 1;
+    ti.num_levels = 1;
+    ti.usage  = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+
+    SDL_GPUTexture *test = SDL_CreateGPUTexture(ps->gpu_device, &ti);
+    if (!test) {
+        log_msg("ZEROCOPY: probe texture creation failed");
+        return -1;
+    }
+
+    VkImage candidate = sdl_texture_to_vkimage(test);
+
+    /* Validate: vkGetImageMemoryRequirements returns non-zero size
+     * for a valid VkImage. A garbage handle would cause a driver error
+     * or return 0. */
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(ps->vk_device, candidate, &mem_req);
+
+    SDL_ReleaseGPUTexture(ps->gpu_device, test);
+
+    if (mem_req.size == 0) {
+        log_msg("ZEROCOPY: VkImage probe failed (size=0) — offset mismatch?");
+        return -1;
+    }
+
+    log_msg("ZEROCOPY: VkImage probe OK (size=%zu, align=%zu)",
+            (size_t)mem_req.size, (size_t)mem_req.alignment);
+    return 0;
+}
+
+
+/* ── Initialize zero-copy: extract Vulkan handles, create cmd pool ── */
+int vaapi_zerocopy_init(PlayerState *ps)
+{
+    ps->vaapi_zerocopy = 0;
+
+    if (!ps->hw_device_ctx) return -1;
+    if (!ps->gpu_device) return -1;
+
+    /* Extract VkDevice, VkQueue from SDL_GPU VulkanRenderer */
+    uint8_t *renderer = *(uint8_t **)((uint8_t *)ps->gpu_device + DSVP_VK_WRAPPER_OFFSET);
+    if (!renderer) {
+        log_msg("ZEROCOPY: failed to get VulkanRenderer");
+        return -1;
+    }
+
+    ps->vk_device       = *(VkDevice *)(renderer + DSVP_VK_DEVICE_OFFSET);
+    ps->vk_queue_family  = *(uint32_t *)(renderer + DSVP_VK_QFI_OFFSET);
+    ps->vk_queue         = *(VkQueue *)(renderer + DSVP_VK_QUEUE_OFFSET);
+
+    /* Validate VkDevice */
+    if (vkDeviceWaitIdle(ps->vk_device) != VK_SUCCESS) {
+        log_msg("ZEROCOPY: VkDevice validation failed");
+        return -1;
+    }
+
+    /* Probe VkImage extraction from SDL_GPUTexture */
+    if (vaapi_zerocopy_probe_vkimage(ps) < 0)
+        return -1;
+
+    /* Get VADisplay from FFmpeg's hw_device_ctx */
+    AVHWDeviceContext *hw_ctx = (AVHWDeviceContext *)ps->hw_device_ctx->data;
+    AVVAAPIDeviceContext *va_ctx = (AVVAAPIDeviceContext *)hw_ctx->hwctx;
+    ps->va_display = va_ctx->display;
+
+    /* Create Vulkan command pool + command buffer for DMA-BUF copies */
+    VkCommandPoolCreateInfo pool_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+        .queueFamilyIndex = ps->vk_queue_family,
+    };
+    if (vkCreateCommandPool(ps->vk_device, &pool_info, NULL, &ps->vk_cmd_pool) != VK_SUCCESS) {
+        log_msg("ZEROCOPY: vkCreateCommandPool failed");
+        return -1;
+    }
+
+    VkCommandBufferAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = ps->vk_cmd_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    if (vkAllocateCommandBuffers(ps->vk_device, &alloc_info, &ps->vk_cmd_buf) != VK_SUCCESS) {
+        log_msg("ZEROCOPY: vkAllocateCommandBuffers failed");
+        vkDestroyCommandPool(ps->vk_device, ps->vk_cmd_pool, NULL);
+        return -1;
+    }
+
+    ps->vaapi_zerocopy = 1;
+    log_msg("ZEROCOPY: initialized (VkDevice=%p, VADisplay=%p, qfi=%u)",
+            (void *)ps->vk_device, ps->va_display, ps->vk_queue_family);
+    return 0;
+}
+
+
+/* ── Cleanup zero-copy resources ── */
+void vaapi_zerocopy_cleanup(PlayerState *ps)
+{
+    if (ps->vk_cmd_pool && ps->vk_device) {
+        vkDestroyCommandPool(ps->vk_device, ps->vk_cmd_pool, NULL);
+        ps->vk_cmd_pool = VK_NULL_HANDLE;
+        ps->vk_cmd_buf  = VK_NULL_HANDLE;
+    }
+    ps->vaapi_zerocopy = 0;
+}
+
+
+/* ── Import a single DMA-BUF plane as a VkImage ──
+ *
+ * Creates a VkImage backed by the DMA-BUF memory at the given offset.
+ * Uses VkImageDrmFormatModifierExplicitCreateInfoEXT to specify the
+ * tiling layout. The caller is responsible for destroying the returned
+ * VkImage and VkDeviceMemory after use.
+ *
+ * Returns 0 on success, -1 on failure. */
+static int import_dmabuf_plane(
+    VkDevice device,
+    int fd,                   /* DMA-BUF fd (will be dup'd, caller keeps original) */
+    uint64_t modifier,        /* DRM format modifier */
+    VkFormat format,          /* VK_FORMAT_R16_UNORM or VK_FORMAT_R16G16_UNORM */
+    uint32_t width,
+    uint32_t height,
+    uint32_t offset,          /* byte offset of this plane within the DMA-BUF */
+    uint32_t pitch,           /* row pitch in bytes */
+    size_t   mem_size,        /* total DMA-BUF object size */
+    VkImage *out_image,
+    VkDeviceMemory *out_mem)
+{
+    /* Plane layout within the image (single-plane image) */
+    VkSubresourceLayout plane_layout = {
+        .offset     = offset,
+        .size       = 0,    /* ignored for import */
+        .rowPitch   = pitch,
+        .arrayPitch = 0,
+        .depthPitch = 0,
+    };
+
+    VkImageDrmFormatModifierExplicitCreateInfoEXT drm_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+        .pNext = NULL,
+        .drmFormatModifier       = modifier,
+        .drmFormatModifierPlaneCount = 1,
+        .pPlaneLayouts           = &plane_layout,
+    };
+
+    VkExternalMemoryImageCreateInfo ext_info = {
+        .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .pNext = &drm_info,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+    };
+
+    VkImageCreateInfo img_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .pNext = &ext_info,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = format,
+        .extent = { width, height, 1 },
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+
+    if (vkCreateImage(device, &img_info, NULL, out_image) != VK_SUCCESS) {
+        log_msg("ZEROCOPY: vkCreateImage failed for %ux%u", width, height);
+        return -1;
+    }
+
+    /* Import DMA-BUF memory */
+    int dup_fd = dup(fd);
+    if (dup_fd < 0) {
+        log_msg("ZEROCOPY: dup(fd) failed");
+        vkDestroyImage(device, *out_image, NULL);
+        return -1;
+    }
+
+    VkImportMemoryFdInfoKHR import_info = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        .fd = dup_fd,   /* Vulkan takes ownership */
+    };
+
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(device, *out_image, &mem_req);
+
+    /* Find a memory type that supports the image */
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &import_info,
+        .allocationSize = mem_size > mem_req.size ? mem_size : mem_req.size,
+        .memoryTypeIndex = 0, /* DMA-BUF import: driver picks the right type */
+    };
+
+    /* For DMA-BUF imports, the memoryTypeIndex needs to be compatible.
+     * Use vkGetMemoryFdPropertiesKHR if available, otherwise try type 0. */
+    VkResult vr = vkAllocateMemory(device, &alloc_info, NULL, out_mem);
+    if (vr != VK_SUCCESS) {
+        /* Try type index 1 (some drivers need this) */
+        alloc_info.memoryTypeIndex = 1;
+        vr = vkAllocateMemory(device, &alloc_info, NULL, out_mem);
+    }
+    if (vr != VK_SUCCESS) {
+        log_msg("ZEROCOPY: vkAllocateMemory failed (DMA-BUF import): %d", vr);
+        vkDestroyImage(device, *out_image, NULL);
+        /* fd was consumed by the failed allocate call if VK spec says so,
+         * but to be safe, close dup_fd on allocation failure path.
+         * Actually, Vulkan takes ownership of fd even on failure for DMA_BUF. */
+        return -1;
+    }
+
+    if (vkBindImageMemory(device, *out_image, *out_mem, 0) != VK_SUCCESS) {
+        log_msg("ZEROCOPY: vkBindImageMemory failed");
+        vkFreeMemory(device, *out_mem, NULL);
+        vkDestroyImage(device, *out_image, NULL);
+        return -1;
+    }
+
+    return 0;
+}
+
+
+/* ── Per-frame zero-copy upload ──
+ *
+ * Exports the VAAPI surface as DMA-BUF, imports into Vulkan,
+ * and copies to the existing SDL_GPU textures via vkCmdCopyImage.
+ *
+ * Returns 0 on success, -1 on failure (caller falls back to readback). */
+static int vaapi_zerocopy_upload(PlayerState *ps)
+{
+    AVFrame *frame = ps->video_frame;
+
+    /* The VAAPI surface ID is stored in data[3] */
+    VASurfaceID surface = (VASurfaceID)(uintptr_t)frame->data[3];
+
+    /* Wait for decode to complete */
+    VAStatus va_st = vaSyncSurface(ps->va_display, surface);
+    if (va_st != VA_STATUS_SUCCESS) {
+        log_msg("ZEROCOPY: vaSyncSurface failed: %d", va_st);
+        return -1;
+    }
+
+    /* Export as DRM_PRIME_2 (gives us DMA-BUF fds + layout info) */
+    VADRMPRIMESurfaceDescriptor desc;
+    va_st = vaExportSurfaceHandle(ps->va_display, surface,
+        VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+        VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+        &desc);
+    if (va_st != VA_STATUS_SUCCESS) {
+        log_msg("ZEROCOPY: vaExportSurfaceHandle failed: %d", va_st);
+        return -1;
+    }
+
+    /* Expect 2 layers: Y (R16) and UV (R16G16) for P010 */
+    if (desc.num_layers < 2) {
+        log_msg("ZEROCOPY: unexpected layer count: %u", desc.num_layers);
+        goto fail_close_fds;
+    }
+
+    int w  = ps->vid_w;
+    int h  = ps->vid_h;
+    int cw = w / 2;
+    int ch = h / 2;
+
+    /* Import Y plane */
+    VkImage vk_img_y = VK_NULL_HANDLE;
+    VkDeviceMemory vk_mem_y = VK_NULL_HANDLE;
+    {
+        int obj_idx = desc.layers[0].object_index[0];
+        if (import_dmabuf_plane(ps->vk_device,
+                desc.objects[obj_idx].fd,
+                desc.objects[obj_idx].drm_format_modifier,
+                VK_FORMAT_R16_UNORM,
+                w, h,
+                desc.layers[0].offset[0],
+                desc.layers[0].pitch[0],
+                desc.objects[obj_idx].size,
+                &vk_img_y, &vk_mem_y) < 0)
+            goto fail_close_fds;
+    }
+
+    /* Import UV plane */
+    VkImage vk_img_uv = VK_NULL_HANDLE;
+    VkDeviceMemory vk_mem_uv = VK_NULL_HANDLE;
+    {
+        int obj_idx = desc.layers[1].object_index[0];
+        if (import_dmabuf_plane(ps->vk_device,
+                desc.objects[obj_idx].fd,
+                desc.objects[obj_idx].drm_format_modifier,
+                VK_FORMAT_R16G16_UNORM,
+                cw, ch,
+                desc.layers[1].offset[0],
+                desc.layers[1].pitch[0],
+                desc.objects[obj_idx].size,
+                &vk_img_uv, &vk_mem_uv) < 0) {
+            vkDestroyImage(ps->vk_device, vk_img_y, NULL);
+            vkFreeMemory(ps->vk_device, vk_mem_y, NULL);
+            goto fail_close_fds;
+        }
+    }
+
+    /* ── Record copy commands ── */
+    VkDevice dev = ps->vk_device;
+
+    vkResetCommandBuffer(ps->vk_cmd_buf, 0);
+    VkCommandBufferBeginInfo begin_info = {
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+    };
+    vkBeginCommandBuffer(ps->vk_cmd_buf, &begin_info);
+
+    /* Get destination VkImages from SDL_GPU textures */
+    VkImage dst_y  = sdl_texture_to_vkimage(ps->gpu_tex_y);
+    VkImage dst_uv = sdl_texture_to_vkimage(ps->gpu_tex_uv);
+
+    /* ── Pre-copy barriers ──
+     *
+     * Source (imported): UNDEFINED → TRANSFER_SRC_OPTIMAL
+     *   - Content is valid (DMA-BUF data from VAAPI) but Vulkan needs
+     *     the layout transition for cache coherency.
+     *
+     * Destination (SDL texture): UNDEFINED → TRANSFER_DST_OPTIMAL
+     *   - Using UNDEFINED as oldLayout because we're overwriting the
+     *     entire image. This avoids needing to know SDL's internal
+     *     layout tracking state. */
+    VkImageMemoryBarrier pre_barriers[4] = {
+        /* Source Y */
+        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .srcAccessMask = 0,
+          .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = vk_img_y,
+          .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+        /* Source UV */
+        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .srcAccessMask = 0,
+          .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = vk_img_uv,
+          .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+        /* Dest Y */
+        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = dst_y,
+          .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+        /* Dest UV */
+        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+          .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+          .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = dst_uv,
+          .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+    };
+    vkCmdPipelineBarrier(ps->vk_cmd_buf,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, NULL, 0, NULL, 4, pre_barriers);
+
+    /* ── Copy Y plane ── */
+    VkImageCopy copy_y = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffset = { 0, 0, 0 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffset = { 0, 0, 0 },
+        .extent = { w, h, 1 },
+    };
+    vkCmdCopyImage(ps->vk_cmd_buf,
+        vk_img_y,  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        dst_y,     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &copy_y);
+
+    /* ── Copy UV plane ── */
+    VkImageCopy copy_uv = {
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .srcOffset = { 0, 0, 0 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstOffset = { 0, 0, 0 },
+        .extent = { cw, ch, 1 },
+    };
+    vkCmdCopyImage(ps->vk_cmd_buf,
+        vk_img_uv, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        dst_uv,    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &copy_uv);
+
+    /* ── Post-copy barriers: transition destinations back to shader read ── */
+    VkImageMemoryBarrier post_barriers[2] = {
+        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = dst_y,
+          .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+        { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image = dst_uv,
+          .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } },
+    };
+    vkCmdPipelineBarrier(ps->vk_cmd_buf,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 2, post_barriers);
+
+    vkEndCommandBuffer(ps->vk_cmd_buf);
+
+    /* ── Submit copy to same queue as SDL_GPU (ordered by queue) ── */
+    VkSubmitInfo submit_info = {
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &ps->vk_cmd_buf,
+    };
+    VkResult vr = vkQueueSubmit(ps->vk_queue, 1, &submit_info, VK_NULL_HANDLE);
+
+    /* ── Wait for copy to complete before SDL renders ──
+     * On a single-queue GPU (Steam Deck), vkQueueWaitIdle ensures the
+     * copy finishes before we return to the main loop where SDL_GPU
+     * starts its render pass. Cost is negligible (<1ms for GPU copy). */
+    if (vr == VK_SUCCESS)
+        vkQueueWaitIdle(ps->vk_queue);
+
+    /* ── Cleanup imported resources ── */
+    vkDestroyImage(dev, vk_img_y, NULL);
+    vkDestroyImage(dev, vk_img_uv, NULL);
+    vkFreeMemory(dev, vk_mem_y, NULL);
+    vkFreeMemory(dev, vk_mem_uv, NULL);
+
+    /* Close DMA-BUF fds (vaExportSurfaceHandle opened them) */
+    for (uint32_t i = 0; i < desc.num_objects; i++)
+        close(desc.objects[i].fd);
+
+    if (vr != VK_SUCCESS) {
+        log_msg("ZEROCOPY: vkQueueSubmit failed: %d", vr);
+        return -1;
+    }
+
+    return 0;
+
+fail_close_fds:
+    for (uint32_t i = 0; i < desc.num_objects; i++)
+        close(desc.objects[i].fd);
+    return -1;
+}
+
+#endif /* _WIN32 */
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * Open / Close
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -1873,6 +2480,17 @@ int player_open(PlayerState *ps, const char *filename) {
                 av_get_pix_fmt_name(ps->video_codec_ctx->pix_fmt),
                 av_get_pix_fmt_name(ps->video_codec_ctx->sw_pix_fmt),
                 av_get_pix_fmt_name(stream_fmt));
+
+            /* ── VAAPI zero-copy init (P010 10-bit only) ──
+             * NV12 (8-bit) is fast enough with readback (~2ms).
+             * P010 (10-bit 4K) is the bottleneck at 35-42ms. */
+            if (!ps->vaapi_nv12) {
+                if (vaapi_zerocopy_init(ps) == 0) {
+                    log_msg("VAAPI: zero-copy enabled for P010");
+                } else {
+                    log_msg("VAAPI: zero-copy unavailable — using readback");
+                }
+            }
         } else {
             log_msg("Video: %dx%d, pix_fmt=%s, threads=%d",
                 ps->vid_w, ps->vid_h,
@@ -2343,6 +2961,11 @@ void player_close(PlayerState *ps) {
     /* ── Destroy GPU video textures and transfer buffers ── */
     gpu_destroy_video_textures(ps);
 
+    /* ── VAAPI zero-copy cleanup ── */
+#ifndef _WIN32
+    vaapi_zerocopy_cleanup(ps);
+#endif
+
     /* Reset state */
     ps->playing            = 0;
     ps->paused             = 0;
@@ -2665,19 +3288,32 @@ int decode_thread_func(void *arg) {
             int ret = avcodec_receive_frame(ps->video_codec_ctx, recv_frame);
             if (ret == 0) {
                 if (ps->vaapi_active) {
-                    av_frame_unref(ps->decoded_frame);
-                    ret = av_hwframe_transfer_data(
-                              ps->decoded_frame, ps->hw_frame, 0);
-                    if (ret < 0) {
-                        log_msg("ERROR: av_hwframe_transfer_data: %s",
-                                av_err2str(ret));
+#ifndef _WIN32
+                    if (ps->vaapi_zerocopy) {
+                        /* Zero-copy: keep raw VAAPI surface in decoded_frame.
+                         * No GPU→CPU readback. data[3] = VASurfaceID.
+                         * The main loop will hand this to vaapi_zerocopy_upload
+                         * which exports the surface via DMA-BUF. */
+                        av_frame_unref(ps->decoded_frame);
+                        av_frame_move_ref(ps->decoded_frame, ps->hw_frame);
+                    } else
+#endif
+                    {
+                        /* Readback path: GPU→CPU transfer (35-42ms at 4K) */
+                        av_frame_unref(ps->decoded_frame);
+                        ret = av_hwframe_transfer_data(
+                                  ps->decoded_frame, ps->hw_frame, 0);
+                        if (ret < 0) {
+                            log_msg("ERROR: av_hwframe_transfer_data: %s",
+                                    av_err2str(ret));
+                            av_frame_unref(ps->hw_frame);
+                            SDL_UnlockMutex(ps->seek_mutex);
+                            SDL_Delay(1);
+                            goto next_iter;
+                        }
+                        av_frame_copy_props(ps->decoded_frame, ps->hw_frame);
                         av_frame_unref(ps->hw_frame);
-                        SDL_UnlockMutex(ps->seek_mutex);
-                        SDL_Delay(1);
-                        goto next_iter;
                     }
-                    av_frame_copy_props(ps->decoded_frame, ps->hw_frame);
-                    av_frame_unref(ps->hw_frame);
                 }
 
                 /* Compute PTS */
@@ -3313,8 +3949,18 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
  *   3. All other formats: swscale → upload, 1 byte/sample (R8_UNORM)
  */
 void video_display(PlayerState *ps) {
-    if (!ps->gpu_tex_y || !ps->video_frame || !ps->video_frame->data[0]) return;
+    if (!ps->gpu_tex_y || !ps->video_frame) return;
+    /* In zero-copy mode, video_frame is a raw VAAPI surface: data[3] = VASurfaceID,
+     * data[0] may be NULL. In readback mode, data[0] has CPU pixel data. */
+#ifndef _WIN32
+    if (!ps->vaapi_zerocopy && !ps->video_frame->data[0]) return;
+    if (ps->vaapi_zerocopy && !ps->video_frame->data[3]) return;
+#else
+    if (!ps->video_frame->data[0]) return;
+#endif
     if (ps->seeking) return;
+
+    int zerocopy_ok = 0;  /* 1 = zero-copy upload succeeded this frame */
 
 #ifdef DSVP_PROFILE
     double t_enter = get_time_sec();
@@ -3334,6 +3980,29 @@ void video_display(PlayerState *ps) {
          && !ps->sws_ctx);
 
     if (ps->vaapi_active) {
+#ifndef _WIN32
+        if (ps->vaapi_zerocopy && ps->gpu_tex_uv) {
+            /* ── VAAPI zero-copy path ──
+             *
+             * DMA-BUF export → Vulkan import → vkCmdCopyImage to SDL textures.
+             * Eliminates 35-42ms GPU→CPU readback entirely. */
+            if (vaapi_zerocopy_upload(ps) == 0) {
+                ps->gpu_uniforms.is_semiplanar = 1.0f;
+                zerocopy_ok = 1;
+            } else {
+                /* Zero-copy failed — disable permanently, fall through to readback.
+                 * This frame will be dropped (no CPU data available). Log and continue. */
+                log_msg("ZEROCOPY: upload failed — disabling, readback fallback next frame");
+                ps->vaapi_zerocopy = 0;
+                ps->gpu_uniforms.is_semiplanar = 0.0f;
+                /* Can't recover this frame (no readback data), so return early.
+                 * The decode thread will provide readback data on the next frame. */
+                return;
+            }
+        }
+        if (!zerocopy_ok)
+#endif
+        {
         /* ── VAAPI semi-planar path ──
          *
          * Both NV12 and P010 are semi-planar: Y plane + interleaved UV plane.
@@ -3387,6 +4056,7 @@ void video_display(PlayerState *ps) {
             upload_plane(ps->gpu_device, ps->gpu_xfer_v,
                          ps->p010_v_plane, cw * 2, cw * 2, ch);
         }
+        } /* end if (!zerocopy_ok) */
 
     } else if (is_10bit_passthrough) {
         /* 10-bit passthrough — raw frame directly to R16_UNORM textures */
@@ -3428,7 +4098,17 @@ void video_display(PlayerState *ps) {
 #ifdef DSVP_PROFILE
         double t_before_peak = get_time_sec();
 #endif
-        hdr_compute_scene_peak(ps, peak_frame, peak_is_10bit);
+#ifndef _WIN32
+        if (zerocopy_ok) {
+            /* Zero-copy: no CPU pixel data for luma histogram.
+             * Use static metadata peak (from container or DV RPU).
+             * DV P5 already uses static peak regardless. */
+            ps->gpu_uniforms.hdr_peak_nits = ps->hdr_static_peak;
+        } else
+#endif
+        {
+            hdr_compute_scene_peak(ps, peak_frame, peak_is_10bit);
+        }
 #ifdef DSVP_PROFILE
         double t_after_peak = get_time_sec();
         ps->prof_peak_ms = (t_after_peak - t_before_peak) * 1000.0;
@@ -3436,8 +4116,9 @@ void video_display(PlayerState *ps) {
     }
 
     /* ── Upload plane data to GPU transfer buffers ──
-     * (VAAPI path does its own upload above — skip for that case) */
-    if (!ps->vaapi_active) {
+     * (VAAPI readback path does its own upload above.
+     *  Zero-copy did vkCmdCopyImage — skip everything.) */
+    if (!ps->vaapi_active && !zerocopy_ok) {
         upload_plane(ps->gpu_device, ps->gpu_xfer_y,
                      src_frame->data[0], src_frame->linesize[0], w * bpp, h);
         upload_plane(ps->gpu_device, ps->gpu_xfer_u,
@@ -3457,7 +4138,9 @@ void video_display(PlayerState *ps) {
         return;
     }
 
-    /* ── Copy pass: transfer buffers → GPU textures ── */
+    /* ── Copy pass: transfer buffers → GPU textures ──
+     * Skipped in zero-copy mode (data already in textures via Vulkan). */
+    if (!zerocopy_ok) {
     SDL_GPUCopyPass *copy = SDL_BeginGPUCopyPass(cmd);
     {
         SDL_GPUTextureTransferInfo src_info;
@@ -3500,6 +4183,7 @@ void video_display(PlayerState *ps) {
         SDL_UploadToGPUTexture(copy, &src_info, &dst_region, true);
     }
     SDL_EndGPUCopyPass(copy);
+    } /* end if (!zerocopy_ok) copy pass */
 
     /* ── Overlay copy pass (if dirty) ── */
     gpu_overlay_copy_cmd(cmd, ps);
@@ -3559,7 +4243,13 @@ void video_display(PlayerState *ps) {
 
         SDL_GPUTextureSamplerBinding bindings[4] = {
             { .texture = ps->gpu_tex_y,     .sampler = ps->gpu_sampler },
+#ifndef _WIN32
+            { .texture = (zerocopy_ok && ps->gpu_tex_uv)
+                         ? ps->gpu_tex_uv : ps->gpu_tex_u,
+                                            .sampler = ps->gpu_sampler },
+#else
             { .texture = ps->gpu_tex_u,     .sampler = ps->gpu_sampler },
+#endif
             { .texture = ps->gpu_tex_v,     .sampler = ps->gpu_sampler },
             { .texture = ps->gpu_tex_noise, .sampler = ps->gpu_sampler_nearest },
         };
@@ -3673,7 +4363,13 @@ void video_reblit(PlayerState *ps) {
 
         SDL_GPUTextureSamplerBinding bindings[4] = {
             { .texture = ps->gpu_tex_y,     .sampler = ps->gpu_sampler },
+#ifndef _WIN32
+            { .texture = (ps->vaapi_zerocopy && ps->gpu_tex_uv)
+                         ? ps->gpu_tex_uv : ps->gpu_tex_u,
+                                            .sampler = ps->gpu_sampler },
+#else
             { .texture = ps->gpu_tex_u,     .sampler = ps->gpu_sampler },
+#endif
             { .texture = ps->gpu_tex_v,     .sampler = ps->gpu_sampler },
             { .texture = ps->gpu_tex_noise, .sampler = ps->gpu_sampler_nearest },
         };
