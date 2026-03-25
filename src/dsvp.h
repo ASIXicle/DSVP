@@ -229,6 +229,7 @@ typedef struct PlayerState {
     int                 fullscreen;
     int                 eof;              /* demuxer hit end of file    */
     int                 video_ready;      /* 1 after first frame uploaded — gates reblit */
+    int                 present_mailbox;  /* 0 = VSYNC (FIFO), 1 = MAILBOX (triple-buf) */
 
     /* ── Window geometry ── */
     int                 win_w, win_h;     /* current window size        */
@@ -291,6 +292,29 @@ typedef struct PlayerState {
     char              **playlist_files;      /* sorted full paths          */
     int                 playlist_count;      /* number of playable files   */
     int                 playlist_index;      /* current file's index (-1)  */
+
+#ifdef DSVP_PROFILE
+    /* ── Frame pacing profiler (build with `make profile`) ── */
+    double              prof_upload_ms;       /* last frame: deinterleave+upload */
+    double              prof_peak_ms;         /* last frame: hdr_compute_scene_peak */
+    double              prof_vsync_ms;        /* last frame: copy pass + VSync wait */
+    double              prof_render_ms;       /* last frame: render pass + submit */
+    double              prof_display_ms;      /* last frame: total video_display() */
+    double              prof_decode_ms;       /* last frame: video_decode_frame()  */
+
+    /* Running stats (reset every 10s DIAG window) */
+    int                 prof_n;
+    double              prof_sum_upload;
+    double              prof_sum_peak;
+    double              prof_sum_vsync;
+    double              prof_sum_decode;
+    double              prof_sum_total;
+    double              prof_max_upload;
+    double              prof_max_peak;
+    double              prof_max_vsync;
+    double              prof_max_decode;
+    double              prof_max_total;
+#endif
 
 } PlayerState;
 

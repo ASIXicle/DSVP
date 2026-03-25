@@ -700,6 +700,34 @@ int main(int argc, char *argv[]) {
                     sub_cycle(&ps);
                     break;
 
+                case SDLK_V:
+                    /* Toggle VSync mode: FIFO (strict) ↔ MAILBOX (triple-buf).
+                     * MAILBOX prevents deadline-miss cascades at the cost of
+                     * occasional repeated frames instead of hard stalls.
+                     * Falls back if MAILBOX not supported (some Vulkan drivers). */
+                {
+                    int want_mailbox = !ps.present_mailbox;
+                    SDL_GPUPresentMode mode = want_mailbox
+                        ? SDL_GPU_PRESENTMODE_MAILBOX
+                        : SDL_GPU_PRESENTMODE_VSYNC;
+                    if (SDL_SetGPUSwapchainParameters(gpu_device, window,
+                            SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode)) {
+                        ps.present_mailbox = want_mailbox;
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "Present: %s",
+                                 want_mailbox ? "MAILBOX" : "VSYNC");
+                        log_msg("Present mode: %s",
+                                want_mailbox ? "MAILBOX" : "VSYNC");
+                    } else {
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "MAILBOX not supported");
+                        log_msg("Present mode: MAILBOX not supported (%s)",
+                                SDL_GetError());
+                    }
+                    ps.aud_osd_until = get_time_sec() + 2.0;
+                    break;
+                }
+
                 case SDLK_A:
                     audio_cycle(&ps);
                     break;
@@ -895,16 +923,50 @@ int main(int argc, char *argv[]) {
             int decoded_this_tick = 0;
 
             /* max_catchup caps burst decodes per VSync tick.
-             * Kept at 4 for all content: at 1:1 (60fps on 60Hz), the
-             * natural (2,0) rhythm self-corrects with max_catchup=4.
-             * For heavy content (4K H.264), the decoder occasionally
-             * needs bursts of 3-4 to recover after expensive I-frames.
-             * max_catchup=2 prevented this, causing accumulated drift
-             * that triggered 100+ snap-forwards and multi-second A/V
-             * desync. max_catchup=4 is the stall recovery safety cap. */
-            int max_catchup = 4;
+             *
+             * For 1:1 content (60fps on 60Hz): max_catchup=1.
+             * VSync provides the pacing heartbeat — decode exactly one
+             * frame per tick. If an I-frame decode misses the VSync
+             * deadline, the previous frame holds for one extra VSync
+             * (imperceptible 16ms repeat) and frame_timer catches up
+             * naturally next tick. No burst, no cascade, no phantom
+             * skips. The micro-correction and snap-forward handle drift.
+             *
+             * For non-1:1 content (24fps on 60Hz): max_catchup=4.
+             * frame_timer advances at 41.67ms but the VSync loop runs
+             * at 16.67ms, so most ticks have no decode and occasional
+             * ticks need 2+ decodes. Heavy I-frames can occasionally
+             * need bursts of 3-4 to recover.
+             *
+             * Detection: frame_last_delay < 20ms = 1:1 (same check as
+             * one_to_one inside the loop). Defaults to 4 at playback
+             * start (frame_last_delay=0) until first frame establishes
+             * the cadence. */
+            int is_1to1 = (ps.frame_last_delay > 0.001
+                           && ps.frame_last_delay < 0.020);
+            int max_catchup = is_1to1 ? 1 : 4;
             while (now >= ps.frame_timer && max_catchup-- > 0) {
+#ifdef DSVP_PROFILE
+                double t_dec0 = get_time_sec();
+#endif
                 int vret = video_decode_frame(&ps);
+#ifdef DSVP_PROFILE
+                if (vret > 0) {
+                    double dec_ms = (get_time_sec() - t_dec0) * 1000.0;
+                    ps.prof_decode_ms = dec_ms;
+                    ps.prof_sum_decode += dec_ms;
+                    if (dec_ms > ps.prof_max_decode)
+                        ps.prof_max_decode = dec_ms;
+                    /* Log decode spikes that approach frame budget.
+                     * Threshold: 80% of content frame period.
+                     * 24fps → 33ms, 60fps → 13ms. */
+                    double dec_thr = ps.frame_last_delay > 0.001
+                        ? ps.frame_last_delay * 800.0 : 13.0;
+                    if (dec_ms > dec_thr)
+                        log_msg("PROF SPIKE: decode=%.1fms (frame %d)",
+                                dec_ms, ps.diag_frames_decoded);
+                }
+#endif
                 if (vret > 0) {
                     decoded_this_tick++;
                     ps.diag_frames_decoded++;
@@ -1095,7 +1157,8 @@ int main(int argc, char *argv[]) {
                     ? ps.video_clock - ps.audio_clock_sync : 0.0;
                 log_msg("DIAG: [%.0fs] decoded=%d displayed=%d "
                         "dropped=%d multi_ticks=%d snaps=%d "
-                        "A/V=%.1fms peak=%.1fms bias=%.1fms",
+                        "A/V=%.1fms peak=%.1fms bias=%.1fms "
+                        "pacing=%s",
                         ps.video_clock,
                         ps.diag_frames_decoded,
                         ps.diag_frames_displayed,
@@ -1104,7 +1167,35 @@ int main(int argc, char *argv[]) {
                         ps.diag_timer_snaps,
                         av_now * 1000.0,
                         ps.diag_max_av_drift * 1000.0,
-                        ps.av_bias * 1000.0);
+                        ps.av_bias * 1000.0,
+                        is_1to1 ? "1:1(mc=1)" : "N:1(mc=4)");
+#ifdef DSVP_PROFILE
+                if (ps.prof_n > 0) {
+                    log_msg("PROF: [%.0fs] n=%d  "
+                            "decode=%.1f/%.1f  upload=%.1f/%.1f  "
+                            "peak=%.1f/%.1f  vsync=%.1f/%.1f  "
+                            "total=%.1f/%.1fms  (avg/max)",
+                            ps.video_clock, ps.prof_n,
+                            ps.prof_sum_decode / ps.prof_n,
+                            ps.prof_max_decode,
+                            ps.prof_sum_upload / ps.prof_n,
+                            ps.prof_max_upload,
+                            ps.prof_sum_peak / ps.prof_n,
+                            ps.prof_max_peak,
+                            ps.prof_sum_vsync / ps.prof_n,
+                            ps.prof_max_vsync,
+                            ps.prof_sum_total / ps.prof_n,
+                            ps.prof_max_total);
+                    /* Reset for next window */
+                    ps.prof_n = 0;
+                    ps.prof_sum_upload = ps.prof_sum_peak = 0.0;
+                    ps.prof_sum_vsync = ps.prof_sum_total = 0.0;
+                    ps.prof_sum_decode = 0.0;
+                    ps.prof_max_upload = ps.prof_max_peak = 0.0;
+                    ps.prof_max_vsync = ps.prof_max_total = 0.0;
+                    ps.prof_max_decode = 0.0;
+                }
+#endif
                 ps.diag_last_report = now;
             }
 

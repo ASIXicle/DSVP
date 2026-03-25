@@ -2990,13 +2990,25 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
         return;
     }
 
+    /* ── Frame skip: run histogram every 4th frame ──
+     * Temporal smoothing handles gradual changes; skipped frames
+     * retain the previous smoothed peak (already in the uniform).
+     * Cuts CPU cost by 75% with no visible quality loss.
+     * Frame 0 always runs (initial peak acquisition). */
+    if (ps->diag_frames_displayed > 0
+            && (ps->diag_frames_displayed % 4) != 0) {
+        return;
+    }
+
     const uint8_t *data = frame->data[0];
     int stride = frame->linesize[0];
     int w = ps->vid_w;
     int h = ps->vid_h;
 
     /* ── Build 256-bin histogram of Y plane ──
-     * Subsample 4× in each dimension to reduce work.
+     * Subsample 8× in each dimension to reduce work.
+     * At 4K: (3840/8) × (2160/8) = 129,600 samples — still robust
+     * for a 256-bin histogram with 99.875th percentile readout.
      * For 10-bit: bin = uint16 >> 8 (top 8 bits → 256 bins).
      * For 8-bit:  bin = uint8 value directly. */
     int histogram[256];
@@ -3004,17 +3016,17 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
     int total_samples = 0;
 
     if (is_10bit) {
-        for (int y = 0; y < h; y += 4) {
+        for (int y = 0; y < h; y += 8) {
             const uint16_t *row = (const uint16_t *)(data + y * stride);
-            for (int x = 0; x < w; x += 4) {
+            for (int x = 0; x < w; x += 8) {
                 histogram[row[x] >> 8]++;
                 total_samples++;
             }
         }
     } else {
-        for (int y = 0; y < h; y += 4) {
+        for (int y = 0; y < h; y += 8) {
             const uint8_t *row = data + y * stride;
-            for (int x = 0; x < w; x += 4) {
+            for (int x = 0; x < w; x += 8) {
                 histogram[row[x]]++;
                 total_samples++;
             }
@@ -3118,6 +3130,10 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
 void video_display(PlayerState *ps) {
     if (!ps->gpu_tex_y || !ps->video_frame || !ps->video_frame->data[0]) return;
     if (ps->seeking) return;
+
+#ifdef DSVP_PROFILE
+    double t_enter = get_time_sec();
+#endif
 
     int w  = ps->vid_w;
     int h  = ps->vid_h;
@@ -3224,7 +3240,14 @@ void video_display(PlayerState *ps) {
     {
         AVFrame *peak_frame = ps->vaapi_active ? ps->video_frame : src_frame;
         int peak_is_10bit = ps->vaapi_active ? !ps->vaapi_nv12 : is_10bit_passthrough;
+#ifdef DSVP_PROFILE
+        double t_before_peak = get_time_sec();
+#endif
         hdr_compute_scene_peak(ps, peak_frame, peak_is_10bit);
+#ifdef DSVP_PROFILE
+        double t_after_peak = get_time_sec();
+        ps->prof_peak_ms = (t_after_peak - t_before_peak) * 1000.0;
+#endif
     }
 
     /* ── Upload plane data to GPU transfer buffers ──
@@ -3239,6 +3262,10 @@ void video_display(PlayerState *ps) {
     }
 
     /* ── GPU command buffer ── */
+#ifdef DSVP_PROFILE
+    double t_before_gpu = get_time_sec();
+    ps->prof_upload_ms = (t_before_gpu - t_enter) * 1000.0 - ps->prof_peak_ms;
+#endif
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
     if (!cmd) {
         log_msg("ERROR: SDL_AcquireGPUCommandBuffer failed: %s", SDL_GetError());
@@ -3310,6 +3337,11 @@ void video_display(PlayerState *ps) {
     ps->sc_w = (int)sc_w;
     ps->sc_h = (int)sc_h;
 
+#ifdef DSVP_PROFILE
+    double t_after_vsync = get_time_sec();
+    ps->prof_vsync_ms = (t_after_vsync - t_before_gpu) * 1000.0;
+#endif
+
     /* ── Render pass: YUV planar shader, 3 textures ── */
     SDL_GPUColorTargetInfo color_target;
     SDL_zero(color_target);
@@ -3355,6 +3387,42 @@ void video_display(PlayerState *ps) {
     }
     SDL_EndGPURenderPass(pass);
     SDL_SubmitGPUCommandBuffer(cmd);
+
+#ifdef DSVP_PROFILE
+    {
+        double t_exit = get_time_sec();
+        ps->prof_render_ms  = (t_exit - t_after_vsync) * 1000.0;
+        ps->prof_display_ms = (t_exit - t_enter) * 1000.0;
+
+        /* Spike log: flag individual frames that exceed budget.
+         * At 60fps the VSync period is 16.67ms, so total includes
+         * ~14ms of normal VSync wait. Only log genuine anomalies.
+         * 20ms total = missed VSync boundary by ~3ms. */
+        if (ps->prof_peak_ms > 3.0 || ps->prof_upload_ms > 8.0
+                || ps->prof_display_ms > 20.0) {
+            log_msg("PROF SPIKE: upload=%.1f peak=%.1f vsync=%.1f "
+                    "render=%.1f total=%.1fms (frame %d)",
+                    ps->prof_upload_ms, ps->prof_peak_ms,
+                    ps->prof_vsync_ms, ps->prof_render_ms,
+                    ps->prof_display_ms, ps->diag_frames_displayed);
+        }
+
+        /* Running stats (reset by main.c every 10s DIAG) */
+        ps->prof_n++;
+        ps->prof_sum_upload += ps->prof_upload_ms;
+        ps->prof_sum_peak   += ps->prof_peak_ms;
+        ps->prof_sum_vsync  += ps->prof_vsync_ms;
+        ps->prof_sum_total  += ps->prof_display_ms;
+        if (ps->prof_upload_ms > ps->prof_max_upload)
+            ps->prof_max_upload = ps->prof_upload_ms;
+        if (ps->prof_peak_ms > ps->prof_max_peak)
+            ps->prof_max_peak = ps->prof_peak_ms;
+        if (ps->prof_vsync_ms > ps->prof_max_vsync)
+            ps->prof_max_vsync = ps->prof_vsync_ms;
+        if (ps->prof_display_ms > ps->prof_max_total)
+            ps->prof_max_total = ps->prof_display_ms;
+    }
+#endif
 
     ps->video_ready = 1;
 }

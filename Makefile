@@ -47,12 +47,15 @@ else
   RC_OBJ   =
 endif
 
-.PHONY: all clean debug
+.PHONY: all clean debug profile
 
 all: $(BUILDDIR) $(TARGET)
 
 debug: CFLAGS += -g -DDSVP_DEBUG
 debug: $(BUILDDIR) $(TARGET)
+
+profile: CFLAGS += -O2 -DDSVP_PROFILE
+profile: $(BUILDDIR) $(TARGET)
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
