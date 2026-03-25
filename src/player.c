@@ -1285,13 +1285,27 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     ps->gpu_uniforms.is_dovi       = is_dovi_active ? 1.0f : 0.0f;
 
     /* DV P5 range override: container says limited but IPTPQc2 is full-range.
-     * Must happen after normal range setup since it overrides those values. */
+     * Must happen after normal range setup since it overrides those values.
+     *
+     * Two storage formats:
+     *   - VAAPI P010: 10-bit left-shifted by 6 → max 65472 in uint16.
+     *     R16_UNORM reads 65472/65535 ≈ 0.999. Scale = 65535/65472.
+     *   - Software YUV420P10LE: raw 10-bit → max 1023 in uint16.
+     *     R16_UNORM reads 1023/65535 ≈ 0.0156. Scale = 65535/1023. */
     if (is_dovi_active) {
         ps->gpu_uniforms.rangeY[0]  = 0.0f;
-        ps->gpu_uniforms.rangeY[1]  = 65535.0f / 1023.0f;
         ps->gpu_uniforms.rangeUV[0] = 0.0f;
-        ps->gpu_uniforms.rangeUV[1] = 65535.0f / 1023.0f;
-        log_msg("GPU: DV P5 — range overridden to full-range 10-bit");
+        if (ps->vaapi_active && !ps->vaapi_nv12) {
+            /* P010: (V << 6) storage, near-unity scale */
+            ps->gpu_uniforms.rangeY[1]  = 65535.0f / 65472.0f;
+            ps->gpu_uniforms.rangeUV[1] = 65535.0f / 65472.0f;
+        } else {
+            /* Software decode: raw 10-bit in uint16 */
+            ps->gpu_uniforms.rangeY[1]  = 65535.0f / 1023.0f;
+            ps->gpu_uniforms.rangeUV[1] = 65535.0f / 1023.0f;
+        }
+        log_msg("GPU: DV P5 — range overridden to full-range 10-bit%s",
+                (ps->vaapi_active && !ps->vaapi_nv12) ? " (P010)" : "");
     }
 
     /* Initialize DV uniforms to identity (populated from first frame RPU) */
