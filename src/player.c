@@ -981,7 +981,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         }
 
         log_msg("GPU: uniforms set (%s, P010 %s range → shader)",
-                is_bt709 ? "BT.709" : "BT.601",
+                cs_name,
                 is_full_range ? "full" : "limited");
 
     } else if (ps->vaapi_active && ps->vaapi_nv12) {
@@ -1003,7 +1003,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         }
 
         log_msg("GPU: uniforms set (%s, NV12 %s range → shader)",
-                is_bt709 ? "BT.709" : "BT.601",
+                cs_name,
                 is_full_range ? "full" : "limited");
 
     } else if (is_10bit_passthrough) {
