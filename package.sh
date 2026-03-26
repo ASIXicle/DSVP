@@ -8,7 +8,7 @@
 
 set -e
 
-VERSION="0.1.7-beta"
+VERSION="0.1.8-beta"
 OUTDIR="DSVP-portable"
 SKIP_BUILD=0
 
@@ -126,6 +126,9 @@ Controls:
   B/N        Previous / next file in folder
   D          Debug overlay
   I          Media info overlay
+  H          Cycle HDR debug views (normal/comparison/PQ bypass/grayscale)
+  T          Cycle SDR target nits (203/300/400)
+  G          Cycle midtone gain (1.0/1.1/1.2/1.3)
 
 More info: https://github.com/ASIXicle/DSVP
 README
@@ -179,6 +182,9 @@ Controls:
   B/N        Previous / next file in folder
   D          Debug overlay
   I          Media info overlay
+  H          Cycle HDR debug views (normal/comparison/PQ bypass/grayscale)
+  T          Cycle SDR target nits (203/300/400)
+  G          Cycle midtone gain (1.0/1.1/1.2/1.3)
 
 More info: https://github.com/ASIXicle/DSVP
 README

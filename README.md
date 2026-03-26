@@ -18,6 +18,8 @@ Claude wrote most of this:
 ## Features
 
 - **Reference-quality playback** — Lanczos-2 luma scaling (anti-ringing clamp), Catmull-Rom chroma upsampling (siting-corrected), temporal blue noise dithering, faithful color/gamma/framerate
+- **HDR→SDR tone mapping** — BT.2390 EETF with dynamic scene-adaptive peak detection (99.875th percentile histogram, temporal smoothing), adjustable SDR target (203/300/400 nits) and midtone gain
+- **Dolby Vision** — Profile 5 decode with per-frame RPU updates and piecewise polynomial reshaping; Profile 8 falls through to standard HDR10 path
 - **10-bit passthrough** — YUV420P10LE content uploads as R16_UNORM planar textures with no truncation
 - **Software decode only** — no hardware decode, no driver quirks, bit-exact output
 - **Supports everything FFmpeg supports** — H.264, HEVC, AV1, VP9, VC-1, MKV, MP4, and hundreds more
@@ -43,6 +45,9 @@ Claude wrote most of this:
 | `B` / `N` | Previous / next file in folder |
 | `D` | Toggle debug overlay |
 | `I` | Toggle media info overlay |
+| `H` | Cycle HDR debug views (normal / comparison / PQ bypass / grayscale) |
+| `T` | Cycle SDR target nits (203 / 300 / 400) |
+| `G` | Cycle midtone gain (1.0 / 1.1 / 1.2 / 1.3) |
 
 ## Building from Source
 
@@ -160,7 +165,9 @@ DSVP/
 
 ## Technical Details
 
-DSVP uses a custom GPU rendering pipeline built on SDL_GPU with HLSL shaders cross-compiled to SPIR-V via SDL3_shadercross 3.0.0. The fragment shader performs Lanczos-2 resampling on luma (16-tap windowed sinc with anti-ringing clamp at 0.8), Catmull-Rom bicubic interpolation on chroma (16-tap with sub-texel siting correction), limited→full range expansion, BT.601/BT.709 color matrix conversion, and temporal blue noise dithering (64×64 void-and-cluster texture, per-frame offset) — all in a single pass. YUV420P and YUV420P10LE formats bypass `swscale` entirely; raw decoded planes upload directly to GPU textures.
+DSVP uses a custom GPU rendering pipeline built on SDL_GPU with HLSL shaders cross-compiled to SPIR-V via SDL3_shadercross 3.0.0. The fragment shader performs Lanczos-2 resampling on luma (16-tap windowed sinc with anti-ringing clamp at 0.8), Catmull-Rom bicubic interpolation on chroma (16-tap with sub-texel siting correction), limited→full range expansion, BT.601/BT.709/BT.2020 color matrix conversion, and temporal blue noise dithering (64×64 void-and-cluster texture, per-frame offset) — all in a single pass. YUV420P and YUV420P10LE formats bypass `swscale` entirely; raw decoded planes upload directly to GPU textures.
+
+For HDR10 content, the shader applies PQ EOTF, BT.2390 tone mapping with scene-adaptive dynamic peak detection (CPU-side histogram scan with temporal smoothing), BT.2020→BT.709 gamut mapping, and configurable midtone gain. Dolby Vision Profile 5 content goes through a per-frame RPU-driven piecewise polynomial reshape before tone mapping. Profile 8 uses the standard HDR10 path via its backward-compatible base layer.
 
 The GPU backend is Vulkan on Windows and Linux, Metal on macOS (untested). Audio is the master clock with adaptive bias correction (EMA α=0.05) for OS audio pipeline latency. At 1:1 content/display framerate (≥50fps), VSync is the sole pacing source with frame drops and delay correction bypassed.
 
