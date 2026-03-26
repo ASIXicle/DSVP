@@ -2522,7 +2522,9 @@ static void dovi_log_frame_metadata(PlayerState *ps, const AVFrame *frame)
 /* ── Dolby Vision Uniform Population ──
  *
  * Extracts reshape coefficients and color matrices from the DV RPU
- * metadata on the first decoded frame and populates the GPU uniforms.
+ * metadata on each decoded frame and populates the GPU uniforms.
+ * Called every frame; skips frames with no RPU side data.
+ * Verbose logging only on first populate (state 1 → 2).
  *
  * The DV decode chain in the shader is:
  *   1. Reshape: affine per-component (poly_coef from RPU)
@@ -2548,9 +2550,9 @@ static const double ictcp_lms_to_bt2020[3][3] = {
 static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
 {
     if (ps->gpu_uniforms.is_dovi < 0.5f) return;
-    if (ps->dovi_metadata_logged != 1) return; /* wait for logging pass */
+    if (ps->dovi_metadata_logged < 1) return; /* wait for logging pass */
 
-    /* Only populate once — dovi_metadata_logged transitions 1 → 2 */
+    /* Per-frame RPU read — re-extract uniforms from each frame's side data */
     const AVFrameSideData *sd =
         av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
     if (!sd) return;
@@ -2624,33 +2626,40 @@ static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
 
     /* ── Peak nits from DV source_max_pq ──
      * More accurate than the 1000 nit fallback — DV RPU knows the actual
-     * mastering peak. PQ code in 12-bit domain [0, 4095]. */
+     * mastering peak. PQ code in 12-bit domain [0, 4095].
+     * Updated per-frame; only logs when the peak changes. */
     if (color->source_max_pq > 0) {
         float pq_norm = (float)color->source_max_pq / 4095.0f;
         float dv_peak = pq_eotf_scalar(pq_norm);
         if (dv_peak > 100.0f) {
+            float prev_peak = ps->hdr_static_peak;
             ps->gpu_uniforms.hdr_peak_nits = dv_peak;
             ps->hdr_static_peak = dv_peak;
-            log_msg("DOVI: source_max_pq=%u → peak=%.0f nits (overriding fallback)",
-                    color->source_max_pq, dv_peak);
+            if (fabsf(dv_peak - prev_peak) > 0.5f) {
+                log_msg("DOVI: source_max_pq=%u → peak=%.0f nits%s",
+                        color->source_max_pq, dv_peak,
+                        prev_peak < 1.0f ? " (initial)" : " (scene change)");
+            }
         }
     }
 
-    /* Log the computed output matrix for debugging */
-    log_msg("DOVI: uniforms populated — reshape c0=[%.4f,%.4f,%.4f] c1=[%.4f,%.4f,%.4f]",
-            ps->gpu_uniforms.dovi_c0_I, ps->gpu_uniforms.dovi_c0_Ct,
-            ps->gpu_uniforms.dovi_c0_Cp,
-            ps->gpu_uniforms.dovi_c1_I, ps->gpu_uniforms.dovi_c1_Ct,
-            ps->gpu_uniforms.dovi_c1_Cp);
-    log_msg("DOVI: output matrix (cone_inv × rgb_to_lms):");
-    log_msg("  [%.6f  %.6f  %.6f]", ps->gpu_uniforms.dovi_out_r0[0],
-            ps->gpu_uniforms.dovi_out_r0[1], ps->gpu_uniforms.dovi_out_r0[2]);
-    log_msg("  [%.6f  %.6f  %.6f]", ps->gpu_uniforms.dovi_out_r1[0],
-            ps->gpu_uniforms.dovi_out_r1[1], ps->gpu_uniforms.dovi_out_r1[2]);
-    log_msg("  [%.6f  %.6f  %.6f]", ps->gpu_uniforms.dovi_out_r2[0],
-            ps->gpu_uniforms.dovi_out_r2[1], ps->gpu_uniforms.dovi_out_r2[2]);
+    /* Log on first populate only (avoid per-frame log spam) */
+    if (ps->dovi_metadata_logged < 2) {
+        log_msg("DOVI: uniforms populated — reshape c0=[%.4f,%.4f,%.4f] c1=[%.4f,%.4f,%.4f]",
+                ps->gpu_uniforms.dovi_c0_I, ps->gpu_uniforms.dovi_c0_Ct,
+                ps->gpu_uniforms.dovi_c0_Cp,
+                ps->gpu_uniforms.dovi_c1_I, ps->gpu_uniforms.dovi_c1_Ct,
+                ps->gpu_uniforms.dovi_c1_Cp);
+        log_msg("DOVI: output matrix (cone_inv × rgb_to_lms):");
+        log_msg("  [%.6f  %.6f  %.6f]", ps->gpu_uniforms.dovi_out_r0[0],
+                ps->gpu_uniforms.dovi_out_r0[1], ps->gpu_uniforms.dovi_out_r0[2]);
+        log_msg("  [%.6f  %.6f  %.6f]", ps->gpu_uniforms.dovi_out_r1[0],
+                ps->gpu_uniforms.dovi_out_r1[1], ps->gpu_uniforms.dovi_out_r1[2]);
+        log_msg("  [%.6f  %.6f  %.6f]", ps->gpu_uniforms.dovi_out_r2[0],
+                ps->gpu_uniforms.dovi_out_r2[1], ps->gpu_uniforms.dovi_out_r2[2]);
+    }
 
-    /* Mark as populated — don't re-extract on subsequent frames */
+    /* Mark as populated at least once (allows log pass gate, peak shortcut) */
     ps->dovi_metadata_logged = 2;
 }
 
@@ -2673,8 +2682,8 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
 
     /* DV Profile 5: skip CPU histogram — I-plane is IPTPQc2, not PQ luma.
      * Histogram reads garbage, stuck at PEAK_MIN_NITS floor.  Use the
-     * static peak from source_max_pq (set by dovi_populate_uniforms). */
-    if (ps->dovi_metadata_logged == 2) {
+     * static peak from source_max_pq (updated per-frame by dovi_populate_uniforms). */
+    if (ps->gpu_uniforms.is_dovi > 0.5f) {
         ps->hdr_smoothed_peak = ps->hdr_static_peak;
         ps->hdr_prev_frame_peak = ps->hdr_static_peak;
         ps->gpu_uniforms.hdr_peak_nits = ps->hdr_static_peak;
