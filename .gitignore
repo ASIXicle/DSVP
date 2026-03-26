@@ -25,3 +25,7 @@ dsvp.log
 # Test scripts and logs
 test_*.sh
 test_logs/
+# Synthetic test clips and results (generated locally, too large for git)
+tests/clips/
+tests/logs/
+tests/
