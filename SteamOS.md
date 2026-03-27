@@ -2,19 +2,17 @@
 
 DSVP runs on SteamOS desktop mode via a portable tarball — no developer mode, no pacman, no root access required. Everything lives in your home directory and survives SteamOS updates.
 
-Tested: 4K 60fps software decode, Vulkan, zero dropped frames on Steam Deck OLED via official dock at 4K 4:4:4 60Hz.
-
-HDR coming soon.
+Tested: 4K 60fps VAAPI hardware decode + zero-copy, Vulkan, zero sustained drops on Steam Deck OLED via official dock at 4K 4:4:4 60Hz.
 
 ## Quick Start
 
-**1. Download** the latest `DSVP-*-linux-x64.tar.gz` from [Releases](https://github.com/ASIXicle/DSVP/releases/).
+**1. Download** the latest Steam Deck tarball from the [steamdeck Release](https://github.com/ASIXicle/DSVP/releases/tag/v0.1.8-beta-steamdeck).
 
 **2. Extract and install.** Switch to Desktop Mode, open Konsole, and run:
 
 ```bash
 cd ~
-tar xzf ~/Downloads/DSVP-*-linux-x64.tar.gz
+tar xzf ~/Downloads/DSVP-*-steamdeck.tar.gz
 mv DSVP-portable DSVP
 chmod +x DSVP/dsvp DSVP/dsvp.sh
 ```
@@ -25,6 +23,16 @@ chmod +x DSVP/dsvp DSVP/dsvp.sh
 ~/DSVP/dsvp.sh                         # idle window, press O to open file
 ~/DSVP/dsvp.sh /path/to/movie.mkv      # open directly
 ```
+
+## VAAPI Hardware Decode
+
+DSVP automatically uses VAAPI hardware decode for HEVC content on the Steam Deck. This offloads the decode from the CPU to the APU's VCN engine, which is critical for 4K HEVC 10-bit content that the Deck's Zen 2 can't sustain in software. H.264 content stays software decoded (it plays perfectly at 4K 60fps with 4 threads).
+
+The zero-copy path imports VAAPI surfaces directly into Vulkan via DMA-BUF interop, eliminating GPU readback entirely. Any zero-copy failure falls back to CPU readback transparently.
+
+VAAPI decode is bit-exact — identical output to software decode, no quality compromise. You can verify it's active by pressing `D` (debug overlay) or `I` (media info) during playback.
+
+To force software decode for comparison: `DSVP_HWDEC=0 ~/DSVP/dsvp.sh /path/to/movie.mkv`
 
 ## Add to Desktop App Menu
 
@@ -70,7 +78,7 @@ For best results with DSVP's quality pipeline:
 
 - **No root required.** The entire install lives in `~/DSVP/`. Nothing touches the system partition.
 - **Survives updates.** SteamOS wipes system packages on every update, but `/home/deck/` is untouched.
-- **Built on Debian, runs on SteamOS.** The portable tarball bundles all shared libraries. No dependencies to install.
+- **Built natively on SteamOS.** The portable tarball bundles all shared libraries compiled on the Deck's Arch-based toolchain. No cross-build compatibility issues.
 - **Vulkan only.** DSVP forces Vulkan via `SDL_SetHint`. The Steam Deck's AMD APU supports this natively.
 
 ## Controls
@@ -92,6 +100,13 @@ For best results with DSVP's quality pipeline:
 | `T` | Cycle SDR target nits (203 / 300 / 400) |
 | `G` | Cycle midtone gain (1.0 / 1.1 / 1.2 / 1.3) |
 
+## Environment Variables
+
+| Variable | Effect |
+| --- | --- |
+| `DSVP_THREADS=N` | Override adaptive thread count (0 = FFmpeg auto) |
+| `DSVP_HWDEC=0` | Disable VAAPI hardware decode, force software |
+
 ## Troubleshooting
 
 **"error while loading shared libraries"** — Make sure you're running `./dsvp.sh`, not `./dsvp` directly. The launcher script sets `LD_LIBRARY_PATH` to find the bundled libraries.
@@ -101,3 +116,5 @@ For best results with DSVP's quality pipeline:
 **No audio** — SteamOS desktop mode uses PipeWire. DSVP outputs via SDL3's audio backend which supports PipeWire natively. Check that your output device is set correctly in System Settings → Sound.
 
 **No file dialog** — The file-open dialog (`O` key) uses `zenity`, which is included in SteamOS desktop mode. If it's missing, install via Discover or just pass files as command-line arguments.
+
+**HEVC content dropping frames** — Press `D` to check if VAAPI is active. If the debug overlay shows "Decoder Threads: N" instead of "Decode: VAAPI (hardware)", VAAPI isn't engaged. This likely means FFmpeg was built without `--enable-vaapi`. See [SETUP.md](SETUP.md) for rebuild instructions.
