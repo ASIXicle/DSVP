@@ -4,6 +4,8 @@ DSVP runs on SteamOS desktop mode via a portable tarball — no developer mode, 
 
 Tested: 4K 60fps software decode, Vulkan, zero dropped frames on Steam Deck OLED via official dock at 4K 4:4:4 60Hz.
 
+HDR coming soon.
+
 ## Quick Start
 
 **1. Download** the latest `DSVP-*-linux-x64.tar.gz` from [Releases](https://github.com/ASIXicle/DSVP/releases/).
