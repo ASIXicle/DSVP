@@ -107,7 +107,7 @@ SteamOS doesn't ship SDL3 — build from source.
 
 ```bash
 cd ~
-git clone --depth 1 --branch release-3.2.10 https://github.com/libsdl-org/SDL.git SDL3-src
+git clone --depth 1 --branch release-3.4.2 https://github.com/libsdl-org/SDL.git SDL3-src
 cd SDL3-src
 mkdir build && cd build
 
@@ -158,7 +158,7 @@ export PKG_CONFIG_PATH=$HOME/ffmpeg-8.1-local/lib/pkgconfig:$HOME/sdl3-local/lib
 
 # Verify all deps are found
 pkg-config --modversion libavcodec libavformat sdl3 sdl3-ttf
-# Should show: 62.28.100 / 62.12.100 / 3.2.10 / 3.2.2
+# Should show: 62.28.100 / 62.12.100 / 3.4.2 / 3.2.2
 
 make clean && make
 ```
@@ -219,7 +219,7 @@ rm -rf ~/DSVP-old && mv ~/DSVP ~/DSVP-old && mv DSVP-portable ~/DSVP
 
 ```
 ~/ffmpeg-8.1-local/     — Native FFmpeg 8.1 with VAAPI (headers, libs, pkg-config)
-~/sdl3-local/           — Native SDL3 3.2.10 + SDL3_ttf 3.2.2
+~/sdl3-local/           — Native SDL3 3.4.2 + SDL3_ttf 3.2.2
 ~/DSVP-build/           — Source checkout (steamdeck branch)
 ~/DSVP/                 — Deployed portable build (binary + bundled libs)
 ~/DSVP-old/             — Previous build (backup)

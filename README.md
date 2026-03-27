@@ -5,7 +5,7 @@
 
 WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer a mpv-style player without configs or intimidation factor. Think of DSVP as a middle-man between VLC and mpv. It's not as SOTA as mpv but should be more "user-friendly". Or less, if you don't have a  keyboard. Should offer better quality than VLC as it uses more modern FFmpeg libraries. It *should* play anything you throw at it.
 
-There are portable Windows & Debian builds on the [main branch](https://github.com/ASIXicle/DSVP/tree/main). Steam Deck builds are on this branch — download the latest tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/).
+There are portable Windows & Debian builds on the [main branch](https://github.com/ASIXicle/DSVP/tree/main). Steam Deck builds are on this branch — download the latest tarball from [Releases]([https://github.com/ASIXicle/DSVP/releases/](https://github.com/ASIXicle/DSVP/releases/tag/v0.1.8-beta-steamdeck)).
 
 Claude wrote most of this:
 
@@ -67,7 +67,7 @@ SteamOS has a read-only root filesystem and ships no development headers. Buildi
 - **SteamOS** with filesystem unlocked (`sudo steamos-readonly disable`)
 - **base-devel** (gcc, make, pkg-config) via `pacman`
 - **FFmpeg 8.1** built from source with `--enable-vaapi`
-- **SDL3 3.2.10** built from source
+- **SDL3 3.4.2 built from source
 - **SDL3_ttf 3.2.2** built from source
 - **SDL3_shadercross 3.0.0** (bundled in repo — not available via package managers)
 - **libva + libva-utils** for VAAPI hardware decode

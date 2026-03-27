@@ -2,17 +2,17 @@
 
 DSVP runs on SteamOS desktop mode via a portable tarball — no developer mode, no pacman, no root access required. Everything lives in your home directory and survives SteamOS updates.
 
-Tested: 4K 60fps software/VAAPI decode, Vulkan, zero dropped frames on LG OLED via official dock at 4K 4:4:4 60Hz.
+Tested: 4K 60fps VAAPI hardware decode + zero-copy, Vulkan, zero sustained drops on Steam Deck OLED via official dock at 4K 4:4:4 60Hz.
 
 ## Quick Start
 
-**1. Download** the latest `DSVP-*-linux-x64.tar.gz` from [Releases](https://github.com/ASIXicle/DSVP/releases/).
+**1. Download** the latest Steam Deck tarball from the [steamdeck Release](https://github.com/ASIXicle/DSVP/releases/tag/v0.1.8-beta-steamdeck).
 
 **2. Extract and install.** Switch to Desktop Mode, open Konsole, and run:
 
 ```bash
 cd ~
-tar xzf ~/Downloads/DSVP-*-linux-x64.tar.gz
+tar xzf ~/Downloads/DSVP-*-steamdeck.tar.gz
 mv DSVP-portable DSVP
 chmod +x DSVP/dsvp DSVP/dsvp.sh
 ```
@@ -27,6 +27,8 @@ chmod +x DSVP/dsvp DSVP/dsvp.sh
 ## VAAPI Hardware Decode
 
 DSVP automatically uses VAAPI hardware decode for HEVC content on the Steam Deck. This offloads the decode from the CPU to the APU's VCN engine, which is critical for 4K HEVC 10-bit content that the Deck's Zen 2 can't sustain in software. H.264 content stays software decoded (it plays perfectly at 4K 60fps with 4 threads).
+
+The zero-copy path imports VAAPI surfaces directly into Vulkan via DMA-BUF interop, eliminating GPU readback entirely. Any zero-copy failure falls back to CPU readback transparently.
 
 VAAPI decode is bit-exact — identical output to software decode, no quality compromise. You can verify it's active by pressing `D` (debug overlay) or `I` (media info) during playback.
 
