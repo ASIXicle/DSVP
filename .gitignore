@@ -22,6 +22,7 @@ dsvp.log
 *.zip
 *.tar.gz
 *.patch
+release-notes-main.md
 # Test scripts and logs
 test_*.sh
 test_logs/
