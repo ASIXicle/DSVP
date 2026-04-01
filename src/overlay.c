@@ -720,7 +720,7 @@ void overlay_render_idle(PlayerState *ps) {
     /* ── Title: "DSVP" in large bitmap font ── */
     int S = s_ui_scale;
     int title_scale = 6 * S;
-    const char *title = "DSVP";
+    const char *title = "DSVP_deck";
     int title_tw = text_width(title, title_scale);
     int title_x = (w - title_tw) / 2;
     int title_y = h / 5;
@@ -768,15 +768,11 @@ void overlay_render_idle(PlayerState *ps) {
     draw_text(s_pixels, w, h, col1_x, key_y, "KEYBOARD", key_scale, 140, 160, 200);
     draw_text(s_pixels, w, h, col2_x, key_y, "FUNCTION", key_scale, 160, 160, 170);
     draw_text(s_pixels, w, h, col3_x, key_y, "GAMEPAD",  key_scale, 200, 180, 120);
-    key_y += line_h;
-
-    /* Thin separator under headers */
-    fill_rect(s_pixels, w, h, block_x, key_y, total_w, 1, 60, 60, 70, 150);
-    key_y += 4 * S;
+    key_y += line_h + 2 * S;
 
     /* { keyboard, function, gamepad } — empty string where N/A */
     static const char *rows[][3] = {
-        { "Enter",      "Select / Open",       "A"         },
+        { "O",          "Select / Open File",  "A"         },
         { "Q",          "Back / Stop",         "B"         },
         { "Space",      "Pause / Resume",      "X"         },
         { "S",          "Cycle Subtitles",     "Y"         },
@@ -786,12 +782,7 @@ void overlay_render_idle(PlayerState *ps) {
         { "Up/Down",    "Volume",              "D-Pad U/D" },
         { "B / N",      "Prev / Next File",    "D-Pad L/R" },
         { "D",          "Debug Overlay",       "Select"    },
-        { "O",          "Open File Dialog",    ""          },
         { "F",          "Toggle Fullscreen",   ""          },
-        { "I",          "Media Info",          ""          },
-        { "H",          "HDR Debug Modes",     ""          },
-        { "T",          "Cycle SDR Target",    ""          },
-        { "G",          "Cycle Midtone Gain",  ""          },
         { "V",          "VSync / Mailbox",     ""          },
         { NULL, NULL, NULL }
     };
