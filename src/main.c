@@ -412,7 +412,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     /* ── Initialize SDL ── */
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[DSVP] SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
@@ -594,6 +594,21 @@ int main(int argc, char *argv[]) {
         }
         free(open_path);
         open_path = NULL;
+    }
+
+    /* ── Auto-detect gamepad already connected at startup ── */
+    {
+        int count = 0;
+        SDL_JoystickID *gamepads = SDL_GetGamepads(&count);
+        if (gamepads && count > 0) {
+            ps.gamepad = SDL_OpenGamepad(gamepads[0]);
+            if (ps.gamepad) {
+                ps.gamepad_active = 1;
+                log_msg("Gamepad detected at startup: %s",
+                        SDL_GetGamepadName(ps.gamepad));
+            }
+        }
+        SDL_free(gamepads);
     }
 
     /* ── Main loop ── */
@@ -936,6 +951,189 @@ int main(int argc, char *argv[]) {
                     ps.win_w = ev.window.data1;
                     ps.win_h = ev.window.data2;
                 break;
+
+            /* ── Gamepad hotplug ── */
+            case SDL_EVENT_GAMEPAD_ADDED:
+                if (!ps.gamepad) {
+                    ps.gamepad = SDL_OpenGamepad(ev.gdevice.which);
+                    if (ps.gamepad) {
+                        ps.gamepad_active = 1;
+                        log_msg("Gamepad connected: %s",
+                                SDL_GetGamepadName(ps.gamepad));
+                    }
+                }
+                break;
+
+            case SDL_EVENT_GAMEPAD_REMOVED:
+                if (ps.gamepad &&
+                        SDL_GetGamepadID(ps.gamepad) == ev.gdevice.which) {
+                    SDL_CloseGamepad(ps.gamepad);
+                    ps.gamepad = NULL;
+                    ps.gamepad_active = 0;
+                    ps.trigger_seek_speed = 0.0f;
+                    log_msg("Gamepad disconnected");
+                }
+                break;
+
+            /* ── Gamepad buttons ── */
+            case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+                switch (ev.gbutton.button) {
+
+                case SDL_GAMEPAD_BUTTON_SOUTH:  /* A — Select / Play */
+                    if (!ps.playing) {
+                        /* Idle: open file (same as Start/O) */
+                        SDL_Event fake = {0};
+                        fake.type = SDL_EVENT_KEY_DOWN;
+                        fake.key.key = SDLK_O;
+                        SDL_PushEvent(&fake);
+                    } else {
+                        /* Playing: show seek bar */
+                        ps.show_seekbar = 1;
+                        ps.seekbar_hide_time = get_time_sec() + 3.0;
+                    }
+                    break;
+
+                case SDL_GAMEPAD_BUTTON_WEST:   /* X — Pause */
+                    if (ps.playing) {
+                        ps.paused = !ps.paused;
+                        if (ps.audio_stream) {
+                            if (ps.paused)
+                                SDL_PauseAudioStreamDevice(ps.audio_stream);
+                            else
+                                SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                        }
+                        if (!ps.paused)
+                            ps.frame_timer = get_time_sec();
+                    }
+                    break;
+
+                case SDL_GAMEPAD_BUTTON_EAST:   /* B — Back / Stop */
+                    if (ps.playing) {
+                        player_close(&ps);
+                        ps.quit = 0;
+                    } else {
+                        ps.quit = 1;
+                    }
+                    break;
+
+                case SDL_GAMEPAD_BUTTON_NORTH:  /* Y — Cycle subtitles */
+                    sub_cycle(&ps);
+                    break;
+
+                case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:  /* LB — Seek -5s */
+                    player_seek(&ps, -SEEK_STEP_SEC);
+                    break;
+
+                case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: /* RB — Seek +5s */
+                    player_seek(&ps, SEEK_STEP_SEC);
+                    break;
+
+                case SDL_GAMEPAD_BUTTON_RIGHT_STICK:    /* R3 — Cycle audio */
+                    audio_cycle(&ps);
+                    break;
+
+                case SDL_GAMEPAD_BUTTON_DPAD_UP:    /* D-pad: nav/volume */
+                    if (ps.playing) {
+                        ps.volume += VOLUME_STEP;
+                        if (ps.volume > 1.0) ps.volume = 1.0;
+                        if (ps.audio_stream)
+                            SDL_SetAudioStreamGain(ps.audio_stream, ps.volume);
+                        ps.show_seekbar = 1;
+                        ps.seekbar_hide_time = get_time_sec() + 1.5;
+                    }
+                    break;
+
+                case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
+                    if (ps.playing) {
+                        ps.volume -= VOLUME_STEP;
+                        if (ps.volume < 0.0) ps.volume = 0.0;
+                        if (ps.audio_stream)
+                            SDL_SetAudioStreamGain(ps.audio_stream, ps.volume);
+                        ps.show_seekbar = 1;
+                        ps.seekbar_hide_time = get_time_sec() + 1.5;
+                    }
+                    break;
+
+                case SDL_GAMEPAD_BUTTON_DPAD_LEFT:  /* Prev file */
+                {
+                    SDL_Event fake = {0};
+                    fake.type = SDL_EVENT_KEY_DOWN;
+                    fake.key.key = SDLK_B;
+                    SDL_PushEvent(&fake);
+                    break;
+                }
+
+                case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: /* Next file */
+                {
+                    SDL_Event fake = {0};
+                    fake.type = SDL_EVENT_KEY_DOWN;
+                    fake.key.key = SDLK_N;
+                    SDL_PushEvent(&fake);
+                    break;
+                }
+
+                case SDL_GAMEPAD_BUTTON_START:  /* Menu — open file dialog */
+                {
+                    SDL_Event fake = {0};
+                    fake.type = SDL_EVENT_KEY_DOWN;
+                    fake.key.key = SDLK_O;
+                    SDL_PushEvent(&fake);
+                    break;
+                }
+
+                case SDL_GAMEPAD_BUTTON_BACK:   /* Select — Debug overlay */
+                    if (ps.playing) {
+                        ps.show_debug = !ps.show_debug;
+                        if (ps.show_debug) {
+                            ps.show_info = 0;
+                            player_build_debug_info(&ps);
+                        }
+                    }
+                    break;
+
+                default:
+                    break;
+                }
+                break;
+
+            /* ── Gamepad analog triggers — continuous seek ──
+             *
+             * LT/RT axis ranges 0 (released) to 32767 (full pull).
+             * Map to seek speed: 0 = idle, 32767 = 8× playback speed.
+             * Dead zone at 10% to avoid drift from resting triggers.
+             * Applied each frame in the render section below. */
+            case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+            {
+                float dead_zone = 3276.7f;  /* ~10% of 32767 */
+                if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
+                    float val = (float)ev.gaxis.value;
+                    if (val < dead_zone)
+                        ps.trigger_seek_speed = 0.0f;
+                    else
+                        ps.trigger_seek_speed = -(val / 32767.0f) * 8.0f;
+                } else if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+                    float val = (float)ev.gaxis.value;
+                    if (val < dead_zone)
+                        ps.trigger_seek_speed = 0.0f;
+                    else
+                        ps.trigger_seek_speed = (val / 32767.0f) * 8.0f;
+                }
+                break;
+            }
+            }
+        }
+
+        /* ── Analog trigger seek (gamepad) ──
+         * Applies a proportional seek each tick while a trigger is held.
+         * Speed scales 0–8× based on trigger pull depth.
+         * Throttled to ~4 seeks/sec to avoid flooding the demuxer. */
+        if (ps.playing && !ps.paused && ps.trigger_seek_speed != 0.0f) {
+            static double last_trigger_seek = 0.0;
+            double tnow = get_time_sec();
+            if (tnow - last_trigger_seek >= 0.25) {
+                double seek_delta = ps.trigger_seek_speed * 0.25;
+                player_seek(&ps, seek_delta);
+                last_trigger_seek = tnow;
             }
         }
 
@@ -1256,6 +1454,7 @@ int main(int argc, char *argv[]) {
     /* ── Cleanup ── */
     log_msg("Shutting down");
     if (ps.playing) player_close(&ps);
+    if (ps.gamepad) SDL_CloseGamepad(ps.gamepad);
     playlist_free(&ps);
     sub_close_font();
     gpu_destroy_pipelines(&ps);

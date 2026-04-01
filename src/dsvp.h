@@ -273,6 +273,11 @@ typedef struct PlayerState {
     int                 video_ready;      /* 1 after first frame uploaded — gates reblit */
     int                 present_mailbox;  /* 0 = VSYNC (FIFO), 1 = MAILBOX (triple-buf) */
 
+    /* ── Gamepad (steamdeck branch) ── */
+    SDL_Gamepad        *gamepad;           /* first connected gamepad (NULL if none) */
+    int                 gamepad_active;    /* 1 = gamepad connected, show pad hints  */
+    float               trigger_seek_speed; /* analog seek multiplier (0.0 = idle)   */
+
     /* ── Window geometry ── */
     int                 win_w, win_h;     /* current window size        */
     int                 vid_w, vid_h;     /* video native resolution    */

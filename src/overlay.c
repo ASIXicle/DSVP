@@ -745,8 +745,9 @@ void overlay_render_idle(PlayerState *ps) {
     int key_scale = 2 * S;
     int key_y = sub_y + FONT_H * sub_scale + 40 * S;
 
-    /* Two-column layout: key on left, description on right */
-    static const char *keys[][2] = {
+    /* Two-column layout: key on left, description on right.
+     * When a gamepad is connected, show "Pad / Key" format. */
+    static const char *keys_kb[][2] = {
         { "O",     "Open file" },
         { "Space", "Play / Pause" },
         { "F",     "Toggle fullscreen" },
@@ -761,8 +762,28 @@ void overlay_render_idle(PlayerState *ps) {
         { NULL, NULL }
     };
 
+    static const char *keys_gp[][2] = {
+        { "Start / O",      "Open file" },
+        { "X / Space",      "Pause" },
+        { "A",              "Select / Play" },
+        { "B / Q",          "Back / Stop" },
+        { "Y / S",          "Cycle subtitles" },
+        { "R3 / A-key",     "Cycle audio" },
+        { "Back / D",       "Debug overlay" },
+        { "LB/RB / L/R",    "Seek 5s" },
+        { "Triggers",       "Analog seek" },
+        { "D-pad U/D",      "Volume" },
+        { "D-pad L/R / B/N","Prev / Next file" },
+        { NULL, NULL }
+    };
+
+    const char *(*keys)[2] = ps->gamepad_active
+        ? (const char *(*)[2])keys_gp
+        : (const char *(*)[2])keys_kb;
+
     int line_h = (FONT_H + FONT_LINE) * key_scale;
-    int col_gap = 14 * (FONT_W + FONT_GAP) * key_scale;  /* key column width */
+    int col_gap = (ps->gamepad_active ? 22 : 14)
+                  * (FONT_W + FONT_GAP) * key_scale;
 
     /* Measure total height to center vertically from key_y */
     int num_keys = 0;
