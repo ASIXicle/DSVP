@@ -1705,6 +1705,7 @@ void pq_flush(PacketQueue *q) {
 static enum AVPixelFormat vaapi_get_format(AVCodecContext *ctx,
                                            const enum AVPixelFormat *pix_fmts)
 {
+    (void)ctx;  /* required by FFmpeg callback signature */
     for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
         if (*p == AV_PIX_FMT_VAAPI)
             return AV_PIX_FMT_VAAPI;
