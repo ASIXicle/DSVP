@@ -295,7 +295,7 @@ void browser_scan(PlayerState *ps) {
                 struct dirent *ue;
                 while ((ue = readdir(ud)) != NULL) {
                     if (ue->d_name[0] == '.') continue;
-                    char upath[2048];
+                    char upath[2048 + 256];
                     snprintf(upath, sizeof(upath), "%s/%s",
                              mpath, ue->d_name);
                     struct stat ust;
@@ -315,7 +315,7 @@ void browser_scan(PlayerState *ps) {
                         entries = tmp;
                     }
 
-                    char label[256];
+                    char label[6 + 256];
                     snprintf(label, sizeof(label), "[SD] %s", ue->d_name);
                     entries[count].name = strdup(label);
                     entries[count].path = strdup(upath);

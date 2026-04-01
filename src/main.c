@@ -196,8 +196,7 @@ static void playlist_scan(PlayerState *ps) {
 
     /* Extract directory and filename from filepath */
     char dir[1024], base[1024];
-    strncpy(dir, ps->filepath, sizeof(dir) - 1);
-    dir[sizeof(dir) - 1] = '\0';
+    snprintf(dir, sizeof(dir), "%s", ps->filepath);
 
     /* Find last separator */
     char *sep = strrchr(dir, '/');
@@ -206,12 +205,10 @@ static void playlist_scan(PlayerState *ps) {
     if (sep2 && (!sep || sep2 > sep)) sep = sep2;
 #endif
     if (sep) {
-        strncpy(base, sep + 1, sizeof(base) - 1);
-        base[sizeof(base) - 1] = '\0';
+        snprintf(base, sizeof(base), "%s", sep + 1);
         *(sep + 1) = '\0';  /* dir now ends with separator */
     } else {
-        strncpy(base, dir, sizeof(base) - 1);
-        base[sizeof(base) - 1] = '\0';
+        snprintf(base, sizeof(base), "%s", dir);
         strcpy(dir, ".");
     }
 
@@ -622,8 +619,7 @@ int main(int argc, char *argv[]) {
     if (ps.playing && ps.filepath[0]) {
         /* Set browser to directory of the opened file */
         char dir[1024];
-        strncpy(dir, ps.filepath, sizeof(dir) - 1);
-        dir[sizeof(dir) - 1] = '\0';
+        snprintf(dir, sizeof(dir), "%s", ps.filepath);
         char *sep = strrchr(dir, '/');
 #ifdef _WIN32
         char *sep2 = strrchr(dir, '\\');
@@ -695,8 +691,7 @@ int main(int argc, char *argv[]) {
                         /* Update browser to current file's directory */
                         if (ps.filepath[0]) {
                             char dir[1024];
-                            strncpy(dir, ps.filepath, sizeof(dir) - 1);
-                            dir[sizeof(dir) - 1] = '\0';
+                            snprintf(dir, sizeof(dir), "%s", ps.filepath);
                             char *sep = strrchr(dir, '/');
 #ifdef _WIN32
                             char *sep2 = strrchr(dir, '\\');
@@ -1120,8 +1115,7 @@ int main(int argc, char *argv[]) {
                         /* Update browser to current file's directory */
                         if (ps.filepath[0]) {
                             char dir[1024];
-                            strncpy(dir, ps.filepath, sizeof(dir) - 1);
-                            dir[sizeof(dir) - 1] = '\0';
+                            snprintf(dir, sizeof(dir), "%s", ps.filepath);
                             char *sep = strrchr(dir, '/');
 #ifdef _WIN32
                             char *sep2 = strrchr(dir, '\\');
@@ -1445,8 +1439,7 @@ int main(int argc, char *argv[]) {
                     /* Sync browser to current file's directory */
                     if (ps.filepath[0]) {
                         char dir[1024];
-                        strncpy(dir, ps.filepath, sizeof(dir) - 1);
-                        dir[sizeof(dir) - 1] = '\0';
+                        snprintf(dir, sizeof(dir), "%s", ps.filepath);
                         char *sep = strrchr(dir, '/');
 #ifdef _WIN32
                         char *sep2 = strrchr(dir, '\\');
