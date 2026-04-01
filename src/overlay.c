@@ -744,68 +744,71 @@ void overlay_render_idle(PlayerState *ps) {
     draw_text(s_pixels, w, h, (w - sub_tw) / 2, sub_y, subtitle, sub_scale,
               100, 100, 110);
 
-    /* ── Hotkey reference ── */
+    /* ── Hotkey reference: Keyboard | Function | Gamepad ── */
     int key_scale = 2 * S;
+    int char_w = (FONT_W + FONT_GAP) * key_scale;
     int key_y = sub_y + FONT_H * sub_scale + 40 * S;
 
-    /* Two-column layout: key on left, description on right.
-     * When a gamepad is connected, show "Pad / Key" format. */
-    static const char *keys_kb[][2] = {
-        { "O",     "Open file" },
-        { "Space", "Play / Pause" },
-        { "F",     "Toggle fullscreen" },
-        { "D",     "Debug overlay" },
-        { "I",     "Media info" },
-        { "S",     "Cycle subtitles" },
-        { "A",     "Cycle audio tracks" },
-        { "Left/Right", "Seek 5s" },
-        { "Up/Down",    "Volume" },
-        { "B/N",        "Prev / Next file" },
-        { "Q",     "Close / Quit" },
-        { NULL, NULL }
-    };
-
-    static const char *keys_gp[][2] = {
-        { "Start / O",      "Open file" },
-        { "X / Space",      "Pause" },
-        { "A",              "Select / Play" },
-        { "B / Q",          "Back / Stop" },
-        { "Y / S",          "Cycle subtitles" },
-        { "R3 / A-key",     "Cycle audio" },
-        { "Back / D",       "Debug overlay" },
-        { "LB/RB / L/R",    "Seek 5s" },
-        { "Triggers",       "Analog seek" },
-        { "D-pad U/D",      "Volume" },
-        { "D-pad L/R / B/N","Prev / Next file" },
-        { NULL, NULL }
-    };
-
-    const char *(*keys)[2] = ps->gamepad_active
-        ? (const char *(*)[2])keys_gp
-        : (const char *(*)[2])keys_kb;
-
-    int line_h = (FONT_H + FONT_LINE) * key_scale;
-    int col_gap = (ps->gamepad_active ? 22 : 14)
-                  * (FONT_W + FONT_GAP) * key_scale;
-
-    /* Measure total height to center vertically from key_y */
-    int num_keys = 0;
-    while (keys[num_keys][0]) num_keys++;
-    int block_h = num_keys * line_h;
-    (void)block_h;
-
-    /* Center the key block horizontally */
-    int block_x = (w - col_gap - text_width("Toggle fullscreen", key_scale)) / 2;
+    /* Column widths in characters */
+    int kb_col_w = 12 * char_w;
+    int fn_col_w = 22 * char_w;
+    int gap_w    =  3 * char_w;
+    int gp_col_w = 10 * char_w;
+    int total_w  = kb_col_w + gap_w + fn_col_w + gap_w + gp_col_w;
+    int block_x  = (w - total_w) / 2;
     if (block_x < 40 * S) block_x = 40 * S;
 
-    for (int i = 0; keys[i][0]; i++) {
+    int col1_x = block_x;                              /* Keyboard */
+    int col2_x = block_x + kb_col_w + gap_w;           /* Function */
+    int col3_x = block_x + kb_col_w + gap_w + fn_col_w + gap_w; /* Gamepad */
+
+    int line_h = (FONT_H + FONT_LINE) * key_scale;
+
+    /* Column headers */
+    draw_text(s_pixels, w, h, col1_x, key_y, "KEYBOARD", key_scale, 140, 160, 200);
+    draw_text(s_pixels, w, h, col2_x, key_y, "FUNCTION", key_scale, 160, 160, 170);
+    draw_text(s_pixels, w, h, col3_x, key_y, "GAMEPAD",  key_scale, 200, 180, 120);
+    key_y += line_h;
+
+    /* Thin separator under headers */
+    fill_rect(s_pixels, w, h, block_x, key_y, total_w, 1, 60, 60, 70, 150);
+    key_y += 4 * S;
+
+    /* { keyboard, function, gamepad } — empty string where N/A */
+    static const char *rows[][3] = {
+        { "Enter",      "Select / Open",       "A"         },
+        { "Q",          "Back / Stop",         "B"         },
+        { "Space",      "Pause / Resume",      "X"         },
+        { "S",          "Cycle Subtitles",     "Y"         },
+        { "Left/Right", "Seek +/- 5s",         "LB / RB"   },
+        { "",           "Analog Seek 0-64x",   "LT / RT"   },
+        { "A-key",      "Cycle Audio Track",   "R3"        },
+        { "Up/Down",    "Volume",              "D-Pad U/D" },
+        { "B / N",      "Prev / Next File",    "D-Pad L/R" },
+        { "D",          "Debug Overlay",       "Select"    },
+        { "O",          "Open File Dialog",    ""          },
+        { "F",          "Toggle Fullscreen",   ""          },
+        { "I",          "Media Info",          ""          },
+        { "H",          "HDR Debug Modes",     ""          },
+        { "T",          "Cycle SDR Target",    ""          },
+        { "G",          "Cycle Midtone Gain",  ""          },
+        { "V",          "VSync / Mailbox",     ""          },
+        { NULL, NULL, NULL }
+    };
+
+    for (int i = 0; rows[i][0]; i++) {
         int y = key_y + i * line_h;
-        /* Key name in accent color */
-        draw_text(s_pixels, w, h, block_x, y,
-                  keys[i][0], key_scale, 180, 200, 240);
-        /* Description in dim color */
-        draw_text(s_pixels, w, h, block_x + col_gap, y,
-                  keys[i][1], key_scale, 130, 130, 140);
+        /* Keyboard — accent blue */
+        if (rows[i][0][0])
+            draw_text(s_pixels, w, h, col1_x, y, rows[i][0],
+                      key_scale, 180, 200, 240);
+        /* Function — neutral light */
+        draw_text(s_pixels, w, h, col2_x, y, rows[i][1],
+                  key_scale, 200, 200, 210);
+        /* Gamepad — warm gold */
+        if (rows[i][2][0])
+            draw_text(s_pixels, w, h, col3_x, y, rows[i][2],
+                      key_scale, 220, 200, 120);
     }
 
     /* Controls overlay (Start button) — drawn on top */
@@ -1151,9 +1154,10 @@ void overlay_render(PlayerState *ps) {
 
     if (need_seekbar) {
         draw_seekbar(s_pixels, w, h, ps);
-        draw_menubar(s_pixels, w, h);
+        if (!ps->game_mode)
+            draw_menubar(s_pixels, w, h);
     }
-
+    
     if (need_debug) {
         player_build_debug_info(ps);  /* refresh live data */
         draw_text_panel(s_pixels, w, h, ps->debug_info, 10, 40, 2);
