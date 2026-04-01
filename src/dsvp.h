@@ -281,6 +281,9 @@ typedef struct PlayerState {
     SDL_Gamepad        *gamepad;           /* first connected gamepad (NULL if none) */
     int                 gamepad_active;    /* 1 = gamepad connected, show pad hints  */
     float               trigger_seek_speed; /* analog seek multiplier (0.0 = idle)   */
+    int                 dpad_held_dir;     /* -1=up, 1=down, 0=none (browser repeat) */
+    double              dpad_held_since;   /* wall time when d-pad was pressed        */
+    double              dpad_last_repeat;  /* wall time of last repeat fire           */
 
     /* ── Built-in file browser (steamdeck branch) ── */
     int                 browser_active;       /* 1 = browser is shown (replaces idle)  */

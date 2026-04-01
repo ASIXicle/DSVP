@@ -971,7 +971,7 @@ void overlay_render_browser(PlayerState *ps) {
 
         const char *hint;
         if (ps->gamepad_active)
-            hint = "A:Open  B:Back  Start:Dialog  D-pad:Navigate";
+            hint = "A:Open  B:Back  D-pad:Navigate";
         else
             hint = "Enter:Open  Backspace:Back  O:Dialog  Arrows:Navigate";
 

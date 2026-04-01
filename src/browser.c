@@ -422,6 +422,19 @@ int browser_enter(PlayerState *ps) {
 }
 
 void browser_back(PlayerState *ps) {
+    /* Don't go above home directory — root is scary for users */
+    const char *home = getenv("HOME");
+    if (home) {
+        char cur[1024], hbuf[1024];
+        snprintf(cur, sizeof(cur), "%s", ps->browser_path);
+        snprintf(hbuf, sizeof(hbuf), "%s", home);
+        size_t clen = strlen(cur);
+        size_t hlen = strlen(hbuf);
+        if (clen > 1 && cur[clen - 1] == '/') cur[clen - 1] = '\0';
+        if (hlen > 1 && hbuf[hlen - 1] == '/') hbuf[hlen - 1] = '\0';
+        if (strcmp(cur, hbuf) == 0) return;  /* already at home, stop */
+    }
+
     /* Go up one directory */
     char *path = ps->browser_path;
     size_t len = strlen(path);
@@ -460,9 +473,21 @@ void browser_back(PlayerState *ps) {
 int browser_at_root(PlayerState *ps) {
     const char *p = ps->browser_path;
 #ifdef _WIN32
-    /* "C:\" or similar */
-    return (strlen(p) <= 3 && p[1] == ':');
+    if (strlen(p) <= 3 && p[1] == ':') return 1;
+    const char *home = getenv("USERPROFILE");
 #else
-    return (strcmp(p, "/") == 0);
+    if (strcmp(p, "/") == 0) return 1;
+    const char *home = getenv("HOME");
 #endif
+    if (home) {
+        char cur[1024], hbuf[1024];
+        snprintf(cur, sizeof(cur), "%s", p);
+        snprintf(hbuf, sizeof(hbuf), "%s", home);
+        size_t clen = strlen(cur);
+        size_t hlen = strlen(hbuf);
+        if (clen > 1 && cur[clen - 1] == '/') cur[clen - 1] = '\0';
+        if (hlen > 1 && hbuf[hlen - 1] == '/') hbuf[hlen - 1] = '\0';
+        if (strcmp(cur, hbuf) == 0) return 1;
+    }
+    return 0;
 }

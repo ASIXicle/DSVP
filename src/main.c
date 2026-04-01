@@ -1156,6 +1156,9 @@ int main(int argc, char *argv[]) {
                 case SDL_GAMEPAD_BUTTON_DPAD_UP:    /* D-pad: nav/volume */
                     if (!ps.playing && ps.browser_active) {
                         browser_navigate(&ps, -1);
+                        ps.dpad_held_dir = -1;
+                        ps.dpad_held_since = get_time_sec();
+                        ps.dpad_last_repeat = ps.dpad_held_since;
                     } else if (ps.playing) {
                         ps.volume += VOLUME_STEP;
                         if (ps.volume > 1.0) ps.volume = 1.0;
@@ -1169,6 +1172,9 @@ int main(int argc, char *argv[]) {
                 case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
                     if (!ps.playing && ps.browser_active) {
                         browser_navigate(&ps, 1);
+                        ps.dpad_held_dir = 1;
+                        ps.dpad_held_since = get_time_sec();
+                        ps.dpad_last_repeat = ps.dpad_held_since;
                     } else if (ps.playing) {
                         ps.volume -= VOLUME_STEP;
                         if (ps.volume < 0.0) ps.volume = 0.0;
@@ -1205,14 +1211,8 @@ int main(int argc, char *argv[]) {
                     break;
                 }
 
-                case SDL_GAMEPAD_BUTTON_START:  /* Menu — open file dialog */
-                {
-                    SDL_Event fake = {0};
-                    fake.type = SDL_EVENT_KEY_DOWN;
-                    fake.key.key = SDLK_O;
-                    SDL_PushEvent(&fake);
+                case SDL_GAMEPAD_BUTTON_START:  /* Menu — no-op in Game Mode */
                     break;
-                }
 
                 case SDL_GAMEPAD_BUTTON_BACK:   /* Select — Debug overlay */
                     if (ps.playing) {
@@ -1229,10 +1229,17 @@ int main(int argc, char *argv[]) {
                 }
                 break;
 
+            case SDL_EVENT_GAMEPAD_BUTTON_UP:
+                if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_UP ||
+                    ev.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_DOWN) {
+                    ps.dpad_held_dir = 0;
+                }
+                break;
+
             /* ── Gamepad analog triggers — continuous seek ──
              *
              * LT/RT axis ranges 0 (released) to 32767 (full pull).
-             * Map to seek speed: 0 = idle, 32767 = 8× playback speed.
+             * Map to seek speed: 0 = idle, 32767 = 32× playback speed.
              * Dead zone at 10% to avoid drift from resting triggers.
              * Applied each frame in the render section below. */
             case SDL_EVENT_GAMEPAD_AXIS_MOTION:
@@ -1243,13 +1250,13 @@ int main(int argc, char *argv[]) {
                     if (val < dead_zone)
                         ps.trigger_seek_speed = 0.0f;
                     else
-                        ps.trigger_seek_speed = -(val / 32767.0f) * 8.0f;
+                        ps.trigger_seek_speed = -(val / 32767.0f) * 32.0f;
                 } else if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
                     float val = (float)ev.gaxis.value;
                     if (val < dead_zone)
                         ps.trigger_seek_speed = 0.0f;
                     else
-                        ps.trigger_seek_speed = (val / 32767.0f) * 8.0f;
+                        ps.trigger_seek_speed = (val / 32767.0f) * 32.0f;
                 }
                 break;
             }
@@ -1258,7 +1265,7 @@ int main(int argc, char *argv[]) {
 
         /* ── Analog trigger seek (gamepad) ──
          * Applies a proportional seek each tick while a trigger is held.
-         * Speed scales 0–8× based on trigger pull depth.
+         * Speed scales 0–32× based on trigger pull depth.
          * Throttled to ~4 seeks/sec to avoid flooding the demuxer. */
         if (ps.playing && !ps.paused && ps.trigger_seek_speed != 0.0f) {
             static double last_trigger_seek = 0.0;
@@ -1267,6 +1274,17 @@ int main(int argc, char *argv[]) {
                 double seek_delta = ps.trigger_seek_speed * 0.25;
                 player_seek(&ps, seek_delta);
                 last_trigger_seek = tnow;
+            }
+        }
+
+        /* ── D-pad repeat for browser scrolling ──
+         * 300ms initial delay, then 80ms repeat rate. */
+        if (ps.dpad_held_dir != 0 && ps.browser_active && !ps.playing) {
+            double dnow = get_time_sec();
+            double elapsed = dnow - ps.dpad_held_since;
+            if (elapsed >= 0.30 && dnow - ps.dpad_last_repeat >= 0.08) {
+                browser_navigate(&ps, ps.dpad_held_dir);
+                ps.dpad_last_repeat = dnow;
             }
         }
 
@@ -1435,25 +1453,60 @@ int main(int argc, char *argv[]) {
                 if (!frame_avail && ps.eof && ps.decode_eof
                         && ps.video_pq.nb_packets == 0
                         && ps.audio_pq.nb_packets == 0) {
-                    log_msg("Playback finished, returning to browser");
-                    /* Sync browser to current file's directory */
-                    if (ps.filepath[0]) {
-                        char dir[1024];
-                        snprintf(dir, sizeof(dir), "%s", ps.filepath);
-                        char *sep = strrchr(dir, '/');
-#ifdef _WIN32
-                        char *sep2 = strrchr(dir, '\\');
-                        if (sep2 && (!sep || sep2 > sep)) sep = sep2;
-#endif
-                        if (sep) {
-                            *(sep + 1) = '\0';
-                            snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", dir);
-                            browser_scan(&ps);
-                            browser_save_path(&ps);
+
+                    /* ── Auto-play next file in folder ── */
+                    int auto_played = 0;
+                    if (ps.playlist_count > 0 && ps.playlist_index >= 0
+                            && ps.playlist_index + 1 < ps.playlist_count) {
+                        int next = ps.playlist_index + 1;
+                        char **saved_files = ps.playlist_files;
+                        int saved_count = ps.playlist_count;
+                        ps.playlist_files = NULL;
+                        ps.playlist_count = 0;
+
+                        int was_fs = ps.fullscreen;
+                        player_close(&ps);
+                        ps.fullscreen = was_fs;
+
+                        log_msg("Auto-play next: [%d/%d] %s",
+                                next + 1, saved_count,
+                                saved_files[next]);
+
+                        if (player_open(&ps, saved_files[next]) == 0) {
+                            ps.playlist_files = saved_files;
+                            ps.playlist_count = saved_count;
+                            ps.playlist_index = next;
+                            auto_played = 1;
+                        } else {
+                            log_msg("ERROR: Auto-play failed: %s",
+                                    saved_files[next]);
+                            ps.playlist_files = saved_files;
+                            ps.playlist_count = saved_count;
+                            ps.playlist_index = next;
                         }
                     }
-                    player_close(&ps);
-                    ps.quit = 0;
+
+                    if (!auto_played) {
+                        log_msg("Playback finished, returning to browser");
+                        /* Sync browser to current file's directory */
+                        if (ps.filepath[0]) {
+                            char dir[1024];
+                            snprintf(dir, sizeof(dir), "%s", ps.filepath);
+                            char *sep = strrchr(dir, '/');
+#ifdef _WIN32
+                            char *sep2 = strrchr(dir, '\\');
+                            if (sep2 && (!sep || sep2 > sep)) sep = sep2;
+#endif
+                            if (sep) {
+                                *(sep + 1) = '\0';
+                                snprintf(ps.browser_path, sizeof(ps.browser_path), "%s", dir);
+                                browser_scan(&ps);
+                                browser_save_path(&ps);
+                            }
+                        }
+                        player_close(&ps);
+                        ps.quit = 0;
+                    }
                 }
             }
 
