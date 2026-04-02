@@ -261,15 +261,23 @@ void browser_scan(PlayerState *ps) {
      * Scan /run/media/ for SD card and NFS mounts so the user
      * can navigate to external storage without typing paths. */
     {
+        int mounts_injected = 0;
         const char *mount_bases[] = { "/run/media/", NULL };
         for (int mi = 0; mount_bases[mi]; mi++) {
+            log_msg("browser: scanning mount base: %s", mount_bases[mi]);
+
             /* Check if we're already inside this mount base */
             if (strncmp(ps->browser_path, mount_bases[mi],
-                        strlen(mount_bases[mi])) == 0)
+                        strlen(mount_bases[mi])) == 0) {
+                log_msg("browser:   skipped (already inside)");
                 continue;
+            }
 
             DIR *md = opendir(mount_bases[mi]);
-            if (!md) continue;
+            if (!md) {
+                log_msg("browser:   opendir failed (does not exist or no permission)");
+                continue;
+            }
             struct dirent *me;
             while ((me = readdir(md)) != NULL) {
                 if (me->d_name[0] == '.') continue;
@@ -280,9 +288,14 @@ void browser_scan(PlayerState *ps) {
                 if (stat(mpath, &mst) != 0 || !S_ISDIR(mst.st_mode))
                     continue;
 
+                log_msg("browser:   user dir: %s", mpath);
+
                 /* Recurse one level into user dirs under /run/media/user/ */
                 DIR *ud = opendir(mpath);
-                if (!ud) continue;
+                if (!ud) {
+                    log_msg("browser:     opendir failed");
+                    continue;
+                }
                 struct dirent *ue;
                 while ((ue = readdir(ud)) != NULL) {
                     if (ue->d_name[0] == '.') continue;
@@ -293,11 +306,16 @@ void browser_scan(PlayerState *ps) {
                     if (stat(upath, &ust) != 0 || !S_ISDIR(ust.st_mode))
                         continue;
 
+                    log_msg("browser:     mount found: %s", upath);
+
                     /* Check not already listed */
                     int dup = 0;
                     for (int i = 0; i < count; i++)
                         if (strcmp(entries[i].path, upath) == 0) { dup = 1; break; }
-                    if (dup) continue;
+                    if (dup) {
+                        log_msg("browser:     (duplicate, skipped)");
+                        continue;
+                    }
 
                     if (count >= capacity) {
                         capacity *= 2;
@@ -312,11 +330,13 @@ void browser_scan(PlayerState *ps) {
                     entries[count].path = strdup(upath);
                     entries[count].is_dir = 1;
                     count++;
+                    mounts_injected++;
                 }
                 closedir(ud);
             }
             closedir(md);
         }
+        log_msg("browser: mount injection done — %d mount(s) added", mounts_injected);
     }
 
     /* Sort: directories first, then alphabetical */
