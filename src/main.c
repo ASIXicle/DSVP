@@ -1050,18 +1050,42 @@ int main(int argc, char *argv[]) {
                 float dead_zone = 4915.0f;  /* ~15% of 32767 */
                 float max_range = 32767.0f - dead_zone;
                 if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX && ps.transport_active) {
-                    static int stick_zone = 0; /* -1=left, 0=center, 1=right */
+                    static int stick_x_zone = 0;
                     float threshold = 19660.0f;  /* ~60% of 32767 */
                     int new_zone = 0;
                     if (ev.gaxis.value < -threshold) new_zone = -1;
                     else if (ev.gaxis.value > threshold) new_zone = 1;
 
-                    if (new_zone != stick_zone) {
+                    if (new_zone != stick_x_zone) {
+                        if (ps.transport_focus == 1) {
+                            /* Scrubber focused: L/R seeks ±30s */
+                            if (new_zone == -1)
+                                player_seek(&ps, -30.0);
+                            else if (new_zone == 1)
+                                player_seek(&ps, 30.0);
+                        } else {
+                            /* Prev/Next focused: L/R navigates focus */
+                            if (new_zone == -1 && ps.transport_focus > 0)
+                                ps.transport_focus--;
+                            else if (new_zone == 1 && ps.transport_focus < 2)
+                                ps.transport_focus++;
+                        }
+                        stick_x_zone = new_zone;
+                    }
+                } else if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY && ps.transport_active) {
+                    /* Y-axis always navigates focus (up=prev, down=next) */
+                    static int stick_y_zone = 0;
+                    float threshold = 19660.0f;
+                    int new_zone = 0;
+                    if (ev.gaxis.value < -threshold) new_zone = -1;  /* up */
+                    else if (ev.gaxis.value > threshold) new_zone = 1; /* down */
+
+                    if (new_zone != stick_y_zone) {
                         if (new_zone == -1 && ps.transport_focus > 0)
                             ps.transport_focus--;
                         else if (new_zone == 1 && ps.transport_focus < 2)
                             ps.transport_focus++;
-                        stick_zone = new_zone;
+                        stick_y_zone = new_zone;
                     }
                 } else if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER) {
                     float val = (float)ev.gaxis.value;
