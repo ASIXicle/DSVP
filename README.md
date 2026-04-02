@@ -8,7 +8,9 @@ DSVP sits between VLC and mpv: better quality than VLC (modern FFmpeg, Lanczos s
 
 There are portable Windows & Debian builds on the [main branch](https://github.com/ASIXicle/DSVP/tree/main). Steam Deck builds are on this branch — download the latest tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/tag/v0.1.8-beta-steamdeck).
 
-Picture is out of date. Working on it.
+File Explorer:
+
+<img alt="DSVP_file_explorer" src="docs/DSVP_file_explorer.png" />
 
 ---
 
@@ -113,6 +115,8 @@ DSVP/
 ```
 
 ## Technical Details
+
+<img alt="DSVP_example" src="docs/DSVP_example.png" />
 
 DSVP uses a custom GPU rendering pipeline built on SDL_GPU with HLSL shaders cross-compiled to SPIR-V via SDL3_shadercross 3.0.0. The fragment shader performs Lanczos-2 resampling on luma (16-tap windowed sinc with anti-ringing clamp at 0.8), Catmull-Rom bicubic interpolation on chroma (16-tap with sub-texel siting correction), limited→full range expansion, BT.601/BT.709/BT.2020 color matrix conversion, and temporal blue noise dithering (64×64 void-and-cluster texture, per-frame offset) — all in a single pass. YUV420P and YUV420P10LE formats bypass `swscale` entirely; raw decoded planes upload directly to GPU textures.
 
