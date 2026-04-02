@@ -3187,14 +3187,28 @@ int demux_thread_func(void *arg) {
         /* ── Throttle if queues are full ── */
         if (ps->video_pq.nb_packets > PACKET_QUEUE_MAX ||
             ps->audio_pq.nb_packets > PACKET_QUEUE_MAX) {
+            static int throttle_count = 0;
+            if (++throttle_count == 1 || (throttle_count % 100) == 0)
+                log_msg("DEMUX DIAG: throttled (vpq=%d apq=%d, count=%d)",
+                        ps->video_pq.nb_packets, ps->audio_pq.nb_packets,
+                        throttle_count);
             SDL_Delay(10);
             continue;
         }
 
         /* ── Read next packet ── */
         ps->io_deadline = get_time_sec() + 10.0;
+        double t_read0 = get_time_sec();
         int ret = av_read_frame(ps->fmt_ctx, pkt);
+        double t_read1 = get_time_sec();
         ps->io_deadline = 0.0;
+
+        /* Log slow reads (>100ms) — helps diagnose post-seek stalls */
+        if ((t_read1 - t_read0) > 0.100)
+            log_msg("DEMUX DIAG: av_read_frame took %.0fms (stream=%d vpq=%d)",
+                    (t_read1 - t_read0) * 1000.0,
+                    (ret >= 0) ? pkt->stream_index : -1,
+                    ps->video_pq.nb_packets);
         if (ret < 0) {
             if (ret == AVERROR_EOF || avio_feof(ps->fmt_ctx->pb)) {
                 if (!ps->eof) log_msg("Demux: reached end of file");
@@ -3332,9 +3346,20 @@ int decode_thread_func(void *arg) {
     PlayerState *ps = (PlayerState *)arg;
     log_msg("Decode thread started");
 
+    /* ── Stall diagnostic state ── */
+    double diag_last_frame_time = 0.0;  /* wall time of last decoded frame */
+    int    diag_stall_logged    = 0;    /* avoid re-logging same stall */
+    int    diag_eagain_count    = 0;    /* EAGAIN hits since last frame */
+    int    diag_empty_count     = 0;    /* empty-queue hits since last frame */
+    int    diag_gate_count      = 0;    /* decode_frame_ready waits */
+    int    diag_seekmtx_count   = 0;    /* seek_mutex contention hits */
+
     while (!ps->quit) {
         /* ── Wait until main loop consumed the previous frame ── */
         SDL_LockMutex(ps->decode_mutex);
+        if (ps->decode_frame_ready && !ps->quit && !ps->seeking) {
+            diag_gate_count++;
+        }
         while (ps->decode_frame_ready && !ps->quit && !ps->seeking)
             SDL_WaitCondition(ps->decode_cond, ps->decode_mutex);
         SDL_UnlockMutex(ps->decode_mutex);
@@ -3343,6 +3368,14 @@ int decode_thread_func(void *arg) {
 
         /* Skip decode when paused, seeking, or not playing */
         if (ps->seeking || !ps->playing || ps->paused) {
+            if (ps->seeking) {
+                diag_last_frame_time = 0.0;  /* reset stall timer on seek */
+                diag_stall_logged = 0;
+                diag_eagain_count = 0;
+                diag_empty_count  = 0;
+                diag_gate_count   = 0;
+                diag_seekmtx_count = 0;
+            }
             SDL_Delay(1);
             continue;
         }
@@ -3352,6 +3385,7 @@ int decode_thread_func(void *arg) {
          * we yield instead of blocking — same pattern as the old
          * synchronous video_decode_frame(). */
         if (!SDL_TryLockMutex(ps->seek_mutex)) {
+            diag_seekmtx_count++;
             SDL_Delay(1);
             continue;
         }
@@ -3367,7 +3401,15 @@ int decode_thread_func(void *arg) {
              * decoded_frame (GPU→CPU readback — the expensive part). */
             AVFrame *recv_frame = ps->vaapi_active
                                   ? ps->hw_frame : ps->decoded_frame;
+            double t_recv0 = get_time_sec();
             int ret = avcodec_receive_frame(ps->video_codec_ctx, recv_frame);
+            double t_recv1 = get_time_sec();
+
+            /* Log if receive_frame itself took a long time */
+            if ((t_recv1 - t_recv0) > 0.100)
+                log_msg("DECODE DIAG: receive_frame took %.0fms (ret=%d)",
+                        (t_recv1 - t_recv0) * 1000.0, ret);
+
             if (ret == 0) {
                 if (ps->vaapi_active) {
                     if (ps->vaapi_zerocopy) {
@@ -3415,10 +3457,13 @@ int decode_thread_func(void *arg) {
                 break;
             }
 
+            diag_eagain_count++;
+
             /* Need more packets from the queue */
             AVPacket pkt;
             ret = pq_get(&ps->video_pq, &pkt, 0);
             if (ret <= 0) {
+                diag_empty_count++;
                 /* No packets available. If demuxer hit EOF, flush the
                  * decoder by sending a NULL packet. This triggers drain
                  * mode: receive_frame will return any buffered frames,
@@ -3434,6 +3479,42 @@ int decode_thread_func(void *arg) {
         }
 
         SDL_UnlockMutex(ps->seek_mutex);
+
+        /* ── Stall diagnostic: report when decode gap exceeds 200ms ── */
+        {
+            double now_d = get_time_sec();
+            if (got_frame) {
+                double gap = (diag_last_frame_time > 0.0)
+                    ? (now_d - diag_last_frame_time) * 1000.0 : 0.0;
+                if (gap > 200.0 && diag_last_frame_time > 0.0) {
+                    log_msg("DECODE DIAG: %.0fms gap between frames — "
+                            "gate=%d eagain=%d empty_q=%d seekmtx=%d "
+                            "vpq=%d apq=%d",
+                            gap, diag_gate_count, diag_eagain_count,
+                            diag_empty_count, diag_seekmtx_count,
+                            ps->video_pq.nb_packets,
+                            ps->audio_pq.nb_packets);
+                }
+                diag_last_frame_time = now_d;
+                diag_stall_logged    = 0;
+                diag_eagain_count    = 0;
+                diag_empty_count     = 0;
+                diag_gate_count      = 0;
+                diag_seekmtx_count   = 0;
+            } else if (!diag_stall_logged && diag_last_frame_time > 0.0
+                       && (now_d - diag_last_frame_time) > 1.0) {
+                /* Log once when decode has been stuck for >1 second */
+                log_msg("DECODE DIAG: stalled >1s — "
+                        "gate=%d eagain=%d empty_q=%d seekmtx=%d "
+                        "vpq=%d apq=%d seeking=%d eof=%d",
+                        diag_gate_count, diag_eagain_count,
+                        diag_empty_count, diag_seekmtx_count,
+                        ps->video_pq.nb_packets,
+                        ps->audio_pq.nb_packets,
+                        ps->seeking, ps->eof);
+                diag_stall_logged = 1;
+            }
+        }
 
 #ifdef DSVP_PROFILE
         if (got_frame) {
