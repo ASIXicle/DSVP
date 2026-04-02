@@ -1350,6 +1350,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     ps->gpu_uniforms.hdr_gamut     = hdr_gamut;
     ps->gpu_uniforms.hdr_debug     = 0.0f;
     ps->gpu_uniforms.is_dovi       = is_dovi_active ? 1.0f : 0.0f;
+    ps->gpu_uniforms.is_semiplanar = 0.0f;
 
     /* DV P5 range override: container says limited but IPTPQc2 is full-range.
      * Must happen after normal range setup since it overrides those values.
