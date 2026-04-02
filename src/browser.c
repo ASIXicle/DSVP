@@ -520,7 +520,49 @@ void browser_back(PlayerState *ps) {
         if (clen > 1 && cur[clen - 1] == '/') cur[clen - 1] = '\0';
         if (hlen > 1 && hbuf[hlen - 1] == '/') hbuf[hlen - 1] = '\0';
         if (strcmp(cur, hbuf) == 0) return;  /* already at home, stop */
+
+        /* Inside a mount path — if going up would leave the mount,
+         * snap back to $HOME instead of exposing system directories */
+        const char *mount_base = "/run/media/";
+        if (strncmp(cur, mount_base, strlen(mount_base)) == 0) {
+            /* Count slashes: /run/media/deck/LABEL = 4 slashes minimum.
+             * At 3 or fewer we'd be above the mount point. */
+            char *parent = strrchr(cur, '/');
+            if (parent) *parent = '\0';
+            char *pp = strrchr(cur, '/');
+            if (pp) *pp = '\0';
+            /* If what's left is /run/media or /run or shorter, go home */
+            if (strlen(cur) <= strlen("/run/media")) {
+                snprintf(ps->browser_path, sizeof(ps->browser_path),
+                         "%s/", home);
+                browser_scan(ps);
+                browser_save_path(ps);
+                return;
+            }
+        }
     }
+
+    /* Go up one directory */
+    char *path = ps->browser_path;
+    size_t len = strlen(path);
+
+    /* Remove trailing separator */
+    if (len > 1 && path[len - 1] == '/')
+        path[--len] = '\0';
+
+    /* Find previous separator */
+    char *sep = strrchr(path, '/');
+
+    if (sep && sep != path) {
+        *(sep + 1) = '\0';  /* keep trailing slash */
+    } else if (sep == path) {
+        /* At root "/" */
+        path[1] = '\0';
+    }
+
+    browser_scan(ps);
+    browser_save_path(ps);
+}
 
     /* Go up one directory */
     char *path = ps->browser_path;
