@@ -103,7 +103,7 @@ The binary lands in `build/dsvp.exe` with all required DLLs auto-copied.
 
 **6. Package for distribution:**
 ```powershell
-.\package.ps1
+.\installer\build-installer.ps1
 ```
 
 **7. Build installer** (optional — requires [NSIS](https://nsis.sourceforge.io/)):
@@ -154,7 +154,7 @@ Binary: `build/dsvp`
 ```bash
 ./installer/package-deb.sh
 ```
-Produces `dsvp_0.2.0-beta_amd64.deb` in the repo root.
+Produces `dsvp_0.2.0-beta_amd64.deb` in the repo root. Builds, packages, and assembles the `.deb` in one step. Use `--skip-build` to repackage without recompiling.
 
 ### macOS (untested as of 3/16/26)
 
@@ -182,7 +182,8 @@ DSVP/
     log.c        ← Crash-safe unbuffered file logger
   installer/
     dsvp.nsi     ← NSIS installer script (Windows)
-    package-deb.sh ← Debian .deb packaging script (Linux)
+    build-installer.ps1 ← One-shot Windows installer builder
+    package-deb.sh ← One-shot Debian .deb builder (Linux)
   Makefile       ← Cross-platform build (sources from src/, output in build/)
   package.ps1    ← Windows portable packaging script
   package.sh     ← Linux/macOS packaging script

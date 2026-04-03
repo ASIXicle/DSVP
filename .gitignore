@@ -4,7 +4,6 @@ build/
 *.exe
 DSVP-portable/
 dsvp/
-installer/
 # Dependencies (downloaded locally, not committed)
 deps/ffmpeg/
 # IDE
