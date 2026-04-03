@@ -1757,6 +1757,55 @@ int player_open(PlayerState *ps, const char *filename) {
     /* ── Find audio streams ── */
     audio_find_streams(ps);
 
+    /* ── Discard unused streams (reduces demux I/O) ──
+     *
+     * Tell the demuxer to skip packets for streams we won't decode.
+     * Saves I/O on files with many streams (e.g. 41-stream DV files).
+     * Also eliminates DV dual-layer enhancement layer overhead if present.
+     */
+    {
+        int discarded = 0;
+
+        for (unsigned i = 0; i < ps->fmt_ctx->nb_streams; i++) {
+            int idx = (int)i;
+
+            /* Keep the selected video and audio streams */
+            if (idx == ps->video_stream_idx) continue;
+            if (idx == ps->audio_stream_idx) continue;
+
+            /* Keep all cataloged subtitle streams */
+            int is_sub = 0;
+            for (int s = 0; s < ps->sub_count; s++) {
+                if (idx == ps->sub_stream_indices[s]) {
+                    is_sub = 1;
+                    break;
+                }
+            }
+            if (is_sub) continue;
+
+            /* Keep all cataloged audio streams (for audio cycling) */
+            int is_aud = 0;
+            for (int a = 0; a < ps->aud_count; a++) {
+                if (idx == ps->aud_stream_indices[a]) {
+                    is_aud = 1;
+                    break;
+                }
+            }
+            if (is_aud) continue;
+
+            /* Check if this is a DV enhancement layer video stream */
+            if (ps->fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                log_msg("Stream %d: DV enhancement layer video — discarding", idx);
+            }
+
+            ps->fmt_ctx->streams[i]->discard = AVDISCARD_ALL;
+            discarded++;
+        }
+
+        if (discarded > 0)
+            log_msg("Demux: discarding %d unused stream(s) to reduce I/O", discarded);
+    }
+
     /* ── Allocate decode frames ── */
     ps->video_frame = av_frame_alloc();
     ps->rgb_frame   = av_frame_alloc();
