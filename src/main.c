@@ -984,6 +984,14 @@ int main(int argc, char *argv[]) {
                     ps.frame_timer += delay;
                     new_frame = 1;
 
+                    /* Cap: never let frame_timer get more than 100ms ahead
+                     * of wall time.  Post-seek rapid frame consumption
+                     * (catch-up drops with delay≈0) can accumulate
+                     * frame_timer seconds ahead, causing a prolonged
+                     * stall when the burst ends. */
+                    if (ps.frame_timer > now + 0.1)
+                        ps.frame_timer = now + 0.1;
+
                     /* Drop frame if video is genuinely behind audio.
                      *
                      * At 1:1 (content fps ≈ display refresh), drops are
@@ -1041,9 +1049,37 @@ int main(int argc, char *argv[]) {
                 video_display(&ps);
                 ps.diag_frames_displayed++;
 
+                /* Resume from seek: first displayed frame post-seek.
+                 *
+                 * CRITICAL: re-sync audio clocks to video_clock here.
+                 * av_seek_frame lands on a keyframe that may be seconds
+                 * away from the seek target. The demux thread pre-sets
+                 * both clocks to the target, but the first decoded frame
+                 * overwrites video_clock to the actual keyframe PTS.
+                 * Without this re-sync:
+                 *   Forward seek: video_clock > audio_clock → A/V sync
+                 *     computes multi-second delay, freezing the main loop.
+                 *   Backward seek: video_clock < audio_clock → massive
+                 *     negative drift, burst of frame drops.
+                 */
                 if (ps.seek_recovering) {
                     ps.seek_recovering = 0;
                     ps.frame_timer = get_time_sec();
+
+                    /* Re-sync clocks to the actual first-frame PTS */
+                    ps.audio_clock      = ps.video_clock;
+                    ps.audio_clock_sync = ps.video_clock;
+                    ps.av_bias          = 0.0;
+                    ps.av_bias_samples  = 0;
+                    ps.frame_last_pts   = ps.video_clock;
+
+                    /* Flush stale audio and resume */
+                    if (ps.audio_stream) {
+                        SDL_ClearAudioStream(ps.audio_stream);
+                        if (!ps.paused)
+                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                    }
+
                     log_msg("DIAG: seek recovery complete at %.3fs",
                             ps.video_clock);
                 }
