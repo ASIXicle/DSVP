@@ -5,10 +5,18 @@
 
 WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer a mpv-style player without configs or intimidation factor. Think of DSVP as a middle-man between VLC and mpv. It's not as SOTA as mpv but should be more "user-friendly". Or less, if you don't have a keyboard. Should offer better quality than VLC as it uses more modern FFmpeg libraries. It *should* play anything you throw at it.
 
-There are portable Windows and Linux builds on the Releases page, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/tag/v0.1.8-beta-steamdeck). The portable tarballs bundle all dependencies including FFmpeg 8.1 — just extract and run. The Steam Deck build (see `steamdeck` branch) includes VAAPI hardware decode for HEVC.
+There are portable Windows and Linux builds on the Releases page, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/tag/v0.1.8-beta-steamdeck). The portable tarballs bundle all dependencies including FFmpeg 8.1 — just extract and run. Windows and Debian installers are also available. The Steam Deck build (see `steamdeck` branch) includes VAAPI hardware decode for HEVC.
 
 REQUIRES Visual C++ Redistributable runtime on Windows (vcruntime140.dll). It's probably already on your PC but you can get it here:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170
+
+## Installation
+
+**Windows:** Download `DSVP-0.2.0-beta-setup.exe` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and run it. Installs to Program Files with Start Menu shortcuts and an uninstaller. Alternatively, download the portable `.zip` — extract and run, no installation needed.
+
+**Debian/Ubuntu:** Download `dsvp_0.2.0-beta_amd64.deb` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and install with `sudo dpkg -i dsvp_0.2.0-beta_amd64.deb`. Bundles all dependencies. Run `dsvp` from a terminal or your application launcher.
+
+**Steam Deck:** See [SteamOS.md](SteamOS.md) for the dedicated Steam Deck build with VAAPI hardware decode.
 
 Claude wrote most of this:
 
@@ -26,7 +34,7 @@ Claude wrote most of this:
 - **Multi-threaded decoding** — uses all available CPU cores
 - **Full subtitle support** — text (SRT, ASS/SSA), bitmap (PGS, VobSub), CJK fallback fonts, golden yellow with black outline, cycle tracks with `S`
 - **Folder navigation** — `B`/`N` keys to jump between media files in the current folder, with clickable prev/next buttons
-- **Portable** — single folder, no installer, no PATH changes
+- **Portable or installed** — Windows installer and Debian `.deb` package, or extract-and-run portable tarballs with all dependencies bundled
 - **Secure** — no networking capabilities whatsoever
 - **Cross-platform** — Vulkan on Windows/Linux, Metal on macOS
 
@@ -47,7 +55,7 @@ Claude wrote most of this:
 | `I` | Toggle media info overlay |
 | `H` | Cycle HDR debug views (normal / comparison / PQ bypass / grayscale) |
 | `T` | Cycle SDR target nits (203 / 300 / 400) |
-| `G` | Cycle midtone gain (1.0 / 1.1 / 1.2 / 1.3) |
+| `G` | Cycle midtone gain (1.0 / 1.1 / 1.2 / **1.3** / 1.35 / 1.4 — default bold) |
 
 ## Building from Source
 
@@ -96,6 +104,12 @@ The binary lands in `build/dsvp.exe` with all required DLLs auto-copied.
 .\package.ps1
 ```
 
+**7. Build installer** (optional — requires [NSIS](https://nsis.sourceforge.io/)):
+```bash
+makensis installer/dsvp.nsi
+```
+Produces `DSVP-0.2.0-beta-setup.exe` in the repo root.
+
 ### Linux (Debian/Ubuntu)
 
 **1. Install system packages:**
@@ -134,6 +148,12 @@ Binary: `build/dsvp`
 ./package.sh
 ```
 
+**5. Build .deb installer** (optional):
+```bash
+./installer/package-deb.sh
+```
+Produces `dsvp_0.2.0-beta_amd64.deb` in the repo root.
+
 ### macOS (untested as of 3/16/26)
 
 ```bash
@@ -158,6 +178,9 @@ DSVP/
     subtitle.c   ← Subtitle detection, decode, SDL3_ttf rendering, CJK fallback fonts
     overlay.c    ← GPU-composited overlays: bitmap font, seek bar, debug/info panels, OSD, subtitles
     log.c        ← Crash-safe unbuffered file logger
+  installer/
+    dsvp.nsi     ← NSIS installer script (Windows)
+    package-deb.sh ← Debian .deb packaging script (Linux)
   Makefile       ← Cross-platform build (sources from src/, output in build/)
   package.ps1    ← Windows portable packaging script
   package.sh     ← Linux/macOS packaging script

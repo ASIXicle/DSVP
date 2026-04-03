@@ -971,8 +971,9 @@ int main(int argc, char *argv[]) {
                             delay = pts_delay + bias * 0.02;
                         }
 
-                        if (!ps.seek_recovering &&
-                                fabs(av_diff) > fabs(ps.diag_max_av_drift))
+                        if (!ps.seek_recovering
+                                && ps.av_bias_samples >= 30
+                                && fabs(av_diff) > fabs(ps.diag_max_av_drift))
                             ps.diag_max_av_drift = av_diff;
                     }
 
@@ -1005,11 +1006,18 @@ int main(int argc, char *argv[]) {
                      *
                      * For non-1:1 content (e.g. 24fps on 60Hz), the
                      * accumulator-based timing needs active correction,
-                     * so bias-corrected drops still apply at -50ms. */
+                     * so bias-corrected drops still apply at -50ms.
+                     *
+                     * Gate on bias convergence (60 samples ≈ 1–2s):
+                     * before the EMA stabilizes, av_diff is unreliable
+                     * and containers with audio PTS lead (MPEG-PS) would
+                     * trigger spurious drops. Modern containers have
+                     * near-zero av_diff at startup so this gate is a
+                     * no-op for them. */
                     if (!one_to_one && ps.audio_stream_idx >= 0
-                            && !ps.seek_recovering) {
-                        double drop_diff = (ps.av_bias_samples >= 60)
-                                           ? av_diff_c : av_diff;
+                            && !ps.seek_recovering
+                            && ps.av_bias_samples >= 60) {
+                        double drop_diff = av_diff_c;
                         if (drop_diff < -0.05) {
                             new_frame = 0;
                             ps.diag_frames_dropped++;
@@ -1036,8 +1044,12 @@ int main(int argc, char *argv[]) {
                 ps.diag_multi_decodes++;
             }
 
-            /* Snap forward on extreme stall */
-            if (ps.frame_timer < now - 0.1) {
+            /* Snap forward on extreme stall — but only when the decoder
+             * actually produced frames this tick.  If the queue is empty
+             * (e.g. EOF drain or demux lag), snapping is pointless and
+             * would fire every tick until player_close runs. */
+            if (decoded_this_tick > 0
+                    && ps.frame_timer < now - 0.1) {
                 ps.frame_timer = now;
                 ps.diag_timer_snaps++;
                 log_msg("DIAG: frame_timer snapped forward "
@@ -1072,6 +1084,7 @@ int main(int argc, char *argv[]) {
                     ps.av_bias          = 0.0;
                     ps.av_bias_samples  = 0;
                     ps.frame_last_pts   = ps.video_clock;
+                    ps.diag_max_av_drift = 0.0;
 
                     /* Flush stale audio and resume */
                     if (ps.audio_stream) {
