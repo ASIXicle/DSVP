@@ -3,9 +3,11 @@
 
 <img alt="DSVPmenu" src="docs/DSVPmenu.png" />
 
-WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer a mpv-style player without configs or intimidation factor. Think of DSVP as a middle-man between VLC and mpv. It's not as SOTA as mpv but should be more "user-friendly". Or less, if you don't have a keyboard. Should offer better quality than VLC as it uses more modern FFmpeg libraries. It *should* play anything you throw at it.
+WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer a mpv-style player without configs or intimidation factor. Think of DSVP as a middle-man between VLC and mpv. It's not as SOTA as mpv but should be more "user-friendly". 
 
-There are portable Windows and Linux builds on the Releases page, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/tag/v0.1.8-beta-steamdeck). The portable tarballs bundle all dependencies including FFmpeg 8.1 — just extract and run. Windows and Debian installers are also available. The Steam Deck build (see `steamdeck` branch) includes VAAPI hardware decode for HEVC.
+TODO: bitstream support and HDR autodetect/output. Soon. ish.
+
+There are portable Windows and Linux builds on the Releases page, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP/releases/tag/v0.2.0-beta-steamdeck). The portable tarballs bundle all dependencies including FFmpeg 8.1 — just extract and run. Windows and Debian installers are also available. The Steam Deck build (see `steamdeck` branch) includes VAAPI hardware decode for HEVC.
 
 REQUIRES Visual C++ Redistributable runtime on Windows (vcruntime140.dll). It's probably already on your PC but you can get it here:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170
@@ -14,7 +16,7 @@ https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=ms
 
 **Windows:** Download `DSVP-0.2.0-beta-setup.exe` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and run it. Installs to Program Files with Start Menu shortcuts and an uninstaller. Alternatively, download the portable `.zip` — extract and run, no installation needed.
 
-**Debian/Ubuntu:** Download `dsvp_0.2.0-beta_amd64.deb` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and install with `sudo dpkg -i dsvp_0.2.0-beta_amd64.deb`. Bundles all dependencies. Run `dsvp` from a terminal or your application launcher.
+**Debian/Ubuntu:** (coming shortly) Download `dsvp_0.2.0-beta_amd64.deb` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and install with `sudo dpkg -i dsvp_0.2.0-beta_amd64.deb`. Bundles all dependencies. Run `dsvp` from a terminal or your application launcher.
 
 **Steam Deck:** See [SteamOS.md](SteamOS.md) for the dedicated Steam Deck build with VAAPI hardware decode.
 
@@ -187,6 +189,8 @@ DSVP/
 ```
 
 ## Technical Details
+
+<img alt="DSVP_example" src="docs/DSVP_example.png" />
 
 DSVP uses a custom GPU rendering pipeline built on SDL_GPU with HLSL shaders cross-compiled to SPIR-V via SDL3_shadercross 3.0.0. The fragment shader performs Lanczos-2 resampling on luma (16-tap windowed sinc with anti-ringing clamp at 0.8), Catmull-Rom bicubic interpolation on chroma (16-tap with sub-texel siting correction), limited→full range expansion, BT.601/BT.709/BT.2020 color matrix conversion, and temporal blue noise dithering (64×64 void-and-cluster texture, per-frame offset) — all in a single pass. YUV420P and YUV420P10LE formats bypass `swscale` entirely; raw decoded planes upload directly to GPU textures.
 
