@@ -208,6 +208,10 @@ mingw32-make debug  # Windows
 
 Enables GPU validation layers, console output, verbose FFmpeg logging, and debug symbols. A `dsvp.log` file is written to the working directory.
 
+## AI Disclosure
+
+Built with the assistance of Claude Opus 4.6 (Anthropic)
+
 ## License
 
 GPL v3 — see [LICENSE](LICENSE).
