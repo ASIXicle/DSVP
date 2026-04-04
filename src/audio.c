@@ -259,9 +259,9 @@ void audio_find_streams(PlayerState *ps) {
             if (strcmp(ps->aud_stream_names[a], ps->aud_stream_names[b]) == 0) {
                 char tmp[128];
                 snprintf(tmp, sizeof(tmp), "%s #1", ps->aud_stream_names[a]);
-                strncpy(ps->aud_stream_names[a], tmp, sizeof(ps->aud_stream_names[a]) - 1);
+                snprintf(ps->aud_stream_names[a], sizeof(ps->aud_stream_names[a]), "%s", tmp);
                 snprintf(tmp, sizeof(tmp), "%s #2", ps->aud_stream_names[b]);
-                strncpy(ps->aud_stream_names[b], tmp, sizeof(ps->aud_stream_names[b]) - 1);
+                snprintf(ps->aud_stream_names[b], sizeof(ps->aud_stream_names[b]), "%s", tmp);
             }
         }
     }
