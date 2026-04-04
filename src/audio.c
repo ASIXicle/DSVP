@@ -65,6 +65,8 @@ int audio_decode_frame(PlayerState *ps) {
             int64_t frame_pts = ps->audio_frame->best_effort_timestamp;
             if (frame_pts == AV_NOPTS_VALUE)
                 frame_pts = ps->audio_frame->pts;
+            if (frame_pts == AV_NOPTS_VALUE)
+               log_msg("WARN: audio frame with no PTS (audio_clock=%.3f)", ps->audio_clock);
             if (frame_pts != AV_NOPTS_VALUE) {
                 AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
                 ps->audio_clock = (double)frame_pts * av_q2d(as->time_base);
@@ -140,7 +142,7 @@ void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
      * CRITICAL: Cap the correction at 100ms to prevent FLAC/large-buffer
      * runaway where SDL reports huge queued amounts during startup. */
     if (ps->audio_spec.freq > 0 && !ps->seek_recovering) {
-        int bytes_per_sample = 2 * 2;  /* S16 stereo = 4 bytes/frame */
+        int bytes_per_sample = 2 * 4;  /* F32 stereo */
 
         /* Our internal buffer: decoded but not yet pushed to SDL */
         int internal_pending = ps->audio_buf_size - ps->audio_buf_index;
