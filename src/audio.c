@@ -31,7 +31,7 @@ int audio_decode_frame(PlayerState *ps) {
             if (!ps->swr_ctx) {
                 AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
                 ret = swr_alloc_set_opts2(&ps->swr_ctx,
-                    &out_layout, AV_SAMPLE_FMT_S16, ps->audio_spec.freq,
+                    &out_layout, AV_SAMPLE_FMT_FLT, ps->audio_spec.freq,    // was AV_SAMPLE_FMT_S16
                     &ps->audio_frame->ch_layout, ps->audio_frame->format,
                     ps->audio_frame->sample_rate, 0, NULL);
                 if (ret < 0 || swr_init(ps->swr_ctx) < 0) {
@@ -41,7 +41,7 @@ int audio_decode_frame(PlayerState *ps) {
             }
 
             int out_samples = swr_get_out_samples(ps->swr_ctx, ps->audio_frame->nb_samples);
-            int out_size = out_samples * 2 * 2;
+            int out_size = out_samples * 2 * 4;
 
             if (!ps->audio_buf || out_size > AUDIO_BUF_SIZE) {
                 av_free(ps->audio_buf);
@@ -60,7 +60,7 @@ int audio_decode_frame(PlayerState *ps) {
                 return -1;
             }
 
-            data_size = converted * 2 * 2;
+            data_size = converted * 2 * 4;
 
             int64_t frame_pts = ps->audio_frame->best_effort_timestamp;
             if (frame_pts == AV_NOPTS_VALUE)
@@ -173,7 +173,7 @@ int audio_open(PlayerState *ps) {
 
     SDL_AudioSpec spec;
     SDL_zero(spec);
-    spec.format   = SDL_AUDIO_S16;
+    spec.format   = SDL_AUDIO_F32;    // was SDL_AUDIO_S16
     spec.channels = 2;
     spec.freq     = ps->audio_codec_ctx->sample_rate;
 
@@ -198,7 +198,8 @@ int audio_open(PlayerState *ps) {
      * video frame is displayed (seek_recovering gate in main.c).
      * This prevents audio from running ahead during initial decode latency. */
 
-    log_msg("Audio opened: %d Hz, %d ch (SDL3 stream)",
+    log_msg("Audio opened: %s %d Hz, %d ch (SDL3 stream)",
+        (spec.format == SDL_AUDIO_F32) ? "F32" : "S16",
         spec.freq, spec.channels);
     return 0;
 }
@@ -250,6 +251,19 @@ void audio_find_streams(PlayerState *ps) {
 
         log_msg("Audio stream %d: [%d] %s", idx, (int)i, ps->aud_stream_names[idx]);
         ps->aud_count++;
+    }
+    
+        /* Disambiguate identical display names */
+    for (int a = 0; a < ps->aud_count; a++) {
+        for (int b = a + 1; b < ps->aud_count; b++) {
+            if (strcmp(ps->aud_stream_names[a], ps->aud_stream_names[b]) == 0) {
+                char tmp[128];
+                snprintf(tmp, sizeof(tmp), "%s #1", ps->aud_stream_names[a]);
+                strncpy(ps->aud_stream_names[a], tmp, sizeof(ps->aud_stream_names[a]) - 1);
+                snprintf(tmp, sizeof(tmp), "%s #2", ps->aud_stream_names[b]);
+                strncpy(ps->aud_stream_names[b], tmp, sizeof(ps->aud_stream_names[b]) - 1);
+            }
+        }
     }
 
     log_msg("Found %d audio stream(s), active: %d (%s)",
