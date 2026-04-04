@@ -71,6 +71,7 @@ mkdir -p "${PKG_DIR}/DEBIAN"
 mkdir -p "${PKG_DIR}/usr/lib/${PKG_NAME}"
 mkdir -p "${PKG_DIR}/usr/bin"
 mkdir -p "${PKG_DIR}/usr/share/applications"
+mkdir -p "${PKG_DIR}/usr/share/metainfo"
 mkdir -p "${PKG_DIR}/usr/share/icons/hicolor/128x128/apps"
 mkdir -p "${PKG_DIR}/usr/share/doc/${PKG_NAME}"
 
@@ -154,6 +155,71 @@ License: GPL-3.0+
  On Debian systems, the full text of the GNU General Public
  License version 3 can be found in /usr/share/common-licenses/GPL-3.
 COPYRIGHT
+
+# ── Create AppStream metainfo (Discover/GNOME Software) ─────
+# This is the file that software centers actually read for the
+# human-readable name, license, author, URL, and description.
+
+echo "      Creating AppStream metainfo..."
+cat > "${PKG_DIR}/usr/share/metainfo/${PKG_NAME}.metainfo.xml" << 'METAINFO'
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dsvp.desktop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>Dead Simple Video Player</name>
+  <summary>Reference-quality video playback with HDR and Dolby Vision support</summary>
+
+  <developer id="com.github.asixicle">
+    <name>ASIXicle</name>
+  </developer>
+
+  <description>
+    <p>
+      DSVP is a video player focused on reference-quality image fidelity.
+      It uses Lanczos-2 luma scaling with anti-ringing, Catmull-Rom chroma
+      upsampling with sub-texel siting correction, and temporal blue noise
+      dithering — all in a single GPU shader pass.
+    </p>
+    <p>
+      Features include HDR-to-SDR tone mapping (BT.2390 with dynamic peak
+      detection), Dolby Vision Profile 5 and 8 support, 10-bit passthrough
+      without truncation, and software decode for bit-exact output. Plays
+      everything FFmpeg supports: H.264, HEVC, AV1, VP9, MKV, MP4, and
+      hundreds more formats.
+    </p>
+  </description>
+
+  <url type="homepage">https://github.com/ASIXicle/DSVP</url>
+  <url type="bugtracker">https://github.com/ASIXicle/DSVP/issues</url>
+
+  <launchable type="desktop-id">dsvp.desktop</launchable>
+
+  <provides>
+    <binary>dsvp</binary>
+    <mediatype>video/x-matroska</mediatype>
+    <mediatype>video/mp4</mediatype>
+    <mediatype>video/x-msvideo</mediatype>
+    <mediatype>video/quicktime</mediatype>
+    <mediatype>video/webm</mediatype>
+    <mediatype>video/mpeg</mediatype>
+    <mediatype>video/mp2t</mediatype>
+    <mediatype>video/ogg</mediatype>
+  </provides>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.2.0-beta" date="2026-04-03">
+      <description>
+        <p>Windows and Debian installers. Seek stall fix, stream discard,
+        audio defer, MPEG-PS startup drop fix, EOF snap-forward fix.</p>
+      </description>
+    </release>
+  </releases>
+</component>
+METAINFO
 
 # ── Create DEBIAN/control ─────────────────────────────────────
 
