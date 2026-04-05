@@ -1709,12 +1709,23 @@ int player_open(PlayerState *ps, const char *filename) {
          * Low-core machines (≤12 cores) are unaffected — auto stays below cap.
          *
          * Non-HEVC codecs (VC-1, H.264) are uncapped — their pipeline fill
-         * is small enough that the existing A/V sync handles it fine. */
+         * is small enough that the existing A/V sync handles it fine.
+         *
+         * H.264 cap at 8: on high-core machines (16T+), uncapped auto gives
+         * 16 threads → 533ms pipeline fill at 30fps.  Combined with MPEG-TS
+         * interleaved audio/video, this widens the PTS gap between the first
+         * audio and video packets after seek, amplifying post-seek A/V drift.
+         * Cap at 8 (267ms fill) retains full decode throughput for 1080p. */
         ps->video_codec_ctx->thread_count = 0; /* auto-detect first */
         ps->video_codec_ctx->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
 
         if (codec->id == AV_CODEC_ID_HEVC) {
             ps->video_codec_ctx->thread_count = 12;
+        } else if (codec->id == AV_CODEC_ID_H264) {
+            int auto_count = SDL_GetNumLogicalCPUCores();
+            if (auto_count > 8) {
+                ps->video_codec_ctx->thread_count = 8;
+            }
         }
 
         ret = avcodec_open2(ps->video_codec_ctx, codec, NULL);
@@ -2123,6 +2134,7 @@ void player_close(PlayerState *ps) {
     ps->seek_request       = 0;
     ps->seeking            = 0;
     ps->seek_recovering    = 0;
+    ps->audio_pts_floor    = 0.0;
     ps->video_ready        = 0;
     ps->show_debug         = 0;
     ps->show_info          = 0;
