@@ -56,6 +56,34 @@
 #define DEFAULT_WIN_W       960
 #define DEFAULT_WIN_H       540
 
+/* ── Bitstream Audio Types ──────────────────────────────────────────
+ *
+ * AudioMode controls how audio reaches the output device:
+ *   PCM         — always decode to F32 stereo (current default behavior)
+ *   AUTO        — probe HDMI sink via EDID; passthrough if supported, else PCM
+ *   PASSTHROUGH — force passthrough; falls back to PCM on handshake failure
+ *
+ * BitstreamCaps is populated by bitstream_probe() (phase 2) from the
+ * EDID Short Audio Descriptors reported by the connected HDMI sink.
+ */
+
+typedef enum {
+    AUDIO_MODE_PCM         = 0,   /* decode → swr → F32 stereo (safe default) */
+    AUDIO_MODE_AUTO        = 1,   /* probe sink, passthrough if possible       */
+    AUDIO_MODE_PASSTHROUGH = 2    /* force passthrough, fallback on failure    */
+} AudioMode;
+
+typedef struct BitstreamCaps {
+    int  support_ac3;      /* sink decodes AC-3 (Dolby Digital)         */
+    int  support_eac3;     /* sink decodes E-AC-3 (DD+)                */
+    int  support_truehd;   /* sink decodes TrueHD (lossless / Atmos)   */
+    int  support_dts;      /* sink decodes DTS core                    */
+    int  support_dtshd;    /* sink decodes DTS-HD MA (lossless)        */
+    int  hbr_capable;      /* HDMI supports High Bit Rate (TrueHD req) */
+    int  max_channels;     /* max channel count reported by sink       */
+    int  probed;           /* 1 = caps have been queried this session   */
+} BitstreamCaps;
+
 /* ── Packet Queue ───────────────────────────────────────────────────
  *
  * Thread-safe FIFO queue for AVPackets. The demux thread pushes packets,
@@ -140,6 +168,11 @@ typedef struct PlayerState {
     uint8_t            *audio_buf;        /* resampled audio buffer     */
     unsigned int        audio_buf_size;   /* bytes of valid data in buf */
     unsigned int        audio_buf_index;  /* read cursor into buf       */
+
+    /* ── Bitstream passthrough ── */
+    AudioMode           audio_mode;       /* PCM / Auto / Passthrough   */
+    BitstreamCaps       bitstream_caps;   /* HDMI sink capabilities     */
+    int                 bitstream_active; /* 1 = currently passing through */
 
     /* ── Packet queues ── */
     PacketQueue         video_pq;

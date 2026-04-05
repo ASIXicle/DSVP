@@ -7,7 +7,7 @@
  *   1. We open an SDL_AudioStream via SDL_OpenAudioDeviceStream(),
  *      which creates a stream bound to a playback device.
  *   2. A "get" callback fires when the device needs more samples.
- *      We decode FFmpeg audio frames, resample to S16 stereo, and
+ *      We decode FFmpeg audio frames, resample to F32 stereo, and
  *      push data into the stream via SDL_PutAudioStreamData().
  *   3. Volume is controlled via SDL_SetAudioStreamGain() — no
  *      manual mixing needed.
@@ -194,7 +194,6 @@ int audio_open(PlayerState *ps) {
     ps->audio_buf_size  = 0;
     ps->audio_buf_index = 0;
 
-    SDL_SetAudioStreamGain(ps->audio_stream, ps->volume);
     SDL_SetAudioStreamGain(ps->audio_stream, ps->volume);
     /* Audio device starts paused. Resume is deferred until the first
      * video frame is displayed (seek_recovering gate in main.c).
