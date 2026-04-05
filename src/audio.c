@@ -23,7 +23,7 @@
 int audio_decode_frame(PlayerState *ps) {
     AVPacket pkt;
     int ret;
-    int data_size = 0;
+    int data_size;
 
     for (;;) {
         ret = avcodec_receive_frame(ps->audio_codec_ctx, ps->audio_frame);
@@ -280,8 +280,8 @@ void audio_find_streams(PlayerState *ps) {
         log_msg("Audio stream %d: [%d] %s", idx, (int)i, ps->aud_stream_names[idx]);
         ps->aud_count++;
     }
-    
-        /* Disambiguate identical display names */
+
+    /* Disambiguate identical display names */
     for (int a = 0; a < ps->aud_count; a++) {
         for (int b = a + 1; b < ps->aud_count; b++) {
             if (strcmp(ps->aud_stream_names[a], ps->aud_stream_names[b]) == 0) {
