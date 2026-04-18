@@ -3481,6 +3481,29 @@ void player_build_debug_info(PlayerState *ps) {
         off += snprintf(buf + off, sz - off, "No audio\n");
     }
 
+    /* Lossless availability — scan catalog for TrueHD/DTS-HD MA tracks
+     * that are present in the container but not currently active. These
+     * are only useful over bitstream passthrough; PCM decode of them is
+     * the same lossless output as decoded FLAC from any other source. */
+    if (ps->fmt_ctx && ps->aud_count > 0) {
+        int has_truehd  = 0;
+        int has_dtshdma = 0;
+        for (int i = 0; i < ps->aud_count; i++) {
+            int sidx = ps->aud_stream_indices[i];
+            if (sidx < 0 || sidx >= (int)ps->fmt_ctx->nb_streams) continue;
+            enum AVCodecID cid = ps->fmt_ctx->streams[sidx]->codecpar->codec_id;
+            if (cid == AV_CODEC_ID_TRUEHD)  has_truehd  = 1;
+            if (cid == AV_CODEC_ID_DTS)     has_dtshdma = 1;  /* DTS-HD MA shares codec_id with DTS core */
+        }
+        if (has_truehd || has_dtshdma) {
+            const char *names = has_truehd && has_dtshdma ? "TrueHD + DTS-HD"
+                              : has_truehd                ? "TrueHD"
+                                                          : "DTS-HD";
+            off += snprintf(buf + off, sz - off,
+                "Lossless: %s available (bitstream only)\n", names);
+        }
+    }
+
     /* Playback diagnostics */
     off += snprintf(buf + off, sz - off, "\n--- Diagnostics ---\n");
     off += snprintf(buf + off, sz - off, "Decoded:     %d\n", ps->diag_frames_decoded);
