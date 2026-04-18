@@ -19,7 +19,7 @@ pacman -Syu
 pacman -S mingw-w64-x86_64-sdl3 mingw-w64-x86_64-sdl3-ttf mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-pkg-config
 ```
 
-This installs SDL3, SDL3_ttf, FFmpeg (8.0+), and pkg-config under `/c/msys64/mingw64/`.
+This installs SDL3, SDL3_ttf, FFmpeg (8.1+), and pkg-config under `/c/msys64/mingw64/`.
 
 ### Step 3: Install GCC (if you don't have it)
 
@@ -90,15 +90,15 @@ sudo apt install gcc make pkg-config \
 
 `fonts-noto-cjk` provides CJK subtitle fallback. `zenity` provides the file-open dialog.
 
-### Step 2: FFmpeg 8.0+
+### Step 2: FFmpeg 8.1+
 
-DSVP requires FFmpeg 8.0 or newer. Check your system version:
+DSVP requires FFmpeg 8.1 or newer. Check your system version:
 
 ```bash
 ffmpeg -version | head -1
 ```
 
-**If your system FFmpeg is 8.0+**, install the dev packages and skip to Step 3:
+**If your system FFmpeg is 8.1+**, install the dev packages and skip to Step 3:
 
 ```bash
 sudo apt install libavformat-dev libavcodec-dev libswscale-dev \

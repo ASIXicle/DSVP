@@ -7,7 +7,7 @@ WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer
 
 TODO: bitstream support and HDR autodetect/output. Soon. ish.
 
-There are portable Windows and Linux builds on the Releases page, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP-deck). The portable tarballs bundle all dependencies including FFmpeg 8.1 — just extract and run. Windows and Debian installers are also available. The Steam Deck build (see `steamdeck` branch) includes VAAPI hardware decode for HEVC.
+There are portable Windows and Linux builds on the Releases page, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP-deck). The portable tarballs bundle all dependencies including FFmpeg 8.1 — just extract and run. Windows and Debian installers are also available.
 
 REQUIRES Visual C++ Redistributable runtime on Windows (vcruntime140.dll). It's probably already on your PC but you can get it here:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170
@@ -19,8 +19,6 @@ https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=ms
 **Debian/Ubuntu:** Download `dsvp_0.2.0-beta_amd64.deb` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and install with `sudo dpkg -i dsvp_0.2.0-beta_amd64.deb`. Bundles all dependencies. Run `dsvp` from a terminal or your application launcher.
 
 **Steam Deck:** See [SteamOS.md](https://github.com/ASIXicle/DSVP-deck/blob/main/SteamOS.md) for the dedicated Steam Deck build with VAAPI hardware decode.
-
-Claude wrote most of this:
 
 ---
 
@@ -64,7 +62,7 @@ Claude wrote most of this:
 ### Requirements
 
 - **GCC** (MSYS2 MinGW64 on Windows, gcc on Linux, clang on macOS)
-- **FFmpeg 8.0+** shared development libraries
+- **FFmpeg 8.1+** shared development libraries
 - **SDL3** development libraries
 - **SDL3_ttf** development libraries
 - **SDL3_shadercross 3.0.0** (bundled — not available via package managers)
@@ -81,7 +79,7 @@ Claude wrote most of this:
 pacman -S mingw-w64-x86_64-sdl3 mingw-w64-x86_64-sdl3-ttf mingw-w64-x86_64-pkg-config
 ```
 
-FFmpeg 8.0+ shared libraries are also needed via MSYS2:
+FFmpeg 8.1+ shared libraries are also needed via MSYS2:
 ```bash
 pacman -S mingw-w64-x86_64-ffmpeg
 ```
@@ -121,7 +119,7 @@ sudo apt install gcc make pkg-config \
     zlib1g-dev fonts-dejavu-core fonts-noto-cjk zenity
 ```
 
-> **FFmpeg 8.0+ required.** Debian/Ubuntu may ship an older version (check with `ffmpeg -version`). If your system FFmpeg is below 8.0, see [SETUP.md](SETUP.md) for instructions on building FFmpeg 8.1 from source into a local prefix. The portable tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/) bundles FFmpeg 8.1 and requires no system FFmpeg.
+> **FFmpeg 8.1+ required.** Debian/Ubuntu may ship an older version (check with `ffmpeg -version`). If your system FFmpeg is below 8.1, see [SETUP.md](SETUP.md) for instructions on building FFmpeg 8.1 from source into a local prefix. The portable tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/) bundles FFmpeg 8.1 and requires no system FFmpeg.
 
 **2. SDL3_shadercross** is bundled in `shadercross/SDL3_shadercross-3.0.0-linux-x64/`. No action needed — the Makefile finds it automatically.
 
@@ -210,7 +208,7 @@ Enables GPU validation layers, console output, verbose FFmpeg logging, and debug
 
 ## AI Disclosure
 
-Built with the assistance of Claude Opus 4.6 (Anthropic)
+Built with the assistance of Claude Opus 4.6 and 4.7 (Anthropic).
 
 ## License
 
