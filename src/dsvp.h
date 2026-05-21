@@ -39,7 +39,7 @@
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.2.0-beta"
+#define DSVP_VERSION        "0.2.1-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -411,8 +411,6 @@ int   sub_init_font(void);
 void  sub_close_font(void);
 TTF_Font *sub_get_font(void);
 TTF_Font *sub_get_outline_font(void);
-/* Phase 2: sub_render will be reworked for GPU compositing */
-void  sub_render(PlayerState *ps, SDL_Renderer *renderer, int win_w, int win_h);
 
 /* ── Overlay API (overlay.c) ─────────────────────────────────────── */
 
@@ -430,12 +428,6 @@ void  log_msg(const char *fmt, ...);
 
 static inline double get_time_sec(void) {
     return (double)av_gettime_relative() / 1000000.0;
-}
-
-/* SDL3 render functions use SDL_FRect. Convert from our int rects.
- * Retained for Phase 2 overlay compositing. */
-static inline SDL_FRect rect_to_frect(const SDL_Rect *r) {
-    return (SDL_FRect){ (float)r->x, (float)r->y, (float)r->w, (float)r->h };
 }
 
 #endif /* DSVP_H */

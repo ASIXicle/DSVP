@@ -185,7 +185,7 @@ void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
         /* Cap at 100ms — prevents FLAC/large-buffer runaway */
         if (buffered_sec > 0.1) buffered_sec = 0.1;
 
-        /* Single atomic write — main thread reads only this field */
+        /* Aligned 64-bit write — atomic on x86-64 and ARMv8. Not guaranteed portable. */
         ps->audio_clock_sync = ps->audio_clock - buffered_sec;
     } else {
         ps->audio_clock_sync = ps->audio_clock;
