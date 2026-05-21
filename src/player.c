@@ -1717,17 +1717,19 @@ int player_open(PlayerState *ps, const char *filename) {
          * interleaved audio/video, this widens the PTS gap between the first
          * audio and video packets after seek, amplifying post-seek A/V drift.
          * Cap at 8 (267ms fill) retains full decode throughput for 1080p. */
-        ps->video_codec_ctx->thread_count = 0; /* auto-detect first */
         ps->video_codec_ctx->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
 
-        if (codec->id == AV_CODEC_ID_HEVC) {
-            ps->video_codec_ctx->thread_count = 12;
-        } else if (codec->id == AV_CODEC_ID_H264) {
-            int auto_count = SDL_GetNumLogicalCPUCores();
-            if (auto_count > 8) {
-                ps->video_codec_ctx->thread_count = 8;
-            }
+        /* Default: auto-detect logical cores, with per-codec upper caps to
+         * limit FF_THREAD_FRAME pipeline-fill latency on high-core machines.
+         * Caps tuned for ~30fps content; lower fps = proportionally less fill. */
+        int auto_count = SDL_GetNumLogicalCPUCores();
+        int cap;
+        switch (codec->id) {
+            case AV_CODEC_ID_HEVC:  cap = 12; break;  /* ~500ms fill at 24fps */
+            case AV_CODEC_ID_H264:  cap = 8;  break;  /* ~267ms fill at 30fps */
+            default:                cap = 16; break;  /* generous default */
         }
+        ps->video_codec_ctx->thread_count = (auto_count < cap) ? auto_count : cap;
 
         ret = avcodec_open2(ps->video_codec_ctx, codec, NULL);
         if (ret < 0) {
