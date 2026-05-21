@@ -43,6 +43,7 @@
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
+#define FRAME_QUEUE_MAX     12      /* decoded video frame buffer depth */
 #define AUDIO_BUF_SIZE      192000  /* max decoded audio buffer bytes   */
 #define SEEK_STEP_SEC       5.0     /* arrow key seek increment         */
 #define VOLUME_STEP         0.05    /* arrow key volume increment       */
@@ -105,6 +106,30 @@ typedef struct PacketQueue {
     SDL_Condition *cond;
     int          abort_request; /* signal threads to stop blocking      */
 } PacketQueue;
+
+/* ── Frame Queue ────────────────────────────────────────────────────
+ *
+ * Thread-safe FIFO queue for decoded AVFrames. The video decode
+ * thread pushes finished frames; the main display thread pops them.
+ * Bounded to FRAME_QUEUE_MAX entries — fq_put blocks when full,
+ * naturally throttling the decoder to display rate while providing
+ * burst absorption when decode runs ahead of realtime.
+ */
+
+typedef struct FrameNode {
+    AVFrame           *frame;
+    struct FrameNode  *next;
+} FrameNode;
+
+typedef struct FrameQueue {
+    FrameNode     *first;
+    FrameNode     *last;
+    int            nb_frames;
+    int            flush_serial;  /* incremented on fq_flush; fq_put returns -2 if changed mid-wait */
+    SDL_Mutex     *mutex;
+    SDL_Condition *cond;
+    int            abort_request; /* signal threads to stop blocking */
+} FrameQueue;
 
 /* ── GPU Uniform Data ──────────────────────────────────────────────
  *
@@ -178,6 +203,9 @@ typedef struct PlayerState {
     PacketQueue         video_pq;
     PacketQueue         audio_pq;
 
+    /* ── Decoded video frame queue (decode thread → display thread) ── */
+    FrameQueue          video_frame_q;
+
     /* ── Audio stream catalog ── */
     int                 aud_stream_indices[MAX_AUDIO_STREAMS];
     char                aud_stream_names[MAX_AUDIO_STREAMS][128];
@@ -241,6 +269,7 @@ typedef struct PlayerState {
 
     /* ── Threads ── */
     SDL_Thread         *demux_thread;
+    SDL_Thread         *video_decode_thread;
     SDL_Mutex          *seek_mutex;    /* protects codec flush vs decode  */
     int                 seeking;       /* 1 = flush in progress, skip decode */
 
@@ -325,11 +354,20 @@ int   pq_put(PacketQueue *q, AVPacket *pkt);
 int   pq_get(PacketQueue *q, AVPacket *pkt, int block);
 void  pq_flush(PacketQueue *q);
 
+/* ── Frame Queue API ──────────────────────────────────────────────── */
+
+void  fq_init(FrameQueue *q);
+void  fq_destroy(FrameQueue *q);
+int   fq_put(FrameQueue *q, AVFrame *frame, int block);
+int   fq_get(FrameQueue *q, AVFrame **frame_out, int block);
+void  fq_flush(FrameQueue *q);
+
 /* ── Player API (player.c) ────────────────────────────────────────── */
 
 int   player_open(PlayerState *ps, const char *filename);
 void  player_close(PlayerState *ps);
 int   demux_thread_func(void *arg);
+int   video_decode_thread_func(void *arg);
 int   video_decode_frame(PlayerState *ps);
 void  video_display(PlayerState *ps);
 void  video_reblit(PlayerState *ps);

@@ -1593,6 +1593,129 @@ void pq_flush(PacketQueue *q) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * Frame Queue — thread-safe FIFO for decoded AVFrames
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Sits between the video decode thread (producer) and the main
+ * display thread (consumer). Bounded at FRAME_QUEUE_MAX entries.
+ * fq_put blocks when full — this is the natural decoder throttle.
+ * fq_get is used non-blocking from the display thread; blocking
+ * there would stall the render loop.
+ */
+
+void fq_init(FrameQueue *q) {
+    memset(q, 0, sizeof(FrameQueue));
+    q->mutex = SDL_CreateMutex();
+    q->cond  = SDL_CreateCondition();
+}
+
+void fq_destroy(FrameQueue *q) {
+    fq_flush(q);
+    if (q->mutex) SDL_DestroyMutex(q->mutex);
+    if (q->cond)  SDL_DestroyCondition(q->cond);
+}
+
+/* Push a decoded frame onto the queue. Takes ownership of `frame`.
+ * If block=1, waits until space is available or abort_request fires.
+ * Returns:
+ *    0 on success (frame is now in the queue)
+ *    0 on full+nonblock (caller still owns frame and may retry/drop)
+ *   -1 on abort (shutdown — caller should free frame and exit)
+ *   -2 if the queue was flushed during our wait — frame is stale,
+ *      caller should free it and continue (NOT exit the thread). */
+int fq_put(FrameQueue *q, AVFrame *frame, int block) {
+    SDL_LockMutex(q->mutex);
+    int entry_serial = q->flush_serial;
+    for (;;) {
+        if (q->abort_request) {
+            SDL_UnlockMutex(q->mutex);
+            return -1;
+        }
+        if (q->flush_serial != entry_serial) {
+            /* Queue was flushed (seek) while we were waiting.
+             * The frame we hold is from before the flush — stale. */
+            SDL_UnlockMutex(q->mutex);
+            return -2;
+        }
+        if (q->nb_frames < FRAME_QUEUE_MAX) {
+            FrameNode *node = av_malloc(sizeof(FrameNode));
+            if (!node) {
+                SDL_UnlockMutex(q->mutex);
+                return -1;
+            }
+            node->frame = frame;
+            node->next  = NULL;
+            if (!q->last) q->first = node;
+            else          q->last->next = node;
+            q->last = node;
+            q->nb_frames++;
+            SDL_SignalCondition(q->cond);
+            SDL_UnlockMutex(q->mutex);
+            return 0;
+        }
+        if (!block) {
+            SDL_UnlockMutex(q->mutex);
+            return 0;  /* full, caller will retry or drop */
+        }
+        SDL_WaitCondition(q->cond, q->mutex);
+    }
+}
+
+/* Pop a frame from the queue. Returns 1 with *frame_out set on success,
+ * 0 if empty (non-blocking), -1 if aborted. Caller takes ownership of
+ * the returned AVFrame and is responsible for av_frame_free. */
+int fq_get(FrameQueue *q, AVFrame **frame_out, int block) {
+    int ret = -1;
+    SDL_LockMutex(q->mutex);
+    for (;;) {
+        if (q->abort_request) {
+            ret = -1;
+            break;
+        }
+        FrameNode *node = q->first;
+        if (node) {
+            q->first = node->next;
+            if (!q->first) q->last = NULL;
+            q->nb_frames--;
+            *frame_out = node->frame;
+            av_free(node);
+            SDL_SignalCondition(q->cond);  /* wake any blocked fq_put */
+            ret = 1;
+            break;
+        }
+        if (!block) {
+            ret = 0;
+            break;
+        }
+        SDL_WaitCondition(q->cond, q->mutex);
+    }
+    SDL_UnlockMutex(q->mutex);
+    return ret;
+}
+
+/* Flush all frames from the queue. Called on seek and close.
+ * Increments flush_serial so any blocked fq_put detects the flush
+ * and discards its stale frame instead of pushing it into the
+ * freshly-cleared queue. */
+void fq_flush(FrameQueue *q) {
+    SDL_LockMutex(q->mutex);
+    FrameNode *node = q->first;
+    while (node) {
+        FrameNode *next = node->next;
+        if (node->frame) av_frame_free(&node->frame);
+        av_free(node);
+        node = next;
+    }
+    q->first = NULL;
+    q->last  = NULL;
+    q->nb_frames = 0;
+    q->flush_serial++;
+    SDL_SignalCondition(q->cond);  /* wake any blocked fq_put */
+    SDL_UnlockMutex(q->mutex);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * Open / Close
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -2005,6 +2128,9 @@ int player_open(PlayerState *ps, const char *filename) {
     for (int i = 0; i < ps->sub_count; i++)
         pq_init(&ps->sub_pqs[i]);
 
+    /* ── Init decoded video frame queue ── */
+    fq_init(&ps->video_frame_q);
+
     /* ── Seek mutex (protects codec flush vs decode) ── */
     ps->seek_mutex = SDL_CreateMutex();
     ps->seeking    = 0;
@@ -2038,11 +2164,12 @@ int player_open(PlayerState *ps, const char *filename) {
         audio_open(ps);
     }
 
-    /* ── Start demux thread ── */
+    /* ── Start demux and video decode threads ── */
     ps->eof     = 0;
     ps->playing = 1;
     ps->paused  = 0;
-    ps->demux_thread = SDL_CreateThread(demux_thread_func, "demux", ps);
+    ps->demux_thread        = SDL_CreateThread(demux_thread_func,        "demux",        ps);
+    ps->video_decode_thread = SDL_CreateThread(video_decode_thread_func, "video-decode", ps);
 
     /* Build media info string */
     player_build_media_info(ps);
@@ -2076,10 +2203,19 @@ void player_close(PlayerState *ps) {
     ps->quit = 1;
 
     /* Signal queues to unblock any waiting threads */
-    ps->video_pq.abort_request = 1;
-    ps->audio_pq.abort_request = 1;
+    ps->video_pq.abort_request      = 1;
+    ps->audio_pq.abort_request      = 1;
+    ps->video_frame_q.abort_request = 1;
     SDL_SignalCondition(ps->video_pq.cond);
     SDL_SignalCondition(ps->audio_pq.cond);
+    SDL_SignalCondition(ps->video_frame_q.cond);
+
+    /* Wait for video decode thread first — it consumes the packet queue,
+     * so it must exit before the demux thread tears that queue down. */
+    if (ps->video_decode_thread) {
+        SDL_WaitThread(ps->video_decode_thread, NULL);
+        ps->video_decode_thread = NULL;
+    }
 
     /* Wait for demux thread */
     if (ps->demux_thread) {
@@ -2098,6 +2234,7 @@ void player_close(PlayerState *ps) {
     pq_destroy(&ps->audio_pq);
     for (int i = 0; i < ps->sub_count; i++)
         pq_destroy(&ps->sub_pqs[i]);
+    fq_destroy(&ps->video_frame_q);
 
     /* Destroy seek mutex */
     if (ps->seek_mutex) { SDL_DestroyMutex(ps->seek_mutex); ps->seek_mutex = NULL; }
@@ -2167,6 +2304,117 @@ void player_close(PlayerState *ps) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * Video Decode Thread
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Continuously pulls packets from video_pq, feeds the decoder, and
+ * pushes finished AVFrames into video_frame_q. Blocks naturally when
+ * the frame queue is full (fq_put block=1) — this is the throttle
+ * that keeps decode tracking display rate without unbounded RAM use.
+ *
+ * Decode work that previously ran inline in the display thread now
+ * happens here. The display thread consumes via video_decode_frame,
+ * which is a non-blocking fq_get + av_frame_move_ref into the
+ * existing persistent ps->video_frame container. video_display sees
+ * the same ps->video_frame it always did.
+ *
+ * Seek handling: when ps->seeking is set, this thread skips work
+ * (the demux thread holds seek_mutex during flush, and our codec API
+ * calls would race the flush otherwise). We also hold seek_mutex
+ * briefly around avcodec_receive_frame / avcodec_send_packet, the
+ * same protection the inline decode used to take.
+ *
+ * Shutdown: ps->quit + abort_request on both queues wakes any
+ * blocked waits. player_close joins this thread before the demux
+ * thread to avoid races with packet-queue teardown.
+ */
+
+int video_decode_thread_func(void *arg) {
+    PlayerState *ps = (PlayerState *)arg;
+
+    /* Audio-only files have no video codec — nothing to decode. */
+    if (!ps->video_codec_ctx) {
+        log_msg("Video decode thread: no video stream, exiting");
+        return 0;
+    }
+
+    log_msg("Video decode thread started");
+
+    while (!ps->quit) {
+        /* Skip while seek is flushing the codec */
+        if (ps->seeking) {
+            SDL_Delay(2);
+            continue;
+        }
+
+        /* Brief codec-API mutex protects against demux's flush.
+         * Try-lock so we don't deadlock if demux is mid-seek. */
+        if (!SDL_TryLockMutex(ps->seek_mutex)) {
+            SDL_Delay(2);
+            continue;
+        }
+
+        AVFrame *frame = av_frame_alloc();
+        if (!frame) {
+            SDL_UnlockMutex(ps->seek_mutex);
+            SDL_Delay(10);
+            continue;
+        }
+
+        int ret = avcodec_receive_frame(ps->video_codec_ctx, frame);
+
+        if (ret == 0) {
+            /* Got a decoded frame. Release codec mutex BEFORE fq_put —
+             * a full queue would otherwise pin seek_mutex and deadlock
+             * the demux thread mid-seek. */
+            SDL_UnlockMutex(ps->seek_mutex);
+
+            int pret = fq_put(&ps->video_frame_q, frame, 1);
+            if (pret == -1) {
+                /* abort_request fired (shutdown) */
+                av_frame_free(&frame);
+                break;
+            }
+            if (pret == -2) {
+                /* Queue was flushed during our wait (seek) — frame is
+                 * stale. Drop it and continue producing fresh frames. */
+                av_frame_free(&frame);
+            }
+            continue;
+        }
+
+        if (ret == AVERROR(EAGAIN)) {
+            /* Decoder needs more input. Pull one packet non-blocking
+             * (demux is on its own pacing); if none, brief sleep. */
+            AVPacket pkt;
+            int pret = pq_get(&ps->video_pq, &pkt, 0);
+            if (pret > 0) {
+                avcodec_send_packet(ps->video_codec_ctx, &pkt);
+                av_packet_unref(&pkt);
+            }
+            SDL_UnlockMutex(ps->seek_mutex);
+            av_frame_free(&frame);
+
+            if (pret == 0) SDL_Delay(2);
+            continue;
+        }
+
+        /* Decoder error (not EAGAIN, not 0) — log unless it's clean EOF */
+        SDL_UnlockMutex(ps->seek_mutex);
+        av_frame_free(&frame);
+        if (ret != AVERROR_EOF) {
+            log_msg("ERROR: avcodec_receive_frame (video) failed: %s",
+                    av_err2str(ret));
+        }
+        SDL_Delay(50);
+    }
+
+    log_msg("Video decode thread exiting");
+    return 0;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * Demux Thread
  * ═══════════════════════════════════════════════════════════════════
  *
@@ -2204,6 +2452,7 @@ int demux_thread_func(void *arg) {
                 pq_flush(&ps->audio_pq);
                 for (int i = 0; i < ps->sub_count; i++)
                     pq_flush(&ps->sub_pqs[i]);
+                fq_flush(&ps->video_frame_q);
                 log_msg("Demux: queues flushed, flushing video codec");
                 if (ps->video_codec_ctx)
                     avcodec_flush_buffers(ps->video_codec_ctx);
@@ -2303,57 +2552,48 @@ int demux_thread_func(void *arg) {
  * Video Decode & Display
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* Decode one video frame from the packet queue.
- * Returns 1 if a frame was decoded, 0 if no packets available, -1 on error. */
+/* Retrieve the next decoded frame for display.
+ *
+ * Decode work itself runs in video_decode_thread_func. This function
+ * is a non-blocking pop from the frame queue; the popped AVFrame's
+ * data is moved into the persistent ps->video_frame container so
+ * the existing video_display path reads it without change.
+ *
+ * Returns 1 if a frame is now ready in ps->video_frame, 0 if the
+ * frame queue is currently empty (decoder hasn't produced one yet —
+ * caller should re-blit the previous frame). Never returns -1 from
+ * this path; decoder errors are handled inside the decode thread. */
 int video_decode_frame(PlayerState *ps) {
-    AVPacket pkt;
-    int ret;
-
-    /* If a seek is in progress, skip decode entirely.
-     * The demux thread holds seek_mutex and is flushing codecs. */
     if (ps->seeking) return 0;
 
-    /* Lock to prevent demux thread from flushing codecs mid-decode */
-    if (!SDL_TryLockMutex(ps->seek_mutex)) {
-        return 0; /* mutex held by seek — skip this frame */
+    AVFrame *queued = NULL;
+    int ret = fq_get(&ps->video_frame_q, &queued, 0);
+    if (ret <= 0 || !queued) return 0;
+
+    /* Move the queued frame's buffers into ps->video_frame.
+     * av_frame_unref releases the previous frame's refcounted data
+     * (the decoder no longer needs it, display has already uploaded
+     * to GPU); av_frame_move_ref transfers ownership without copying.
+     * The now-empty queued container is freed. */
+    av_frame_unref(ps->video_frame);
+    av_frame_move_ref(ps->video_frame, queued);
+    av_frame_free(&queued);
+
+    /* Update video clock from new frame's PTS in seconds.
+     * best_effort_timestamp is preferred: FFmpeg computes it from
+     * DTS/packet timing even when the codec doesn't set frame->pts
+     * (required for VC-1, some MPEG-2, etc.). */
+    AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
+    double pts = 0.0;
+    int64_t frame_pts = ps->video_frame->best_effort_timestamp;
+    if (frame_pts == AV_NOPTS_VALUE)
+        frame_pts = ps->video_frame->pts;
+    if (frame_pts != AV_NOPTS_VALUE) {
+        pts = (double)frame_pts * av_q2d(vs->time_base);
     }
+    ps->video_clock = pts;
 
-    for (;;) {
-        /* Try to receive a decoded frame first (may have buffered frames) */
-        ret = avcodec_receive_frame(ps->video_codec_ctx, ps->video_frame);
-        if (ret == 0) {
-            /* Got a frame — compute its PTS in seconds.
-             * best_effort_timestamp is preferred: FFmpeg computes it
-             * from DTS/packet timing even when the codec doesn't set
-             * frame->pts (required for VC-1, some MPEG-2, etc.). */
-            AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
-            double pts = 0.0;
-            int64_t frame_pts = ps->video_frame->best_effort_timestamp;
-            if (frame_pts == AV_NOPTS_VALUE)
-                frame_pts = ps->video_frame->pts;
-            if (frame_pts != AV_NOPTS_VALUE) {
-                pts = (double)frame_pts * av_q2d(vs->time_base);
-            }
-            ps->video_clock = pts;
-            SDL_UnlockMutex(ps->seek_mutex);
-            return 1;
-        }
-        if (ret != AVERROR(EAGAIN)) {
-            log_msg("ERROR: avcodec_receive_frame (video) failed: %s", av_err2str(ret));
-            SDL_UnlockMutex(ps->seek_mutex);
-            return -1; /* decoder error */
-        }
-
-        /* Need to feed more packets to the decoder */
-        ret = pq_get(&ps->video_pq, &pkt, 0);
-        if (ret <= 0) {
-            SDL_UnlockMutex(ps->seek_mutex);
-            return 0;  /* no packets available right now */
-        }
-
-        avcodec_send_packet(ps->video_codec_ctx, &pkt);
-        av_packet_unref(&pkt);
-    }
+    return 1;
 }
 
 /* Compute the letterboxed display rectangle for the video.
