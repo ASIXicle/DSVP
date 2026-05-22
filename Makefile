@@ -1,5 +1,5 @@
 # DSVP — Dead Simple Video Player
-# Makefile for SDL_GPU build (v0.2.1-beta)
+# Makefile for SDL_GPU build (v0.2.2-beta)
 
 CC      = gcc
 SRCDIR  = src

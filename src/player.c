@@ -3070,7 +3070,11 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
 
     /* ── Build 256-bin histogram of Y plane ──
      * Subsample 4× in each dimension to reduce work.
-     * For 10-bit: bin = uint16 >> 8 (top 8 bits → 256 bins).
+     * For 10-bit: bin = uint16 >> 2 (10-bit value 0..1023 → 256 bins).
+     *   NOTE: yuv420p10le stores 10-bit data right-justified in uint16
+     *   containers (low 10 bits, high 6 bits zero). The shift must be 2,
+     *   not 8 — shifting by 8 collapses the range to only 4 effective bins
+     *   (0-3) and forces a binary percentile output. See commit notes.
      * For 8-bit:  bin = uint8 value directly. */
     int histogram[256];
     memset(histogram, 0, sizeof(histogram));
@@ -3080,7 +3084,7 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
         for (int y = 0; y < h; y += 4) {
             const uint16_t *row = (const uint16_t *)(data + y * stride);
             for (int x = 0; x < w; x += 4) {
-                histogram[row[x] >> 8]++;
+                histogram[row[x] >> 2]++;
                 total_samples++;
             }
         }
@@ -3111,12 +3115,18 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
     }
 
     /* ── Convert bin to normalized value [0,1] ──
-     * Use bin center: (bin + 0.5) / 256 for 10-bit (maps back to uint16 space).
-     * For 8-bit: (bin + 0.5) / 256 ≈ bin / 255 (close enough). */
+     * Reconstruct the bin's midpoint in uint16-normalized space.
+     *
+     * For 10-bit (bin = value>>2, value ∈ [0,1023]): bin N covers values
+     *   [4N, 4N+3]; midpoint ≈ 4N + 1.5. Normalized: (4*bin + 2) / 65535
+     *   ≡ (bin + 0.5) * 4 / 65535.
+     *
+     * For 8-bit (bin = value, value ∈ [0,255]): midpoint (bin + 0.5) / 256
+     *   ≈ bin / 255 (close enough).
+     */
     float raw_max_norm;
     if (is_10bit) {
-        /* Bin represents top 8 bits of uint16. Reconstruct midpoint. */
-        raw_max_norm = ((float)percentile_bin + 0.5f) * 256.0f / 65535.0f;
+        raw_max_norm = ((float)percentile_bin + 0.5f) * 4.0f / 65535.0f;
     } else {
         raw_max_norm = ((float)percentile_bin + 0.5f) / 256.0f;
     }
@@ -3155,8 +3165,20 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
         }
     }
 
-    /* Clamp: floor at PEAK_MIN_NITS, ceiling at static metadata peak */
-    if (smoothed < PEAK_MIN_NITS) smoothed = PEAK_MIN_NITS;
+    /* Clamp: floor at max(PEAK_MIN_NITS, target_nits), ceiling at static peak.
+     *
+     * The floor MUST be ≥ target_nits to keep the BT.2390 EETF well-defined.
+     * Below target, maxLum = target/smoothed exceeds 1.0, KS = 1.5*maxLum-0.5
+     * exceeds 1.0, and the tone curve degenerates to a pure linear pass-through
+     * (knee point lands above the normalized range, so no compression occurs).
+     * When smoothed crosses this boundary on scene cuts, tone mapping toggles
+     * between "engaged" and "disengaged", producing a visible brightness strobe.
+     * Flooring at target_nits keeps the curve continuous: low-peak content
+     * naturally fits in SDR range (curve is near-identity), bright content
+     * compresses gradually as smoothed rises. */
+    float target_nits = ps->gpu_uniforms.hdr_target_nits;
+    float floor_nits  = PEAK_MIN_NITS > target_nits ? PEAK_MIN_NITS : target_nits;
+    if (smoothed < floor_nits) smoothed = floor_nits;
     if (ps->hdr_static_peak > 0.0f && smoothed > ps->hdr_static_peak)
         smoothed = ps->hdr_static_peak;
 
