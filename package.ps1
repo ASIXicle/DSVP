@@ -12,7 +12,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$version = "0.2.2-beta"
+$version = "0.2.3-beta"
 $outDir  = "DSVP-portable"
 
 Write-Host "=== DSVP Packager v$version ===" -ForegroundColor Cyan

@@ -7,12 +7,12 @@
 ;   2. Install NSIS:  pacman -S mingw-w64-x86_64-nsis
 ;   3. Build:         makensis installer/dsvp.nsi
 ;
-; Output: DSVP-0.2.2-beta-setup.exe in repo root
+; Output: DSVP-0.2.3-beta-setup.exe in repo root
 ;
 ; ─── Configuration ──────────────────────────────────────────────
 
 !define PRODUCT_NAME    "DSVP"
-!define PRODUCT_VERSION "0.2.2-beta"
+!define PRODUCT_VERSION "0.2.3-beta"
 !define PRODUCT_PUBLISHER "Holden"
 !define PRODUCT_WEB     "https://github.com/ASIXicle/DSVP"
 !define PRODUCT_EXE     "dsvp.exe"
