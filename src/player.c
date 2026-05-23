@@ -497,11 +497,142 @@ static const char hlsl_overlay_frag[] =
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * SPIRV Compile Cache
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Caches the SPIRV bytecode output of HLSL→SPIRV compilation — the
+ * expensive step in the shader pipeline (~200ms for the 48KB fragment
+ * shader at cold start). SPIRV is platform-independent bytecode, so
+ * the cache key is just (cache version + stage + entrypoint + source).
+ * The SPIRV→native compile still runs every launch (driver-specific,
+ * fast).
+ *
+ * Cache layout: <exe_dir>/shadercaches/<stage>_<16-hex-key>.spv
+ * Files are opaque SPIRV blobs. Safe for the user to delete; the next
+ * launch will repopulate. Cache version bumps whenever shadercross
+ * version changes or anything that could alter SPIRV output for the
+ * same source, invalidating all entries.
+ */
+
+#ifdef _WIN32
+  #include <direct.h>
+  static int dsvp_mkdir(const char *p) { return _mkdir(p); }
+#else
+  #include <sys/stat.h>
+  #include <sys/types.h>
+  static int dsvp_mkdir(const char *p) { return mkdir(p, 0755); }
+#endif
+
+#define DSVP_SHADERCACHE_VERSION "1"  /* bump to invalidate all cache files */
+#define DSVP_SHADERCACHE_MAX_SIZE (16 * 1024 * 1024)  /* sanity ceiling */
+
+/* FNV-1a 64-bit hash. Not cryptographic; collision-resistant enough
+ * for keying a handful of shaders per program. Public domain. */
+static uint64_t dsvp_fnv1a64(const void *data, size_t len) {
+    const unsigned char *p = (const unsigned char *)data;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/* Build hash key from (version, stage, entrypoint, source). */
+static uint64_t shadercache_key(const char *stage, const char *ep,
+                                const char *src) {
+    char hdr[256];
+    int hlen = snprintf(hdr, sizeof(hdr), "%s|%s|%s|",
+                        DSVP_SHADERCACHE_VERSION, stage, ep);
+    if (hlen < 0 || (size_t)hlen >= sizeof(hdr)) return 0;
+    /* Hash header then source, in a stream to avoid concatenation. */
+    uint64_t h = dsvp_fnv1a64(hdr, (size_t)hlen);
+    /* Continue the hash with the source bytes. FNV is rolling, but
+     * we don't expose a continuation API; re-implement inline. */
+    const unsigned char *p = (const unsigned char *)src;
+    while (*p) {
+        h ^= *p++;
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+/* Compose <exe_dir>/shadercaches/<stage>_<key>.spv into out. */
+static int shadercache_path(char *out, size_t out_size,
+                            const char *stage, uint64_t key) {
+    const char *base = SDL_GetBasePath();
+    if (!base) return -1;
+    int n = snprintf(out, out_size, "%sshadercaches/%s_%016llx.spv",
+                     base, stage, (unsigned long long)key);
+    return (n > 0 && (size_t)n < out_size) ? 0 : -1;
+}
+
+/* Best-effort: create shadercaches/ next to the exe. Ignores existing-
+ * directory errors. Failure here just means saves will fail silently. */
+static void shadercache_ensure_dir(void) {
+    const char *base = SDL_GetBasePath();
+    if (!base) return;
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%sshadercaches", base);
+    if (n <= 0 || (size_t)n >= sizeof(path)) return;
+    dsvp_mkdir(path);  /* errno=EEXIST is fine; we don't check */
+}
+
+/* Load cached SPIRV. Returns SDL_malloc'd buffer (caller SDL_free's
+ * via the same path as the SDL_ShaderCross result) or NULL on miss. */
+static void *shadercache_load(const char *stage, uint64_t key,
+                              size_t *out_size) {
+    char path[1024];
+    if (shadercache_path(path, sizeof(path), stage, key) != 0) return NULL;
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long size = ftell(f);
+    if (size <= 0 || size > DSVP_SHADERCACHE_MAX_SIZE) {
+        fclose(f);
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    void *buf = SDL_malloc((size_t)size);
+    if (!buf) { fclose(f); return NULL; }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    if (got != (size_t)size) {
+        SDL_free(buf);
+        return NULL;
+    }
+    *out_size = (size_t)size;
+    return buf;
+}
+
+/* Save SPIRV to cache atomically (write to .tmp, then rename).
+ * Best-effort — failures are non-fatal and silently skipped. */
+static void shadercache_save(const char *stage, uint64_t key,
+                             const void *buf, size_t size) {
+    shadercache_ensure_dir();
+    char path[1024], tmp[1024 + 4];
+    if (shadercache_path(path, sizeof(path), stage, key) != 0) return;
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (n <= 0 || (size_t)n >= sizeof(tmp)) return;
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    size_t wrote = fwrite(buf, 1, size, f);
+    if (fclose(f) != 0 || wrote != size) {
+        remove(tmp);
+        return;
+    }
+    if (rename(tmp, path) != 0) remove(tmp);
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * Shader Compilation Helper
  * ═══════════════════════════════════════════════════════════════════
  *
  * Three-step pipeline for shadercross 3.0.0:
- *   1. HLSL → SPIRV  (CompileSPIRVFromHLSL)
+ *   1. HLSL → SPIRV  (CompileSPIRVFromHLSL) — cached on disk; see
+ *      SPIRV Compile Cache above. Cold path is ~200ms for the 48KB
+ *      fragment shader; cache hit is ~ms.
  *   2. SPIRV → metadata (ReflectGraphicsSPIRV) — resource counts
  *   3. SPIRV → native  (CompileGraphicsShaderFromSPIRV) — D3D12/Vulkan/Metal
  *
@@ -517,7 +648,7 @@ static SDL_GPUShader *compile_shader(
     const char *stage_name =
         (stage == SDL_SHADERCROSS_SHADERSTAGE_VERTEX) ? "vert" : "frag";
 
-    /* Step 1: HLSL → SPIRV */
+    /* Step 1: HLSL → SPIRV, with on-disk cache. */
     SDL_ShaderCross_HLSL_Info hlsl_info;
     SDL_zero(hlsl_info);
     hlsl_info.source       = source;
@@ -528,12 +659,27 @@ static SDL_GPUShader *compile_shader(
     hlsl_info.props        = 0;
 
     size_t spirv_size = 0;
-    void *spirv = SDL_ShaderCross_CompileSPIRVFromHLSL(&hlsl_info, &spirv_size);
-    if (!spirv) {
-        log_msg("ERROR: HLSL->SPIRV failed (%s): %s", stage_name, SDL_GetError());
-        return NULL;
+    uint64_t cache_key = shadercache_key(stage_name, entrypoint, source);
+    void *spirv = (cache_key != 0)
+        ? shadercache_load(stage_name, cache_key, &spirv_size)
+        : NULL;
+
+    if (spirv) {
+        log_msg("Shader: SPIRV cache hit (%s, %zu bytes)",
+                stage_name, spirv_size);
+    } else {
+        spirv = SDL_ShaderCross_CompileSPIRVFromHLSL(&hlsl_info, &spirv_size);
+        if (!spirv) {
+            log_msg("ERROR: HLSL->SPIRV failed (%s): %s",
+                    stage_name, SDL_GetError());
+            return NULL;
+        }
+        log_msg("Shader: HLSL->SPIRV OK (%s, %zu bytes)",
+                stage_name, spirv_size);
+        if (cache_key != 0) {
+            shadercache_save(stage_name, cache_key, spirv, spirv_size);
+        }
     }
-    log_msg("Shader: HLSL->SPIRV OK (%s, %zu bytes)", stage_name, spirv_size);
 
     /* Step 2: Reflect SPIRV for resource counts.
      * Returns a malloc'd struct — must SDL_free when done. */
