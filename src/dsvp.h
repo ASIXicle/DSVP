@@ -39,7 +39,7 @@
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.2.5-beta"
+#define DSVP_VERSION        "0.2.6-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -266,6 +266,7 @@ typedef struct PlayerState {
     int                 seek_request;     /* 1 = seek pending           */
     int                 seek_flags;
     int                 seek_recovering;  /* 1 = waiting for first displayed frame post-seek */
+    double              seek_recovering_start; /* wall-clock when seek_recovering=1 was set (timeout fallback) */
 
     /* ── Threads ── */
     SDL_Thread         *demux_thread;

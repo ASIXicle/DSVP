@@ -1083,6 +1083,7 @@ int main(int argc, char *argv[]) {
                  */
                 if (ps.seek_recovering) {
                     ps.seek_recovering = 0;
+                    ps.seek_recovering_start = 0.0;
                     ps.frame_timer = get_time_sec();
 
                     /* Re-sync clocks to the actual first-frame PTS */
@@ -1104,6 +1105,47 @@ int main(int argc, char *argv[]) {
                     log_msg("DIAG: seek recovery complete at %.3fs",
                             ps.video_clock);
                 }
+            }
+
+            /* Audio-only / no-video-frame fallback for seek recovery.
+             *
+             * The seek_recovering branch above clears only when the
+             * first decoded video frame is displayed. For audio-only
+             * files (video_stream_idx < 0) there is no video frame to
+             * wait for — without this fallback audio would stay paused
+             * forever. For video files where the seek lands on an
+             * unrecoverable region (corrupt stream, missing keyframe),
+             * a 2-second timeout forces resume so the user isn't left
+             * in silence.
+             *
+             * Either branch is mutually exclusive with the in-display
+             * recovery — that one already cleared seek_recovering. */
+            if (ps.playing && ps.seek_recovering
+                    && (ps.video_stream_idx < 0
+                        || (ps.seek_recovering_start > 0.0
+                            && (now - ps.seek_recovering_start) > 2.0))) {
+                ps.seek_recovering = 0;
+                ps.seek_recovering_start = 0.0;
+                ps.frame_timer = now;
+                /* audio_clock was set to seek_pos by the demux thread.
+                 * For audio-only this is exactly where we want audio
+                 * to resume; for video-timeout it's a best-effort
+                 * starting point. */
+                ps.audio_clock_sync = ps.audio_clock;
+                ps.audio_pts_floor  = ps.audio_clock;
+                ps.av_bias          = 0.0;
+                ps.av_bias_samples  = 0;
+                if (ps.audio_stream) {
+                    SDL_ClearAudioStream(ps.audio_stream);
+                    if (!ps.paused)
+                        SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                }
+                log_msg("DIAG: seek recovery timeout — forcing audio "
+                        "resume at %.3fs (%s)",
+                        ps.audio_clock,
+                        (ps.video_stream_idx < 0)
+                            ? "audio-only file"
+                            : "no video frame in 2s");
             }
 
             /* Periodic diagnostics (every 10 seconds) */

@@ -2328,6 +2328,7 @@ int player_open(PlayerState *ps, const char *filename) {
     /* Suppress frame drops until the first frame is displayed.
      * Adapts automatically to any codec's keyframe recovery time. */
     ps->seek_recovering = 1;
+    ps->seek_recovering_start = get_time_sec();
     ps->video_ready = 0;
 
     /* ── Reset diagnostics ── */
@@ -2454,6 +2455,7 @@ void player_close(PlayerState *ps) {
     ps->seek_request       = 0;
     ps->seeking            = 0;
     ps->seek_recovering    = 0;
+    ps->seek_recovering_start = 0.0;
     ps->audio_pts_floor    = 0.0;
     ps->video_ready        = 0;
     ps->show_debug         = 0;
@@ -2671,12 +2673,28 @@ int demux_thread_func(void *arg) {
              * ~100ms, HEVC with long GOPs may take 5–10 seconds.
              * Cleared in main.c when a frame is actually shown. */
             ps->seek_recovering = 1;
+            ps->seek_recovering_start = get_time_sec();
             ps->av_bias = 0.0;
             ps->av_bias_samples = 0;
 
-            /* Resume audio playback */
-            if (ps->audio_stream && !ps->paused)
-                SDL_ResumeAudioStreamDevice(ps->audio_stream);
+            /* Flush any pre-seek audio still queued in SDL pipeline.
+             * Audio stays PAUSED here until the first video frame is
+             * displayed (cleared in main.c's seek_recovering branch).
+             * Resuming audio before the first frame decodes on heavy
+             * content (4K HEVC HDR keyframe takes ~300–400ms) causes
+             * audio_clock to run that far ahead, then snap-forwards
+             * and frame drops cascade as video catches up. The deck
+             * branch hit this with VAAPI's DPB rebuild on Steam Deck
+             * (commit b3177ba in DSVP-deck, Mar 24, 2026); the same
+             * mechanism applies to software HEVC decode on lower-spec
+             * hosts. Pause+resume must be paired: demux thread pauses
+             * (above), main thread resumes on first-frame display.
+             *
+             * Audio-only files have no video frame to wait for; the
+             * timeout in main.c (seek_recovering_start + 2s, or
+             * immediate when video_stream_idx<0) forces resume. */
+            if (ps->audio_stream)
+                SDL_ClearAudioStream(ps->audio_stream);
 
             log_msg("Demux: seek complete");
         }
