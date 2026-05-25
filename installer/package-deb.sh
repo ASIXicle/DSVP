@@ -9,14 +9,14 @@
 # Options:
 #   --skip-build    Skip compilation, use existing DSVP-portable/
 #
-# Output: dsvp_0.2.7-beta_amd64.deb in repo root
+# Output: dsvp_0.2.8-beta_amd64.deb in repo root
 #
-# Install:  sudo dpkg -i dsvp_0.2.7-beta_amd64.deb
+# Install:  sudo dpkg -i dsvp_0.2.8-beta_amd64.deb
 # Remove:   sudo dpkg -r dsvp
 
 set -e
 
-VERSION="0.2.7-beta"
+VERSION="0.2.8-beta"
 ARCH="amd64"
 PKG_NAME="dsvp"
 PKG_DIR="${PKG_NAME}_${VERSION}_${ARCH}"
@@ -211,6 +211,15 @@ cat > "${PKG_DIR}/usr/share/metainfo/${PKG_NAME}.metainfo.xml" << 'METAINFO'
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.2.8-beta" date="2026-05-25">
+      <description>
+        <p>Subtitle: extended font fallback chain covers Arabic, Hebrew,
+        Indic scripts (Devanagari, Bengali, Tamil, Telugu, Kannada,
+        Malayalam, Gujarati, Gurmukhi, Oriya, Sinhala), SE Asian (Thai,
+        Lao, Khmer, Myanmar), Georgian, Armenian, Ethiopic, and Tibetan.
+        Previously these rendered as missing-glyph boxes on most platforms.</p>
+      </description>
+    </release>
     <release version="0.2.7-beta" date="2026-05-25">
       <description>
         <p>Subtitle: skip stale packets before decode when cycling streams,

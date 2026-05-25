@@ -7,14 +7,14 @@
 #   - MSYS2 MinGW64 toolchain (gcc, mingw32-make, pkg-config)
 #   - NSIS:  pacman -S mingw-w64-x86_64-nsis
 #
-# Output: DSVP-0.2.7-beta-setup.exe in repo root
+# Output: DSVP-0.2.8-beta-setup.exe in repo root
 
 param(
     [switch]$SkipBuild    # skip compilation, use existing DSVP-portable/
 )
 
 $ErrorActionPreference = "Stop"
-$version = "0.2.7-beta"
+$version = "0.2.8-beta"
 
 Write-Host "`n=== DSVP Installer Builder v${version} ===" -ForegroundColor Cyan
 

@@ -15,11 +15,24 @@
 
 /* ── Font state (module-level) ─────────────────────────────────────── */
 
-static TTF_Font *sub_font         = NULL;
-static TTF_Font *sub_font_outline = NULL;
+static TTF_Font *sub_font             = NULL;
+static TTF_Font *sub_font_outline     = NULL;
 static TTF_Font *sub_font_cjk         = NULL;
 static TTF_Font *sub_font_cjk_outline = NULL;
-static int       font_loaded      = 0;
+static int       font_loaded          = 0;
+
+/* Extended-script fallback chain — covers Arabic, Hebrew, Indic scripts,
+ * SE Asian (Thai, Lao, Khmer, Myanmar), Georgian, Armenian, Ethiopic,
+ * Tibetan, and others.  Each script tries platform-specific paths in
+ * order; first match per script attaches.  Path-dedup prevents double-
+ * attaching shared fonts (e.g. arial.ttf covers both Arabic and Hebrew
+ * on Windows; Nirmala UI covers most Indic scripts on Windows). */
+#define MAX_EXTENDED_FALLBACKS  32
+#define EXTENDED_FONT_PATH_MAX  256
+static TTF_Font *sub_font_extended[MAX_EXTENDED_FALLBACKS];
+static TTF_Font *sub_font_extended_outline[MAX_EXTENDED_FALLBACKS];
+static char      sub_font_extended_paths[MAX_EXTENDED_FALLBACKS][EXTENDED_FONT_PATH_MAX];
+static int       sub_font_extended_count = 0;
 
 /* ── Font discovery ────────────────────────────────────────────────── */
 
@@ -90,6 +103,67 @@ static const char *find_cjk_font(void) {
 }
 
 
+/* ── Extended script fallback helpers ──────────────────────────────── */
+
+/* Attach a font as a fallback for both regular and outline subtitle fonts.
+ * Returns 1 if newly attached (or already attached via dedup), 0 on miss.
+ * Silently no-ops if MAX_EXTENDED_FALLBACKS is reached.
+ *
+ * Two-step open: the same path is opened twice — once for the regular
+ * font chain, once for the outlined font chain.  SDL_ttf's outline mode
+ * is a per-font property, not per-render, so each chain needs its own
+ * font handle. */
+static int try_attach_extended_fallback(const char *path, int font_size) {
+    if (sub_font_extended_count >= MAX_EXTENDED_FALLBACKS) return 0;
+
+    /* Existence probe before TTF_OpenFont — avoids noisy SDL errors on
+     * platforms where most candidate paths legitimately don't exist. */
+    FILE *probe = fopen(path, "rb");
+    if (!probe) return 0;
+    fclose(probe);
+
+    /* Path-dedup: shared fonts (arial.ttf for Arabic+Hebrew on Windows,
+     * Nirmala.ttf for the Indic family) appear in multiple script tables.
+     * Attach the file once, let SDL_ttf reuse it across scripts. */
+    for (int i = 0; i < sub_font_extended_count; i++) {
+        if (strcmp(sub_font_extended_paths[i], path) == 0) {
+            return 1;
+        }
+    }
+
+    TTF_Font *font = TTF_OpenFont(path, font_size);
+    if (!font) return 0;
+    TTF_SetFontHinting(font, TTF_HINTING_LIGHT);
+    TTF_AddFallbackFont(sub_font, font);
+    sub_font_extended[sub_font_extended_count] = font;
+
+    TTF_Font *outline = TTF_OpenFont(path, font_size);
+    if (outline) {
+        TTF_SetFontOutline(outline, 2);
+        TTF_SetFontHinting(outline, TTF_HINTING_LIGHT);
+        TTF_AddFallbackFont(sub_font_outline, outline);
+    }
+    sub_font_extended_outline[sub_font_extended_count] = outline;
+
+    snprintf(sub_font_extended_paths[sub_font_extended_count],
+             EXTENDED_FONT_PATH_MAX, "%s", path);
+
+    sub_font_extended_count++;
+    log_msg("Extended fallback loaded: %s", path);
+    return 1;
+}
+
+/* Try each path in the NULL-terminated `paths` array; first existing
+ * match is attached as a fallback.  Returns 1 if attached, 0 if all missed. */
+static int try_attach_script(const char *const paths[], int font_size) {
+    for (int i = 0; paths[i]; i++) {
+        if (try_attach_extended_fallback(paths[i], font_size))
+            return 1;
+    }
+    return 0;
+}
+
+
 /* ═══════════════════════════════════════════════════════════════════
  * Font Init / Close
  * ═══════════════════════════════════════════════════════════════════ */
@@ -147,12 +221,344 @@ int sub_init_font(void) {
         }
     }
 
+    /* ── Extended-script fallback chain ─────────────────────────────────
+     *
+     * Each script tries a NULL-terminated platform-specific path list;
+     * first match wins per script.  Shared fonts (arial.ttf on Windows
+     * for Arabic+Hebrew, Nirmala.ttf for the Indic family) attach once
+     * via path-dedup inside try_attach_extended_fallback().
+     *
+     * Coverage rationale: SDL_ttf iterates fallbacks lazily per glyph,
+     * so missing scripts cost nothing at render time.  Loading more
+     * fallbacks costs only a few MB of startup memory per attached font. */
+
+    /* Arabic (also reused for languages using Arabic script: Persian, Urdu) */
+    static const char *const arabic_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\arial.ttf",
+        "C:\\Windows\\Fonts\\tahoma.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/GeezaPro.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSansArabic-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+        "/usr/share/fonts/TTF/NotoSansArabic-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(arabic_paths, font_size);
+
+    /* Hebrew */
+    static const char *const hebrew_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\arial.ttf",          /* shared with Arabic, dedups */
+        "C:\\Windows\\Fonts\\tahoma.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/System/Library/Fonts/ArialHB.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansHebrew-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSansHebrew-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(hebrew_paths, font_size);
+
+    /* Devanagari (Hindi, Marathi, Nepali, Sanskrit) */
+    static const char *const devanagari_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Nirmala.ttf",
+        "C:\\Windows\\Fonts\\mangal.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/DevanagariMT.ttc",
+        "/System/Library/Fonts/Supplemental/Kohinoor.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf",
+        "/usr/share/fonts/google-noto/NotoSansDevanagari-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(devanagari_paths, font_size);
+
+    /* Bengali (Bangla, Assamese) */
+    static const char *const bengali_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Nirmala.ttf",        /* shared Indic, dedups */
+        "C:\\Windows\\Fonts\\vrinda.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Bangla MN.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansBengali-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(bengali_paths, font_size);
+
+    /* Tamil */
+    static const char *const tamil_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Nirmala.ttf",
+        "C:\\Windows\\Fonts\\latha.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Tamil MN.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansTamil-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansTamil-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(tamil_paths, font_size);
+
+    /* Telugu */
+    static const char *const telugu_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Nirmala.ttf",
+        "C:\\Windows\\Fonts\\gautami.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Telugu MN.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansTelugu-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(telugu_paths, font_size);
+
+    /* Kannada */
+    static const char *const kannada_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Nirmala.ttf",
+        "C:\\Windows\\Fonts\\tunga.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Kannada MN.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansKannada-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansKannada-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(kannada_paths, font_size);
+
+    /* Malayalam */
+    static const char *const malayalam_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Nirmala.ttf",
+        "C:\\Windows\\Fonts\\kartika.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Malayalam MN.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansMalayalam-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansMalayalam-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(malayalam_paths, font_size);
+
+    /* Gujarati */
+    static const char *const gujarati_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Nirmala.ttf",
+        "C:\\Windows\\Fonts\\shruti.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Gujarati MT.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansGujarati-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansGujarati-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(gujarati_paths, font_size);
+
+    /* Gurmukhi (Punjabi) */
+    static const char *const gurmukhi_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Nirmala.ttf",
+        "C:\\Windows\\Fonts\\raavi.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Gurmukhi MN.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansGurmukhi-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansGurmukhi-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(gurmukhi_paths, font_size);
+
+    /* Oriya */
+    static const char *const oriya_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Nirmala.ttf",
+        "C:\\Windows\\Fonts\\kalinga.ttf",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansOriya-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansOriya-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(oriya_paths, font_size);
+
+    /* Sinhala */
+    static const char *const sinhala_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Nirmala.ttf",
+        "C:\\Windows\\Fonts\\iskpota.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Sinhala MN.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansSinhala-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansSinhala-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(sinhala_paths, font_size);
+
+    /* Thai */
+    static const char *const thai_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Leelawui.ttf",
+        "C:\\Windows\\Fonts\\tahoma.ttf",          /* shared with RTL set, dedups */
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
+        "/System/Library/Fonts/Supplemental/Thonburi.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(thai_paths, font_size);
+
+    /* Lao */
+    static const char *const lao_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Leelawui.ttf",
+        "C:\\Windows\\Fonts\\Phagspa.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Lao MN.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansLao-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansLao-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(lao_paths, font_size);
+
+    /* Khmer */
+    static const char *const khmer_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Leelawui.ttf",
+        "C:\\Windows\\Fonts\\daunpenh.ttf",
+        "C:\\Windows\\Fonts\\khmerui.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Khmer MN.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansKhmer-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansKhmer-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(khmer_paths, font_size);
+
+    /* Myanmar (Burmese) */
+    static const char *const myanmar_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Mmrtext.ttf",
+#elif defined(__APPLE__)
+        "/System/Library/Fonts/Supplemental/Myanmar MN.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansMyanmar-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansMyanmar-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(myanmar_paths, font_size);
+
+    /* Georgian */
+    static const char *const georgian_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\sylfaen.ttf",
+#elif defined(__APPLE__)
+        "/Library/Fonts/Helvetica.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansGeorgian-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansGeorgian-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(georgian_paths, font_size);
+
+    /* Armenian */
+    static const char *const armenian_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\sylfaen.ttf",         /* shared with Georgian, dedups */
+#elif defined(__APPLE__)
+        "/Library/Fonts/Mshtakan.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansArmenian-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansArmenian-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(armenian_paths, font_size);
+
+    /* Ethiopic (Amharic, Tigrinya, Ge'ez) */
+    static const char *const ethiopic_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\Ebrima.ttf",
+        "C:\\Windows\\Fonts\\Nyala.ttf",
+#elif defined(__APPLE__)
+        "/Library/Fonts/Kefa.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansEthiopic-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansEthiopic-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(ethiopic_paths, font_size);
+
+    /* Tibetan */
+    static const char *const tibetan_paths[] = {
+#ifdef _WIN32
+        "C:\\Windows\\Fonts\\himalaya.ttf",
+#elif defined(__APPLE__)
+        "/Library/Fonts/Kailasa.ttc",
+#else
+        "/usr/share/fonts/truetype/noto/NotoSansTibetan-Regular.ttf",
+        "/usr/share/fonts/noto/NotoSansTibetan-Regular.ttf",
+#endif
+        NULL
+    };
+    try_attach_script(tibetan_paths, font_size);
+
+    if (sub_font_extended_count > 0) {
+        log_msg("Extended script fallbacks: %d font(s) loaded", sub_font_extended_count);
+    } else {
+        log_msg("Extended script fallbacks: none found "
+                "(scripts beyond Latin/CJK may render as boxes)");
+    }
+
     font_loaded = 1;
     log_msg("Subtitle font loaded: %s (%dpt)", font_path, font_size);
     return 0;
 }
 
 void sub_close_font(void) {
+    /* Free extended-script fallbacks (added via TTF_AddFallbackFont).
+     * Close before the chain root so SDL_ttf doesn't end up holding
+     * references to a freed primary font. */
+    for (int i = 0; i < sub_font_extended_count; i++) {
+        if (sub_font_extended[i])         { TTF_CloseFont(sub_font_extended[i]);         sub_font_extended[i] = NULL; }
+        if (sub_font_extended_outline[i]) { TTF_CloseFont(sub_font_extended_outline[i]); sub_font_extended_outline[i] = NULL; }
+        sub_font_extended_paths[i][0] = '\0';
+    }
+    sub_font_extended_count = 0;
+
     if (sub_font_cjk)         { TTF_CloseFont(sub_font_cjk);         sub_font_cjk = NULL; }
     if (sub_font_cjk_outline) { TTF_CloseFont(sub_font_cjk_outline); sub_font_cjk_outline = NULL; }
     if (sub_font)         { TTF_CloseFont(sub_font);         sub_font = NULL; }
