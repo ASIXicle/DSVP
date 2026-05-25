@@ -14,9 +14,9 @@ https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=ms
 
 ## Installation
 
-**Windows:** Download `DSVP-0.2.6-beta-setup.exe` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and run it. Installs to Program Files with Start Menu shortcuts and an uninstaller. Alternatively, download the portable `.zip` — extract and run, no installation needed.
+**Windows:** Download `DSVP-0.2.7-beta-setup.exe` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and run it. Installs to Program Files with Start Menu shortcuts and an uninstaller. Alternatively, download the portable `.zip` — extract and run, no installation needed.
 
-**Debian/Ubuntu:** Download `dsvp_0.2.6-beta_amd64.deb` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and install with `sudo dpkg -i dsvp_0.2.6-beta_amd64.deb`. Bundles all dependencies. Run `dsvp` from a terminal or your application launcher.
+**Debian/Ubuntu:** Download `dsvp_0.2.7-beta_amd64.deb` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and install with `sudo dpkg -i dsvp_0.2.7-beta_amd64.deb`. Bundles all dependencies. Run `dsvp` from a terminal or your application launcher.
 
 **Steam Deck:** See [SteamOS.md](https://github.com/ASIXicle/DSVP-deck/blob/main/SteamOS.md) for the dedicated Steam Deck build with VAAPI hardware decode.
 
@@ -108,7 +108,7 @@ The binary lands in `build/dsvp.exe` with all required DLLs auto-copied.
 ```bash
 makensis installer/dsvp.nsi
 ```
-Produces `DSVP-0.2.6-beta-setup.exe` in the repo root.
+Produces `DSVP-0.2.7-beta-setup.exe` in the repo root.
 
 ### Linux (Debian/Ubuntu)
 
@@ -152,7 +152,7 @@ Binary: `build/dsvp`
 ```bash
 ./installer/package-deb.sh
 ```
-Produces `dsvp_0.2.6-beta_amd64.deb` in the repo root. Builds, packages, and assembles the `.deb` in one step. Use `--skip-build` to repackage without recompiling.
+Produces `dsvp_0.2.7-beta_amd64.deb` in the repo root. Builds, packages, and assembles the `.deb` in one step. Use `--skip-build` to repackage without recompiling.
 
 ### macOS (untested as of 3/16/26)
 
