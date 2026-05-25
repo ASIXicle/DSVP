@@ -9,14 +9,14 @@
 # Options:
 #   --skip-build    Skip compilation, use existing DSVP-portable/
 #
-# Output: dsvp_0.2.6-beta_amd64.deb in repo root
+# Output: dsvp_0.2.7-beta_amd64.deb in repo root
 #
-# Install:  sudo dpkg -i dsvp_0.2.6-beta_amd64.deb
+# Install:  sudo dpkg -i dsvp_0.2.7-beta_amd64.deb
 # Remove:   sudo dpkg -r dsvp
 
 set -e
 
-VERSION="0.2.6-beta"
+VERSION="0.2.7-beta"
 ARCH="amd64"
 PKG_NAME="dsvp"
 PKG_DIR="${PKG_NAME}_${VERSION}_${ARCH}"
@@ -211,6 +211,13 @@ cat > "${PKG_DIR}/usr/share/metainfo/${PKG_NAME}.metainfo.xml" << 'METAINFO'
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.2.7-beta" date="2026-05-25">
+      <description>
+        <p>Subtitle: skip stale packets before decode when cycling streams,
+        eliminating cascade drops triggered by catch-up bitmap subtitle work
+        on the main thread.</p>
+      </description>
+    </release>
     <release version="0.2.6-beta" date="2026-04-03">
       <description>
         <p>Windows and Debian installers. Seek stall fix, stream discard,

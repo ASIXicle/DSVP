@@ -470,6 +470,35 @@ void sub_decode_pending(PlayerState *ps) {
     int pgs_packets_this_drain = 0;
     double last_pgs_pts = 0.0;
     while (pq_get(spq, &pkt, 0) > 0) {
+        /* ── Stale-packet skip ──
+         *
+         * Subtitle decode is expensive — PGS bitmap especially, with zlib
+         * decompression, palette/object segment accumulation, and a final
+         * END-inject pass.  During subtitle-stream cycling (user tabbing
+         * through tracks), opening a new codec mid-playback pulls every
+         * queued packet from file-start through current playback position;
+         * each catch-up decode runs on the main thread and can block for
+         * tens of ms.  In one stress test (16 subtitle streams cycled
+         * on a 3840x1608 4K HEVC HDR DV P8 source), this triggered 312
+         * video-frame drops.
+         *
+         * Skip packets whose worst-case display window (pts + 30s, matching
+         * the PGS display cap applied a few hundred lines below) has
+         * already passed.  Same-scene PGS segment state — PCS/WDS/PDS/ODS
+         * accumulation toward END — cannot span this gap, so the decoder's
+         * cross-call state machine and the END-inject path below both stay
+         * intact.  Packets with unknown PTS are kept (can't judge safely). */
+        if (pkt.pts != AV_NOPTS_VALUE) {
+            AVStream *sub_st = ps->fmt_ctx->streams[ps->sub_active_idx];
+            double pkt_pts_sec = (double)pkt.pts * av_q2d(sub_st->time_base);
+            if (pkt_pts_sec + 30.0 < now) {
+                log_msg("Sub: skipped stale packet (pts=%.1f + 30 < now=%.1f)",
+                        pkt_pts_sec, now);
+                av_packet_unref(&pkt);
+                continue;
+            }
+        }
+
         AVSubtitle sub;
         int got_sub = 0;
 
