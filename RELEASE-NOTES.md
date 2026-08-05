@@ -1,9 +1,8 @@
 # DSVP 0.3.0-beta — Release Notes
 
-This branch carries release-facing files only; development history lives elsewhere.
-
-This round was a full-codebase review followed by a fix-and-feature pass across
-every subsystem. Everything below is in the pending build.
+A full-codebase review followed by a fix-and-feature pass across every
+subsystem: colour-pipeline corrections, new format support, playback
+robustness, and rendering performance.
 
 ---
 
