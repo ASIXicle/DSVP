@@ -20,6 +20,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
 #include <libavutil/channel_layout.h>
@@ -39,7 +40,7 @@
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.2.8-beta"
+#define DSVP_VERSION        "0.3.0-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -152,7 +153,10 @@ typedef struct GPUUniforms {
     float hdr_target_nits;  /* SDR display peak (T key toggle)     4 bytes */
     float hdr_midtone_gain; /* midtone lift exponent (G key)       4 bytes */
     float is_dovi;          /* 1.0 = DV reshaping active           4 bytes */
-    float _pad0[2];         /* align to 16B for float4 arrays      8 bytes */
+    float out_gamma;        /* 0 = sRGB piecewise; else power exp  4 bytes */
+    float is_hlg;           /* 1.0 = HLG transfer (ARIB STD-B67)   4 bytes */
+    /* (these two occupy what was explicit padding — the 144B float4
+     *  alignment boundary below is unchanged) */
     /* ── 144B boundary ── */
     float dovi_num_pieces[4]; /* [I, Ct, Cp, 0] piece counts      16 bytes */
     float dovi_pivots[9][4];  /* [pivot][comp] normalized pivots 144 bytes */
@@ -165,7 +169,15 @@ typedef struct GPUUniforms {
     float dovi_out_r0[4];   /* output row 0 [m,m,m,0] (lms→2020) 16 bytes */
     float dovi_out_r1[4];   /* output row 1 [m,m,m,0]            16 bytes */
     float dovi_out_r2[4];   /* output row 2 [m,m,m,0]            16 bytes */
-} GPUUniforms;              /*                                  784 bytes */
+    /* ── DV MMR chroma reshaping (appended — offsets above unchanged) ──
+     * Real-world P5 RPUs overwhelmingly reshape Ct/Cp with MMR, a
+     * cross-channel polynomial over the full (I,Ct,Cp) triple; the
+     * per-component poly path cannot represent it. Single-piece MMR
+     * (the universal case for chroma) is supported; order 1-3. */
+    float dovi_mmr_meta[4];   /* [ct_order, cp_order, ct_const, cp_const] */
+    float dovi_mmr_ct[6][4];  /* 21 coeffs, [order*7+term] packed  96 bytes */
+    float dovi_mmr_cp[6][4];  /*                                   96 bytes */
+} GPUUniforms;              /*                                  992 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *
@@ -182,6 +194,25 @@ typedef struct PlayerState {
     /* ── Video decode ── */
     AVCodecContext     *video_codec_ctx;
     struct SwsContext  *sws_ctx;
+    int                 sws_out_10bit;   /* sws dst is yuv420p10le (deep sources
+                                            keep 10-bit precision through the
+                                            R16 path instead of being crushed
+                                            to 8-bit before PQ decode) */
+    int                 sws_dst_siting;  /* AVChromaLocation the sws OUTPUT is
+                                            pinned to via dst_chr_pos — drives
+                                            the shader siting offset */
+
+    /* ── Deinterlacing (bwdif via lavfi) — content-aware ──
+     * Graph is created lazily by the decode thread the first time a
+     * frame arrives flagged interlaced, and freed on seek (bwdif keeps
+     * temporal field state). deint=interlaced passes progressive frames
+     * through untouched, so mixed streams are handled per frame.
+     * DSVP_DEINT=0 disables, =1 forces the graph on from frame one. */
+    struct AVFilterGraph   *deint_graph;
+    struct AVFilterContext *deint_src;
+    struct AVFilterContext *deint_sink;
+    int                     deint_disabled;
+    int                     deint_force;
     AVFrame            *video_frame;      /* raw decoded frame          */
     AVFrame            *rgb_frame;        /* scaled/converted for SDL   */
     uint8_t            *rgb_buffer;       /* backing buffer for rgb_frame */
@@ -189,8 +220,16 @@ typedef struct PlayerState {
     /* ── Audio decode ── */
     AVCodecContext     *audio_codec_ctx;
     struct SwrContext  *swr_ctx;
+    /* Input format swr_ctx was configured for — mid-stream changes
+     * (broadcast TS 5.1<->2.0 at program boundaries, AAC SBR rate
+     * switches) must rebuild the resampler, not feed it stale-config
+     * frames (planar-channel mismatch reads NULL plane pointers). */
+    AVChannelLayout     swr_in_layout;
+    int                 swr_in_format;
+    int                 swr_in_rate;
     AVFrame            *audio_frame;
     uint8_t            *audio_buf;        /* resampled audio buffer     */
+    unsigned int        audio_buf_cap;    /* allocated capacity of audio_buf (bytes) */
     unsigned int        audio_buf_size;   /* bytes of valid data in buf */
     unsigned int        audio_buf_index;  /* read cursor into buf       */
 
@@ -224,6 +263,7 @@ typedef struct PlayerState {
     /* ── SDL_GPU handles (lifetime: application) ── */
     SDL_GPUDevice              *gpu_device;
     SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv;   /* planar YUV420P   */
+    SDL_GPUGraphicsPipeline    *gpu_pipeline_blit;  /* frame cache → swapchain copy */
     SDL_GPUSampler             *gpu_sampler;         /* linear filtering */
     SDL_GPUSampler             *gpu_sampler_nearest; /* nearest for overlay */
 
@@ -235,7 +275,21 @@ typedef struct PlayerState {
     SDL_GPUTransferBuffer      *gpu_xfer_y;          /* CPU→GPU staging  */
     SDL_GPUTransferBuffer      *gpu_xfer_u;
     SDL_GPUTransferBuffer      *gpu_xfer_v;
+    Uint32                      gpu_xfer_y_cap;      /* staging capacities (bytes) — */
+    Uint32                      gpu_xfer_uv_cap;     /* allow stride-padded single memcpy */
     GPUUniforms                 gpu_uniforms;         /* current color params */
+
+    /* ── Shaded-frame cache ──
+     * The YUV→RGB (+tone map) shader output is rendered once per CONTENT
+     * frame into this texture; reblit ticks blit the cached result
+     * instead of re-running the 48-tap shader every VSync. Output is
+     * identical: frameCount only advances on new frames, so reblits
+     * always reproduced the same shading anyway. Invalidated on resize,
+     * letterbox change, or HDR uniform change (H/T/G keys). */
+    SDL_GPUTexture             *gpu_tex_cache;       /* sized to swapchain      */
+    int                         cache_w, cache_h;    /* current cache dims      */
+    int                         cache_valid;         /* 1 = holds current frame */
+    SDL_Rect                    cache_rect;          /* display_rect at render  */
 
     /* ── HDR dynamic peak detection (Layer 1: CPU scan) ── */
     float                       hdr_smoothed_peak;    /* temporally smoothed peak (nits) */
@@ -251,6 +305,8 @@ typedef struct PlayerState {
     int                         overlay_tex_w;         /* current texture dimensions */
     int                         overlay_tex_h;
     int                         overlay_dirty;         /* 1 = need re-upload */
+    int                         overlay_up_y0;         /* pending upload rows */
+    int                         overlay_up_y1;         /* (exclusive)         */
 
     /* ── Timing / A/V sync ── */
     double              audio_clock;      /* current audio PTS in secs (audio thread internal) */
@@ -281,6 +337,9 @@ typedef struct PlayerState {
     double              volume;           /* 0.0 — 1.0                  */
     int                 fullscreen;
     int                 eof;              /* demuxer hit end of file    */
+    int                 io_error;         /* persistent decode failure — main.c tears down */
+    int                 res_change_logged; /* per-file: mid-stream size warn shown  */
+    int                 cache_fail_logged; /* per-file: frame-cache create fail shown */
     int                 video_ready;      /* 1 after first frame uploaded — gates reblit */
 
     /* ── Window geometry ── */
@@ -340,6 +399,13 @@ typedef struct PlayerState {
     double              diag_max_av_drift;     /* worst A/V drift (signed) */
     double              diag_last_report;      /* time of last periodic log*/
 
+    /* ── Real-time FPS measurement (debug overlay, 0.5s window) ── */
+    double              fps_window_start;      /* window anchor (wall sec) */
+    int                 fps_window_frames;     /* CONTENT frames in window */
+    int                 rfps_window_frames;    /* GPU presents in window   */
+    double              fps_content;           /* measured content fps     */
+    double              fps_render;            /* measured present rate    */
+
     /* ── Folder playlist (prev/next navigation) ── */
     char              **playlist_files;      /* sorted full paths          */
     int                 playlist_count;      /* number of playable files   */
@@ -352,6 +418,9 @@ typedef struct PlayerState {
 void  pq_init(PacketQueue *q);
 void  pq_destroy(PacketQueue *q);
 int   pq_put(PacketQueue *q, AVPacket *pkt);
+int   pq_peek_pts(PacketQueue *q, int64_t *pts_out);
+void  pq_prune_stale(PacketQueue *q, int64_t min_pts);
+void  deint_graph_free(PlayerState *ps);
 int   pq_get(PacketQueue *q, AVPacket *pkt, int block);
 void  pq_flush(PacketQueue *q);
 
@@ -359,7 +428,7 @@ void  pq_flush(PacketQueue *q);
 
 void  fq_init(FrameQueue *q);
 void  fq_destroy(FrameQueue *q);
-int   fq_put(FrameQueue *q, AVFrame *frame, int block);
+int   fq_put(FrameQueue *q, AVFrame *frame, int block, int expect_serial);
 int   fq_get(FrameQueue *q, AVFrame **frame_out, int block);
 void  fq_flush(FrameQueue *q);
 
@@ -385,7 +454,7 @@ void  gpu_destroy_pipelines(PlayerState *ps);
 /* ── Overlay GPU (player.c) ──────────────────────────────────────── */
 
 int   gpu_overlay_ensure(PlayerState *ps, int width, int height);
-void  gpu_overlay_upload(PlayerState *ps, const uint8_t *rgba, int width, int height);
+void  gpu_overlay_upload(PlayerState *ps, const uint8_t *rgba, int width, int height, int y0, int y1);
 void  gpu_overlay_copy_cmd(SDL_GPUCommandBuffer *cmd, PlayerState *ps);
 void  gpu_overlay_draw(SDL_GPURenderPass *pass, SDL_GPUCommandBuffer *cmd,
                         PlayerState *ps, Uint32 sc_w, Uint32 sc_h);
@@ -401,6 +470,12 @@ int   audio_decode_frame(PlayerState *ps);
 void  audio_find_streams(PlayerState *ps);
 void  audio_cycle(PlayerState *ps);
 
+/* ── Bitstream API (bitstream.c) ─────────────────────────────────── */
+
+int   bitstream_probe(BitstreamCaps *caps);
+int   bitstream_can_passthrough(const BitstreamCaps *caps,
+                                 enum AVCodecID codec_id);
+
 /* ── Subtitle API (subtitle.c) ───────────────────────────────────── */
 
 void  sub_find_streams(PlayerState *ps);
@@ -412,6 +487,8 @@ int   sub_init_font(void);
 void  sub_close_font(void);
 TTF_Font *sub_get_font(void);
 TTF_Font *sub_get_outline_font(void);
+void  sub_set_font_size(int font_size);
+int   ui_scale_for(const PlayerState *ps, int sc_h);
 
 /* ── Overlay API (overlay.c) ─────────────────────────────────────── */
 

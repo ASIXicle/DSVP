@@ -12,7 +12,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$version = "0.2.8-beta"
+# Version derives from src/dsvp.h — single source of truth, never hardcode here
+$version = (Select-String -Path "src/dsvp.h" -Pattern 'DSVP_VERSION\s+"([^"]+)"').Matches[0].Groups[1].Value
 $outDir  = "DSVP-portable"
 
 Write-Host "=== DSVP Packager v$version ===" -ForegroundColor Cyan
@@ -89,6 +90,13 @@ Write-Host "[4/5] Resolving DLL dependencies..." -ForegroundColor Yellow
 
 # Build list of directories to search for DLLs (MSYS2 + vcpkg)
 $searchDirs = @()
+# Bundled shadercross FIRST: it ships DLLs that exist nowhere else on
+# the system (libspirv-cross-c-shared.dll and the MinGW runtime the
+# bundle was built against), so a portable package assembled without
+# this directory is missing dependencies no other search dir can supply.
+if (Test-Path "deps\SDL3_shadercross-3.0.0-windows-mingw-x64\bin") {
+    $searchDirs += (Resolve-Path "deps\SDL3_shadercross-3.0.0-windows-mingw-x64\bin").Path
+}
 if (Test-Path "C:\msys64\mingw64\bin")              { $searchDirs += "C:\msys64\mingw64\bin" }
 if (Test-Path "C:\vcpkg\installed\x64-windows\bin") { $searchDirs += "C:\vcpkg\installed\x64-windows\bin" }
 

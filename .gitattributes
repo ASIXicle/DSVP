@@ -1,0 +1,8 @@
+# A Windows-side edit once turned the deck repo's package.sh CRLF and it
+# could not run on Linux at all. Pin the files whose interpreters care.
+*.sh     text eol=lf
+Makefile text eol=lf
+*.c      text eol=lf
+*.h      text eol=lf
+*.ps1    text eol=crlf
+*.nsi    text eol=crlf

@@ -9,14 +9,15 @@
 # Options:
 #   --skip-build    Skip compilation, use existing DSVP-portable/
 #
-# Output: dsvp_0.2.8-beta_amd64.deb in repo root
+# Output: dsvp_0.3.0-beta_amd64.deb in repo root
 #
-# Install:  sudo dpkg -i dsvp_0.2.8-beta_amd64.deb
+# Install:  sudo dpkg -i dsvp_0.3.0-beta_amd64.deb
 # Remove:   sudo dpkg -r dsvp
 
 set -e
 
-VERSION="0.2.8-beta"
+# Version derives from src/dsvp.h — single source of truth, never hardcode here
+VERSION=$(sed -n 's/.*DSVP_VERSION *"\(.*\)"/\1/p' src/dsvp.h)
 ARCH="amd64"
 PKG_NAME="dsvp"
 PKG_DIR="${PKG_NAME}_${VERSION}_${ARCH}"
@@ -161,7 +162,7 @@ COPYRIGHT
 # human-readable name, license, author, URL, and description.
 
 echo "      Creating AppStream metainfo..."
-cat > "${PKG_DIR}/usr/share/metainfo/${PKG_NAME}.metainfo.xml" << 'METAINFO'
+cat > "${PKG_DIR}/usr/share/metainfo/${PKG_NAME}.metainfo.xml" << METAINFO
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>dsvp.desktop</id>
@@ -211,6 +212,13 @@ cat > "${PKG_DIR}/usr/share/metainfo/${PKG_NAME}.metainfo.xml" << 'METAINFO'
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="${VERSION}" date="$(date +%Y-%m-%d)">
+      <description>
+        <p>Full-codebase review round: chroma siting correction, seek and
+        EOF timing fixes, subtitle memory and safety hardening, HLG
+        support, and content-aware deinterlacing.</p>
+      </description>
+    </release>
     <release version="0.2.8-beta" date="2026-05-25">
       <description>
         <p>Subtitle: extended font fallback chain covers Arabic, Hebrew,
@@ -251,7 +259,7 @@ Architecture: ${ARCH}
 Installed-Size: ${INSTALLED_SIZE}
 Depends: libc6 (>= 2.17), zlib1g, fonts-dejavu-core
 Recommends: fonts-noto-cjk
-Maintainer: Holden <holden@dsvp>
+Maintainer: Holden <asixicle@users.noreply.github.com>
 Homepage: https://github.com/ASIXicle/DSVP
 Description: Dead Simple Video Player — reference-quality playback
  DSVP is a video player focused on reference-quality image fidelity.

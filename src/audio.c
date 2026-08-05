@@ -25,6 +25,11 @@ int audio_decode_frame(PlayerState *ps) {
     int ret;
     int data_size;
 
+    /* Codec can be NULL mid-session if audio_cycle() failed to open the
+     * next track — the device stays open, so the callback still fires.
+     * Produce silence instead of dereferencing NULL. */
+    if (!ps->audio_codec_ctx) return -1;
+
     for (;;) {
         ret = avcodec_receive_frame(ps->audio_codec_ctx, ps->audio_frame);
         if (ret == 0) {
@@ -55,6 +60,20 @@ int audio_decode_frame(PlayerState *ps) {
                 ps->audio_pts_floor = 0.0;  /* floor satisfied — clear */
             }
 
+            /* Rebuild the resampler if the stream's format changed under
+             * us (ffplay does this per frame). Feeding a 6-channel-planar-
+             * configured swr a frame that downgraded to stereo reads
+             * frame->extended_data[2..5] == NULL → crash; a stale sample
+             * rate pitch-shifts and corrupts the clock increment. */
+            if (ps->swr_ctx &&
+                (ps->swr_in_format != ps->audio_frame->format ||
+                 ps->swr_in_rate   != ps->audio_frame->sample_rate ||
+                 av_channel_layout_compare(&ps->swr_in_layout,
+                                           &ps->audio_frame->ch_layout))) {
+                log_msg("Audio: input format changed mid-stream — rebuilding resampler");
+                swr_free(&ps->swr_ctx);
+            }
+
             if (!ps->swr_ctx) {
                 AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
                 ret = swr_alloc_set_opts2(&ps->swr_ctx,
@@ -63,23 +82,45 @@ int audio_decode_frame(PlayerState *ps) {
                     ps->audio_frame->sample_rate, 0, NULL);
                 if (ret < 0 || swr_init(ps->swr_ctx) < 0) {
                     log_msg("ERROR: swr init failed: %s", av_err2str(ret));
+                    /* Free the half-built context — a non-NULL but
+                     * uninitialized swr_ctx skipped this branch forever
+                     * and silenced the track for the whole file. */
+                    swr_free(&ps->swr_ctx);
                     return -1;
                 }
+                av_channel_layout_copy(&ps->swr_in_layout,
+                                       &ps->audio_frame->ch_layout);
+                ps->swr_in_format = ps->audio_frame->format;
+                ps->swr_in_rate   = ps->audio_frame->sample_rate;
             }
 
             int out_samples = swr_get_out_samples(ps->swr_ctx, ps->audio_frame->nb_samples);
+            if (out_samples < 0) return -1;
             int out_size = out_samples * 2 * 4;
 
-            if (!ps->audio_buf || out_size > AUDIO_BUF_SIZE) {
+            /* HEAP-OVERFLOW FIX: the old code re-malloc'd the SAME
+             * AUDIO_BUF_SIZE when out_size exceeded it, then told
+             * swr_convert the buffer held out_samples anyway — a large
+             * decoded frame plus heavy upsampling could write past the
+             * end of the allocation. Grow the buffer to fit instead. */
+            unsigned int need = (out_size > AUDIO_BUF_SIZE)
+                              ? (unsigned int)out_size
+                              : (unsigned int)AUDIO_BUF_SIZE;
+            if (!ps->audio_buf || need > ps->audio_buf_cap) {
                 av_free(ps->audio_buf);
-                ps->audio_buf = av_malloc(AUDIO_BUF_SIZE);
-                if (!ps->audio_buf) return -1;
+                ps->audio_buf = av_malloc(need);
+                if (!ps->audio_buf) { ps->audio_buf_cap = 0; return -1; }
+                ps->audio_buf_cap = need;
             }
 
             uint8_t *out_buf = ps->audio_buf;
+            /* extended_data, not data: for planar layouts above 8 channels
+             * data[] holds only the first AV_NUM_DATA_POINTERS plane
+             * pointers — indexing past it walks into AVFrame struct
+             * memory interpreted as pointers. */
             int converted = swr_convert(ps->swr_ctx,
                 &out_buf, out_samples,
-                (const uint8_t **)ps->audio_frame->data,
+                (const uint8_t **)ps->audio_frame->extended_data,
                 ps->audio_frame->nb_samples);
 
             if (converted < 0) {
@@ -200,6 +241,30 @@ void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
 int audio_open(PlayerState *ps) {
     if (!ps->audio_codec_ctx) return -1;
 
+    /* ── Probe HDMI/DP sink capabilities if bitstream mode requested ──
+     * Reprobe on file open when the previous probe found no usable sink
+     * — covers the HDMI cable being plugged in after launch. A probe
+     * that found capabilities persists for the session as before. */
+    int caps_found = ps->bitstream_caps.support_ac3
+                  || ps->bitstream_caps.support_eac3
+                  || ps->bitstream_caps.support_truehd
+                  || ps->bitstream_caps.support_dts
+                  || ps->bitstream_caps.support_dtshd;
+    if (ps->audio_mode != AUDIO_MODE_PCM
+            && (!ps->bitstream_caps.probed || !caps_found)) {
+        if (bitstream_probe(&ps->bitstream_caps) == 0) {
+            /* Check if the current audio codec can pass through */
+            enum AVCodecID codec = ps->audio_codec_ctx->codec_id;
+            if (bitstream_can_passthrough(&ps->bitstream_caps, codec)) {
+                log_msg("Audio: codec %s is passthrough-eligible",
+                        avcodec_get_name(codec));
+                /* Phase 3 TODO: open SPDIF muxer + IEC958 device here.
+                 * For now, fall through to PCM — probe data is logged
+                 * and visible in the debug overlay. */
+            }
+        }
+    }
+
     SDL_AudioSpec spec;
     SDL_zero(spec);
     spec.format   = SDL_AUDIO_F32;    // was SDL_AUDIO_S16
@@ -217,7 +282,11 @@ int audio_open(PlayerState *ps) {
 
     ps->audio_spec = spec;
 
+    /* Free any existing buffer first — the sample-rate-change reopen in
+     * audio_cycle() previously leaked one allocation per reopen. */
+    if (ps->audio_buf) av_free(ps->audio_buf);
     ps->audio_buf       = av_malloc(AUDIO_BUF_SIZE);
+    ps->audio_buf_cap   = ps->audio_buf ? AUDIO_BUF_SIZE : 0;
     ps->audio_buf_size  = 0;
     ps->audio_buf_index = 0;
 
@@ -237,6 +306,14 @@ void audio_close(PlayerState *ps) {
         SDL_DestroyAudioStream(ps->audio_stream);
         ps->audio_stream = NULL;
     }
+    /* Invalidate the remembered device rate. audio_cycle's reopen
+     * decision compares the new track's rate against this — a stale
+     * value from a dead stream let the same-rate case skip the reopen
+     * entirely, setting audio_stream_idx with no device and no
+     * callback: demux refilled audio_pq, nothing drained it, and the
+     * queue-full throttle froze all playback (the resurrected-C3
+     * finding of the final review). */
+    ps->audio_spec.freq = 0;
 }
 
 
@@ -339,8 +416,23 @@ void audio_cycle(PlayerState *ps) {
     log_msg("Audio: switching to %s (stream %d)",
         ps->aud_stream_names[new_sel], new_stream_idx);
 
-    if (ps->audio_stream)
+    /* The demux thread's seek handler flushes audio_codec_ctx under
+     * seek_mutex; freeing/swapping the context here without that lock is a
+     * NULL-check-then-flush use-after-free (seek-then-A within the seek
+     * window, reachable via key auto-repeat). Same lock order as demux
+     * (seek_mutex, then stream lock) — no inversion. */
+    SDL_LockMutex(ps->seek_mutex);
+
+    if (ps->audio_stream) {
         SDL_PauseAudioStreamDevice(ps->audio_stream);
+        /* Barrier: pause stops FUTURE callbacks but does not wait for
+         * one already in flight. SDL runs the get-callback while holding
+         * the stream lock, so lock+unlock returns only after any
+         * in-flight audio_decode_frame() finishes — only then is it
+         * safe to free the codec and swr contexts below. */
+        SDL_LockAudioStream(ps->audio_stream);
+        SDL_UnlockAudioStream(ps->audio_stream);
+    }
 
     pq_flush(&ps->audio_pq);
 
@@ -357,9 +449,7 @@ void audio_cycle(PlayerState *ps) {
     if (!codec) {
         log_msg("ERROR: No decoder for audio codec %s",
             avcodec_get_name(as->codecpar->codec_id));
-        snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: codec error");
-        ps->aud_osd_until = get_time_sec() + 2.0;
-        return;
+        goto fail_video_only;
     }
 
     ps->audio_codec_ctx = avcodec_alloc_context3(codec);
@@ -370,17 +460,25 @@ void audio_cycle(PlayerState *ps) {
     if (ret < 0) {
         log_msg("ERROR: Cannot open audio codec: %s", av_err2str(ret));
         avcodec_free_context(&ps->audio_codec_ctx);
-        snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: codec error");
-        ps->aud_osd_until = get_time_sec() + 2.0;
-        return;
+        goto fail_video_only;
     }
 
     int new_rate = ps->audio_codec_ctx->sample_rate;
-    if (new_rate != ps->audio_spec.freq) {
-        log_msg("Audio: sample rate changed %d -> %d, reopening stream",
+    /* Reopen when the rate changed OR when there is no live stream at
+     * all (recovering from an earlier audio failure — the whole reason
+     * the user is pressing A). Keying on rate alone let the common
+     * same-rate case land in the success path with a codec but no
+     * device: the total-playback freeze class, resurrected. */
+    if (!ps->audio_stream || new_rate != ps->audio_spec.freq) {
+        log_msg("Audio: %s (rate %d -> %d)",
+            ps->audio_stream ? "sample rate changed, reopening stream"
+                             : "no live stream, reopening device",
             ps->audio_spec.freq, new_rate);
         audio_close(ps);
-        audio_open(ps);
+        if (audio_open(ps) < 0) {
+            avcodec_free_context(&ps->audio_codec_ctx);
+            goto fail_video_only;
+        }
     }
 
     ps->aud_selection    = new_sel;
@@ -389,16 +487,45 @@ void audio_cycle(PlayerState *ps) {
     log_msg("Audio: now playing %s (%s %dHz)",
         ps->aud_stream_names[new_sel], codec->name, new_rate);
 
-    double pos = ps->audio_clock_sync;
+    /* Recovery seek target: prefer the live video clock — after an
+     * audio failure, audio_clock_sync is frozen at the moment audio
+     * died and would yank playback back to a stale position. */
+    double pos = (ps->video_stream_idx >= 0) ? ps->video_clock
+                                             : ps->audio_clock_sync;
     if (pos < 0.1) pos = 0.1;
     ps->seek_target  = (int64_t)(pos * AV_TIME_BASE);
     ps->seek_flags   = AVSEEK_FLAG_BACKWARD;
     ps->seek_request = 1;
 
-    if (ps->audio_stream && !ps->paused)
-        SDL_ResumeAudioStreamDevice(ps->audio_stream);
+    SDL_UnlockMutex(ps->seek_mutex);
+
+    /* No device resume here: the recovery seek just issued keeps audio
+     * paused until the first post-seek frame displays (main.c's
+     * seek-recovery resume). Resuming here raced the demux seek
+     * handler's own pause — a resume after its pause let audio run
+     * ahead during recovery. */
 
     snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: %s",
         ps->aud_stream_names[new_sel]);
+    ps->aud_osd_until = get_time_sec() + 2.0;
+    return;
+
+fail_video_only:
+    /* The old track is already torn down; leaving audio_stream_idx pointing
+     * at it would keep demux queueing packets nothing drains — the queue-full
+     * throttle then stalls all playback permanently, with the device paused.
+     * Drop to video-only on the video clock instead. audio_close() must
+     * happen under seek_mutex: the demux seek path touches audio_stream. */
+    ps->audio_stream_idx = -1;
+    /* Flush AFTER clearing the index: demux routes without seek_mutex,
+     * so packets read during the failed codec-open window could land
+     * after an earlier flush and sit orphaned forever, blocking the
+     * EOF close condition (audio_pq must reach zero). Index first
+     * stops new routing; then the flush clears stragglers. */
+    pq_flush(&ps->audio_pq);
+    audio_close(ps);
+    SDL_UnlockMutex(ps->seek_mutex);
+    log_msg("Audio: track switch failed — continuing video-only");
+    snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Audio: codec error, audio off");
     ps->aud_osd_until = get_time_sec() + 2.0;
 }

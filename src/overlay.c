@@ -347,14 +347,17 @@ static void blit_rgba_scaled(uint8_t *buf, int bw, int bh,
             if (sa == 255 || dp[3] == 0) {
                 dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2]; dp[3] = sa;
             } else {
-                float sf = sa / 255.0f;
-                float df = dp[3] / 255.0f;
-                float of = sf + df * (1.0f - sf);
-                if (of > 0.0f) {
-                    dp[0] = (uint8_t)((sp[0]*sf + dp[0]*df*(1.0f-sf)) / of);
-                    dp[1] = (uint8_t)((sp[1]*sf + dp[1]*df*(1.0f-sf)) / of);
-                    dp[2] = (uint8_t)((sp[2]*sf + dp[2]*df*(1.0f-sf)) / of);
-                    dp[3] = (uint8_t)(of * 255.0f);
+                /* Integer "over" — was three float divides per pixel;
+                 * a full-width PGS bitmap at 4K is millions per frame.
+                 * 16.16-ish fixed point, same rounding within 1 LSB. */
+                unsigned sf = sa;                       /* 0..255 */
+                unsigned df = dp[3] * (255u - sf) / 255u;
+                unsigned of = sf + df;                  /* 0..255 */
+                if (of > 0) {
+                    dp[0] = (uint8_t)((sp[0]*sf + dp[0]*df) / of);
+                    dp[1] = (uint8_t)((sp[1]*sf + dp[1]*df) / of);
+                    dp[2] = (uint8_t)((sp[2]*sf + dp[2]*df) / of);
+                    dp[3] = (uint8_t)of;
                 }
             }
         }
@@ -366,6 +369,18 @@ static void blit_rgba_scaled(uint8_t *buf, int bw, int bh,
  * Set at the top of overlay_render() and overlay_render_idle()
  * before any draw calls. Multiplied into all hardcoded pixel
  * sizes (bar heights, margins, font scales, padding). */
+/* UI scale derives from the swapchain's physical height — NOT the
+ * fullscreen flag, which is only a proxy for "compositor scaled 2x" and
+ * is wrong in both directions: windowed on a HiDPI/4K display rendered
+ * half-size UI, fullscreen on a small panel doubled it for no reason.
+ * main.c's seekbar hit-testing calls this same function, so clicks
+ * cannot land where the bar is not. */
+int ui_scale_for(const PlayerState *ps, int sc_h) {
+    (void)ps;
+    if (sc_h >= 1600) return 2;
+    return 1;
+}
+
 static int s_ui_scale = 1;
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -380,7 +395,10 @@ static int s_ui_scale = 1;
 static void draw_seekbar(uint8_t *buf, int bw, int bh, PlayerState *ps) {
     double duration = (ps->fmt_ctx && ps->fmt_ctx->duration != AV_NOPTS_VALUE)
         ? (double)ps->fmt_ctx->duration / AV_TIME_BASE : 0.0;
-    double pos = ps->video_clock;
+    /* Audio-only files never update video_clock — show the audio
+     * playback position instead. */
+    double pos = (ps->video_stream_idx >= 0)
+        ? ps->video_clock : ps->audio_clock_sync;
     if (pos < 0.0) pos = 0.0;
     if (duration > 0.0 && pos > duration) pos = duration;
 
@@ -523,14 +541,15 @@ static void draw_text_panel(uint8_t *buf, int bw, int bh,
 /* ── Pause Indicator ── */
 static void draw_pause(uint8_t *buf, int bw, int bh) {
     const char *msg = "PAUSED";
-    int scale = 3;
+    int scale = 3 * s_ui_scale;   /* was fixed 3 — half-size in 4K */
     int tw = text_width(msg, scale);
     int th = FONT_H * scale;
     int x = (bw - tw) / 2;
     int y = (bh - th) / 2;
 
     fill_rect(buf, bw, bh,
-              x - 16, y - 12, tw + 32, th + 24,
+              x - 16 * s_ui_scale, y - 12 * s_ui_scale,
+              tw + 32 * s_ui_scale, th + 24 * s_ui_scale,
               0, 0, 0, 140);
     draw_text(buf, bw, bh, x, y, msg, scale, 200, 200, 200);
 }
@@ -542,14 +561,15 @@ static void draw_pause(uint8_t *buf, int bw, int bh) {
 static void draw_osd(uint8_t *buf, int bw, int bh, const char *text) {
     if (!text || !text[0]) return;
 
-    int scale = 2;
+    int scale = 2 * s_ui_scale;   /* was fixed 2 — half-size in 4K */
     int tw = text_width(text, scale);
     int th = FONT_H * scale;
     int x = (bw - tw) / 2;
-    int y = 30;
+    int y = 30 * s_ui_scale;
 
     fill_rect(buf, bw, bh,
-              x - 12, y - 8, tw + 24, th + 16,
+              x - 12 * s_ui_scale, y - 8 * s_ui_scale,
+              tw + 24 * s_ui_scale, th + 16 * s_ui_scale,
               0, 0, 0, 160);
     draw_text(buf, bw, bh, x, y, text, scale, 255, 223, 0);
 }
@@ -609,6 +629,28 @@ static void draw_menubar(uint8_t *buf, int bw, int bh) {
  * Rendered via SDL_ttf for proper Unicode support. The TTF surfaces
  * are blitted onto the overlay pixel buffer. Outline is drawn first
  * (black), then the main text (golden yellow) on top. */
+/* Rasterized-line cache: a caption is on screen for seconds but was
+ * re-rendered (glyph shaping + blending) every single frame. Keyed on
+ * the caption text and font size; invalidated when either changes. */
+#define SUB_RASTER_MAX 64
+static struct {
+    SDL_Surface *text;
+    SDL_Surface *outline;
+    int          w;
+} s_raster[SUB_RASTER_MAX];
+static int  s_raster_n = 0;
+static char s_raster_text[SUB_TEXT_SIZE] = {0};
+
+static void sub_raster_cache_invalidate(void) {
+    for (int i = 0; i < s_raster_n; i++) {
+        if (s_raster[i].text)    SDL_DestroySurface(s_raster[i].text);
+        if (s_raster[i].outline) SDL_DestroySurface(s_raster[i].outline);
+        s_raster[i].text = s_raster[i].outline = NULL;
+    }
+    s_raster_n = 0;
+    s_raster_text[0] = '\0';
+}
+
 static void draw_subtitles(uint8_t *buf, int bw, int bh, PlayerState *ps) {
     if (!ps->sub_valid || ps->sub_selection == 0) return;
 
@@ -651,12 +693,22 @@ static void draw_subtitles(uint8_t *buf, int bw, int bh, PlayerState *ps) {
     if (!font || !ps->sub_text[0]) return;
 
     /* Set font size relative to window height */
+    /* bh is physical pixels. The old 54px cap was a 1080p-era ceiling:
+     * at 4K it clamped 2160/24 = 90 to just over half the intended
+     * height. 96 accommodates 4K; the floor guards tiny windows. */
     int font_size = bh / 24;
     if (font_size < 14) font_size = 14;
-    if (font_size > 54) font_size = 54;
-    TTF_SetFontSize(font, font_size);
-    if (outline_font)
-        TTF_SetFontSize(outline_font, font_size);
+    if (font_size > 96) font_size = 96;
+    /* Resizes the fallback chain too — CJK/extended scripts used to
+     * stay at their 32pt open size regardless of window size. Only on
+     * change: this walks ~44 TTF_SetFontSize calls, and it ran on
+     * every rendered frame while a subtitle was on screen. */
+    static int s_sub_font_size = 0;
+    if (font_size != s_sub_font_size) {
+        sub_set_font_size(font_size);
+        s_sub_font_size = font_size;
+        sub_raster_cache_invalidate();
+    }
 
     /* Split text into lines */
     char text_buf[SUB_TEXT_SIZE];
@@ -673,34 +725,43 @@ static void draw_subtitles(uint8_t *buf, int bw, int bh, PlayerState *ps) {
 
     int line_height = TTF_GetFontLineSkip(font);
     int total_h = nlines * line_height;
-    int y_base = bh - 60 - total_h;
+    /* Bottom margin scales with the display — fixed 60 physical pixels
+     * pinned subtitles to the extreme bottom edge at 4K. */
+    int y_base = bh - (bh / 18) - total_h;
 
     SDL_Color fg      = { 255, 223, 0, 255 };   /* golden yellow */
     SDL_Color outline  = { 0, 0, 0, 255 };
 
-    for (int i = 0; i < nlines; i++) {
-        int tw = 0, th = 0;
-        TTF_GetStringSize(font, lines[i], 0, &tw, &th);
-        int x = (bw - tw) / 2;
+    /* Rasterize once per (text, size) — a caption holds for seconds,
+     * and re-rendering every line through TTF_RenderText_Blended on
+     * every frame was the heaviest recurring CPU cost in the overlay
+     * path. The cache holds the rendered surfaces; blitting them is
+     * all that remains per frame. */
+    if (s_raster_text[0] == '\0'
+            || strcmp(s_raster_text, ps->sub_text) != 0) {
+        sub_raster_cache_invalidate();
+        snprintf(s_raster_text, sizeof(s_raster_text), "%s", ps->sub_text);
+        s_raster_n = 0;
+        for (int i = 0; i < nlines && i < SUB_RASTER_MAX; i++) {
+            int tw = 0, th = 0;
+            TTF_GetStringSize(font, lines[i], 0, &tw, &th);
+            s_raster[i].w = tw;
+            s_raster[i].outline = outline_font
+                ? TTF_RenderText_Blended(outline_font, lines[i], 0, outline)
+                : NULL;
+            s_raster[i].text = TTF_RenderText_Blended(font, lines[i], 0, fg);
+            s_raster_n++;
+        }
+    }
+
+    int oo = outline_font ? TTF_GetFontOutline(outline_font) : 0;
+    for (int i = 0; i < s_raster_n; i++) {
+        int x = (bw - s_raster[i].w) / 2;
         int y = y_base + i * line_height;
-
-        /* Outline (rendered first, behind main text) */
-        if (outline_font) {
-            SDL_Surface *osurf = TTF_RenderText_Blended(
-                outline_font, lines[i], 0, outline);
-            if (osurf) {
-                int oo = TTF_GetFontOutline(outline_font);
-                blit_surface(buf, bw, bh, osurf, x - oo, y - oo);
-                SDL_DestroySurface(osurf);
-            }
-        }
-
-        /* Main text */
-        SDL_Surface *tsurf = TTF_RenderText_Blended(font, lines[i], 0, fg);
-        if (tsurf) {
-            blit_surface(buf, bw, bh, tsurf, x, y);
-            SDL_DestroySurface(tsurf);
-        }
+        if (s_raster[i].outline)
+            blit_surface(buf, bw, bh, s_raster[i].outline, x - oo, y - oo);
+        if (s_raster[i].text)
+            blit_surface(buf, bw, bh, s_raster[i].text, x, y);
     }
 }
 
@@ -726,7 +787,7 @@ void overlay_render_idle(PlayerState *ps) {
     int h = (ps->sc_h > 0) ? ps->sc_h : ps->win_h;
     if (w <= 0 || h <= 0) return;
 
-    s_ui_scale = ps->fullscreen ? 2 : 1;
+    s_ui_scale = ui_scale_for(ps, h);
 
     if (gpu_overlay_ensure(ps, w, h) < 0) {
         ps->overlay_active = 0;
@@ -815,7 +876,7 @@ void overlay_render_idle(PlayerState *ps) {
                   keys[i][1], key_scale, 130, 130, 140);
     }
 
-    gpu_overlay_upload(ps, s_pixels, w, h);
+    gpu_overlay_upload(ps, s_pixels, w, h, 0, h);
     ps->overlay_active = 1;
 }
 
@@ -840,7 +901,7 @@ void overlay_render(PlayerState *ps) {
         return;
     }
 
-    s_ui_scale = ps->fullscreen ? 2 : 1;
+    s_ui_scale = ui_scale_for(ps, h);
 
     double now = get_time_sec();
 
@@ -901,6 +962,10 @@ void overlay_render(PlayerState *ps) {
                (s_dirty_y1 - s_dirty_y0) * stride);
     }
 
+    /* Rows touched THIS tick = last frame's cleared band ∪ this frame's
+     * drawn band. That union is exactly what the GPU must re-read. */
+    int prev_y0 = s_dirty_y0, prev_y1 = s_dirty_y1;
+
     /* Reset per-frame dirty accumulator */
     s_frame_y0 = h;
     s_frame_y1 = 0;
@@ -914,11 +979,13 @@ void overlay_render(PlayerState *ps) {
 
     if (need_debug) {
         player_build_debug_info(ps);  /* refresh live data */
-        draw_text_panel(s_pixels, w, h, ps->debug_info, 10, 40, 2);
+        draw_text_panel(s_pixels, w, h, ps->debug_info,
+                        10 * s_ui_scale, 40 * s_ui_scale, 2 * s_ui_scale);
     }
 
     if (need_info)
-        draw_text_panel(s_pixels, w, h, ps->media_info, 10, 40, 2);
+        draw_text_panel(s_pixels, w, h, ps->media_info,
+                        10 * s_ui_scale, 40 * s_ui_scale, 2 * s_ui_scale);
 
     if (need_pause)
         draw_pause(s_pixels, w, h);
@@ -933,8 +1000,11 @@ void overlay_render(PlayerState *ps) {
     s_dirty_y0 = s_frame_y0;
     s_dirty_y1 = s_frame_y1;
 
-    /* ── Upload to GPU ── */
-    gpu_overlay_upload(ps, s_pixels, w, h);
+    /* ── Upload to GPU (changed rows only) ── */
+    int up_y0 = (prev_y0 < s_frame_y0) ? prev_y0 : s_frame_y0;
+    int up_y1 = (prev_y1 > s_frame_y1) ? prev_y1 : s_frame_y1;
+    if (up_y1 <= up_y0) { up_y0 = 0; up_y1 = 0; }  /* nothing changed */
+    gpu_overlay_upload(ps, s_pixels, w, h, up_y0, up_y1);
     ps->overlay_active = 1;
 }
 
@@ -947,4 +1017,5 @@ void overlay_cleanup(void) {
     s_pix_h  = 0;
     s_dirty_y0 = 0;
     s_dirty_y1 = 0;
+    sub_raster_cache_invalidate();
 }

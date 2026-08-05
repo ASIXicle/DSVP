@@ -7,14 +7,15 @@
 #   - MSYS2 MinGW64 toolchain (gcc, mingw32-make, pkg-config)
 #   - NSIS:  pacman -S mingw-w64-x86_64-nsis
 #
-# Output: DSVP-0.2.8-beta-setup.exe in repo root
+# Output: DSVP-0.3.0-beta-setup.exe in repo root
 
 param(
     [switch]$SkipBuild    # skip compilation, use existing DSVP-portable/
 )
 
 $ErrorActionPreference = "Stop"
-$version = "0.2.8-beta"
+# Version derives from src/dsvp.h — single source of truth, never hardcode here
+$version = (Select-String -Path "src/dsvp.h" -Pattern 'DSVP_VERSION\s+"([^"]+)"').Matches[0].Groups[1].Value
 
 Write-Host "`n=== DSVP Installer Builder v${version} ===" -ForegroundColor Cyan
 
@@ -67,7 +68,8 @@ if (-not $makensis) {
 }
 
 Write-Host "      Using: $makensis" -ForegroundColor DarkGray
-& $makensis installer\dsvp.nsi
+# Pass the dsvp.h-derived version in; dsvp.nsi's !define is only a fallback
+& $makensis "/DPRODUCT_VERSION=$version" installer\dsvp.nsi
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: NSIS compilation failed." -ForegroundColor Red
     exit 1

@@ -78,6 +78,95 @@ Output: `build/dsvp.exe` plus auto-copied DLLs (SDL3.dll, SDL3_ttf.dll, SDL3_sha
 
 ---
 
+## Updating dependencies (Linux)
+
+Point releases carry decoder and driver fixes worth having in release
+builds. The portable tarball and .deb bundle whatever the binary links
+against (package.sh walks the link dependencies), so upgrading a local
+prefix and rebuilding is all it takes — no packaging changes needed.
+
+### FFmpeg: 8.1 → 8.1.2 (drop-in, same branch, ~10 min)
+
+Bugfix releases on a branch are ABI-compatible. Rebuild the local
+prefix with the same configure line as the initial install:
+
+```bash
+cd ~/Documents
+wget https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
+tar xf ffmpeg-8.1.2.tar.xz
+cd ffmpeg-8.1.2
+./configure --prefix=$HOME/ffmpeg-8.1-local \
+    --enable-shared --disable-static \
+    --enable-gpl \
+    --disable-programs --disable-doc \
+    --disable-encoders --disable-muxers \
+    --enable-libdav1d
+make -j$(nproc)
+make install        # installs over the old 8.1 prefix — intended
+```
+
+DSVP now needs libavfilter (bwdif deinterlacing) — the configure line
+above builds it by default; do NOT add --disable-filters.
+
+Then relink DSVP and confirm the startup log line reads `FFmpeg 8.1.2`:
+
+```bash
+cd ~/Documents/DSVP/DSVP && make clean && make
+```
+
+### SDL3: distro package → upstream (worth it for release builds)
+
+Debian's libsdl3 lags upstream, and recent upstream releases carry SDL
+GPU Vulkan crash fixes and a PipeWire under-load fix that matter for
+DSVP specifically. Check what you have:
+
+```bash
+pkg-config --modversion sdl3
+```
+
+If it's below the current upstream release, build SDL3 + SDL3_ttf into
+a local prefix (does not touch the system packages):
+
+```bash
+cd ~/Documents
+git clone --depth 1 --branch release-3.4.12 https://github.com/libsdl-org/SDL
+cmake -S SDL -B SDL/build -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=$HOME/sdl3-local
+cmake --build SDL/build -j$(nproc) && cmake --install SDL/build
+
+# SDL3_ttf against the local SDL3 (pick the latest release tag)
+git clone --depth 1 --branch release-3.2.2 https://github.com/libsdl-org/SDL_ttf
+cmake -S SDL_ttf -B SDL_ttf/build -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=$HOME/sdl3-local \
+      -DCMAKE_PREFIX_PATH=$HOME/sdl3-local
+cmake --build SDL_ttf/build -j$(nproc) && cmake --install SDL_ttf/build
+```
+
+Put the local prefix FIRST in `PKG_CONFIG_PATH` and `LD_LIBRARY_PATH`
+(alongside the ffmpeg-8.1-local entries in `~/.bashrc`):
+
+```bash
+export PKG_CONFIG_PATH=$HOME/sdl3-local/lib/pkgconfig:$PKG_CONFIG_PATH
+export LD_LIBRARY_PATH=$HOME/sdl3-local/lib:$LD_LIBRARY_PATH
+```
+
+Rebuild (`make clean && make`), then verify which SDL the binary
+actually linked before packaging:
+
+```bash
+ldd build/dsvp | grep -E 'SDL3|avcodec'
+# should show ~/sdl3-local and ~/ffmpeg-8.1-local paths
+```
+
+`./package.sh` and `./installer/package-deb.sh` bundle exactly what ldd
+shows, so the release artifacts inherit the upgraded libraries
+automatically.
+
+On Windows, `pacman -Syu` in MSYS2 tracks SDL3/FFmpeg point releases —
+run it before a release build.
+
+---
+
 ## Linux (Debian/Ubuntu)
 
 ### Step 1: Install system packages
@@ -101,7 +190,7 @@ ffmpeg -version | head -1
 **If your system FFmpeg is 8.1+**, install the dev packages and skip to Step 3:
 
 ```bash
-sudo apt install libavformat-dev libavcodec-dev libswscale-dev \
+sudo apt install libavformat-dev libavcodec-dev libavfilter-dev libswscale-dev \
     libswresample-dev libavutil-dev
 ```
 
@@ -213,4 +302,4 @@ make debug          # Linux
 mingw32-make debug  # Windows
 ```
 
-This adds `-g -DDSVP_DEBUG`, which enables GPU validation layers, console output, verbose FFmpeg logging, and writes `dsvp.log` to the working directory.
+This adds `-g -DDSVP_DEBUG`, which enables GPU validation layers, console output, verbose FFmpeg logging, and writes `dsvp.log` next to the executable (working-directory fallback if unwritable).

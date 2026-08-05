@@ -7,16 +7,16 @@ WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer
 
 TODO: bitstream support and HDR autodetect/output. Soon. ish.
 
-There are portable Windows and Linux builds on the Releases page, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP-deck). The portable tarballs bundle all dependencies including FFmpeg 8.1 — just extract and run. Windows and Debian installers are also available.
+There are portable Windows and Linux builds on the Releases page, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP-deck). The portable tarballs bundle all dependencies including FFmpeg 8.1.2 — just extract and run. Windows and Debian installers are also available.
 
 REQUIRES Visual C++ Redistributable runtime on Windows (vcruntime140.dll). It's probably already on your PC but you can get it here:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170
 
 ## Installation
 
-**Windows:** Download `DSVP-0.2.8-beta-setup.exe` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and run it. Installs to Program Files with Start Menu shortcuts and an uninstaller. Alternatively, download the portable `.zip` — extract and run, no installation needed.
+**Windows:** Download `DSVP-0.3.0-beta-setup.exe` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and run it. Installs to Program Files with Start Menu shortcuts and an uninstaller. Alternatively, download the portable `.zip` — extract and run, no installation needed.
 
-**Debian/Ubuntu:** Download `dsvp_0.2.8-beta_amd64.deb` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and install with `sudo dpkg -i dsvp_0.2.8-beta_amd64.deb`. Bundles all dependencies. Run `dsvp` from a terminal or your application launcher.
+**Debian/Ubuntu:** Download `dsvp_0.3.0-beta_amd64.deb` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and install with `sudo dpkg -i dsvp_0.3.0-beta_amd64.deb`. Bundles all dependencies. Run `dsvp` from a terminal or your application launcher.
 
 **Steam Deck:** See [SteamOS.md](https://github.com/ASIXicle/DSVP-deck/blob/main/SteamOS.md) for the dedicated Steam Deck build with VAAPI hardware decode.
 
@@ -25,18 +25,18 @@ https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=ms
 ![Windows](https://img.shields.io/badge/Windows-supported-blue) ![Linux](https://img.shields.io/badge/Linux-supported-blue) ![Steam Deck](https://img.shields.io/badge/Steam_Deck-supported-1a9fff?logo=steam&logoColor=white) ![macOS](https://img.shields.io/badge/macOS-untested-yellow)
 ## Features
 
-- **Reference-quality playback** — Lanczos-2 luma scaling (anti-ringing clamp), Catmull-Rom chroma upsampling (siting-corrected), temporal blue noise dithering, faithful color/gamma/framerate
-- **HDR→SDR tone mapping** — BT.2390 EETF with dynamic scene-adaptive peak detection (99.875th percentile histogram, temporal smoothing), adjustable SDR target (203/300/400 nits) and midtone gain
-- **Dolby Vision** — Profile 5 and Profile 8 decode with per-frame RPU updates and piecewise polynomial reshaping driving HDR→SDR tone mapping
+- **Reference-quality playback** — Lanczos-2 luma scaling (anti-ringing clamp, footprint-dilated on downscale), Catmull-Rom chroma upsampling (siting-corrected), temporal blue noise dithering, gamma-2.2 reference output (`DSVP_OUTPUT_GAMMA=srgb|2.2|2.4`)
+- **HDR→SDR tone mapping** — BT.2390 EETF with dynamic scene-adaptive peak detection (99.875th percentile histogram, temporal smoothing with scene-cut handling), HLG (BT.2100 OOTF), adjustable SDR target (203/300/400 nits) and midtone gain
+- **Dolby Vision** — Profile 5 and Profile 8 decode with per-frame RPU updates; piecewise polynomial luma and MMR cross-channel chroma reshaping driving HDR→SDR tone mapping
 - **10-bit passthrough** — YUV420P10LE content uploads as R16_UNORM planar textures with no truncation
-- **Software decode only** — no hardware decode, no driver quirks, bit-exact output
-- **Supports everything FFmpeg supports** — H.264, HEVC, AV1, VP9, VC-1, MKV, MP4, and hundreds more
+- **Software decode only** — no hardware decode, no driver quirks, bit-exact decode
+- **Supports everything FFmpeg supports** — H.264, HEVC, AV1, VP9, VC-1, MKV, MP4, and hundreds more; interlaced content deinterlaces automatically (bwdif, engaged only when frames are flagged interlaced — `DSVP_DEINT=0|1` overrides)
 - **Multi-threaded decoding** — adaptive thread count per codec (HEVC up to 12, H.264 up to 8, others up to 16), capped to logical CPU count
 - **Full subtitle support** — text (SRT, ASS/SSA), bitmap (PGS, VobSub), CJK fallback fonts, golden yellow with black outline, cycle tracks with `S`
 - **Folder navigation** — `B`/`N` keys to jump between media files in the current folder, with clickable prev/next buttons
 - **Portable or installed** — Windows installer and Debian `.deb` package, or extract-and-run portable tarballs with all dependencies bundled
-- **Secure** — no networking capabilities whatsoever
-- **Cross-platform** — Vulkan on Windows/Linux, Metal on macOS
+- **Secure** — no networking, enforced: file opening runs under an FFmpeg protocol whitelist (`file` only), so even URL arguments cannot touch the network
+- **Cross-platform** — Vulkan on Windows/Linux (macOS untested)
 
 ## Controls
 
@@ -108,7 +108,7 @@ The binary lands in `build/dsvp.exe` with all required DLLs auto-copied.
 ```bash
 makensis installer/dsvp.nsi
 ```
-Produces `DSVP-0.2.8-beta-setup.exe` in the repo root.
+Produces `DSVP-0.3.0-beta-setup.exe` in the repo root.
 
 ### Linux (Debian/Ubuntu)
 
@@ -119,7 +119,7 @@ sudo apt install gcc make pkg-config \
     zlib1g-dev fonts-dejavu-core fonts-noto-cjk zenity
 ```
 
-> **FFmpeg 8.1+ required.** Debian/Ubuntu may ship an older version (check with `ffmpeg -version`). If your system FFmpeg is below 8.1, see [SETUP.md](SETUP.md) for instructions on building FFmpeg 8.1 from source into a local prefix. The portable tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/) bundles FFmpeg 8.1 and requires no system FFmpeg.
+> **FFmpeg 8.1+ required.** Debian/Ubuntu may ship an older version (check with `ffmpeg -version`). If your system FFmpeg is below 8.1, see [SETUP.md](SETUP.md) for instructions on building FFmpeg 8.1 from source into a local prefix. The portable tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/) bundles FFmpeg 8.1.2 and requires no system FFmpeg.
 
 **2. SDL3_shadercross** is bundled in `shadercross/SDL3_shadercross-3.0.0-linux-x64/`. No action needed — the Makefile finds it automatically.
 
@@ -152,7 +152,7 @@ Binary: `build/dsvp`
 ```bash
 ./installer/package-deb.sh
 ```
-Produces `dsvp_0.2.8-beta_amd64.deb` in the repo root. Builds, packages, and assembles the `.deb` in one step. Use `--skip-build` to repackage without recompiling.
+Produces `dsvp_0.3.0-beta_amd64.deb` in the repo root. Builds, packages, and assembles the `.deb` in one step. Use `--skip-build` to repackage without recompiling.
 
 ### macOS (untested as of 3/16/26)
 
@@ -176,6 +176,7 @@ DSVP/
     player.c     ← Demux thread, video decode/display, GPU pipelines, HLSL shaders, seeking, media info
     audio.c      ← Audio decode, resample, SDL3 audio stream, A/V clock, track cycling
     subtitle.c   ← Subtitle detection, decode, SDL3_ttf rendering, CJK fallback fonts
+    bitstream.c  ← HDMI sink EDID probe for audio passthrough (Phase 3 scaffolding)
     overlay.c    ← GPU-composited overlays: bitmap font, seek bar, debug/info panels, OSD, subtitles
     log.c        ← Crash-safe unbuffered file logger
   installer/
@@ -204,11 +205,11 @@ make debug          # Linux/macOS
 mingw32-make debug  # Windows
 ```
 
-Enables GPU validation layers, console output, verbose FFmpeg logging, and debug symbols. A `dsvp.log` file is written to the working directory.
+Enables GPU validation layers, console output, verbose FFmpeg logging, and debug symbols. A `dsvp.log` file is written next to the executable (falling back to the working directory if that location is unwritable).
 
 ## AI Disclosure
 
-Built with the assistance of Claude Opus 4.6 and 4.7 (Anthropic).
+Built with the assistance of Claude Opus and Fable (Anthropic).
 
 ## License
 

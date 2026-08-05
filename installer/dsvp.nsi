@@ -7,12 +7,16 @@
 ;   2. Install NSIS:  pacman -S mingw-w64-x86_64-nsis
 ;   3. Build:         makensis installer/dsvp.nsi
 ;
-; Output: DSVP-0.2.8-beta-setup.exe in repo root
+; Output: DSVP-0.3.0-beta-setup.exe in repo root
 ;
 ; ─── Configuration ──────────────────────────────────────────────
 
 !define PRODUCT_NAME    "DSVP"
-!define PRODUCT_VERSION "0.2.8-beta"
+; Version is passed by build-installer.ps1 from src/dsvp.h (/DPRODUCT_VERSION=...).
+; This fallback exists only for a bare `makensis installer\dsvp.nsi` invocation.
+!ifndef PRODUCT_VERSION
+!define PRODUCT_VERSION "0.3.0-beta"
+!endif
 !define PRODUCT_PUBLISHER "Holden"
 !define PRODUCT_WEB     "https://github.com/ASIXicle/DSVP"
 !define PRODUCT_EXE     "dsvp.exe"
@@ -24,8 +28,9 @@ Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 ; Output installer filename
 OutFile "..\DSVP-${PRODUCT_VERSION}-setup.exe"
 
-; Default installation directory
-InstallDir "$PROGRAMFILES\${PRODUCT_NAME}"
+; Default installation directory — 64-bit binary belongs in the 64-bit
+; Program Files, and HKLM writes must not be WOW64-redirected.
+InstallDir "$PROGRAMFILES64\${PRODUCT_NAME}"
 
 ; Request admin privileges for Program Files install
 RequestExecutionLevel admin
@@ -57,6 +62,16 @@ RequestExecutionLevel admin
 !insertmacro MUI_LANGUAGE "English"
 
 ; ─── Installer Sections ────────────────────────────────────────
+
+; 64-bit registry view — without this, HKLM writes from a 32-bit makensis
+; land under WOW6432Node while the 64-bit app looks in the native view.
+Function .onInit
+    SetRegView 64
+FunctionEnd
+
+Function un.onInit
+    SetRegView 64
+FunctionEnd
 
 Section "DSVP (required)" SecCore
     SectionIn RO  ; read-only — always installed
