@@ -504,7 +504,11 @@ static void set_fullscreen(PlayerState *ps, SDL_Window *window, bool want_fs) {
 
     if (ps->playing) {
         ps->frame_timer = get_time_sec();
-        if (!ps->paused && ps->audio_stream)
+        /* Same gate as the device-removed handler: resuming during an
+         * in-flight seek plays run-ahead audio through the recovery
+         * window, then recovery clears and clock-snaps it. */
+        if (!ps->paused && !ps->seek_request && !ps->seek_recovering
+                && ps->audio_stream)
             SDL_ResumeAudioStreamDevice(ps->audio_stream);
     }
     log_msg("FS: %s", want_fs ? "entered fullscreen (borderless)"
@@ -646,6 +650,25 @@ int main(int argc, char *argv[]) {
         SDL_GPU_PRESENTMODE_VSYNC);
     log_msg("GPU: swapchain set to SDR + VSync");
 
+    /* Swapchain-depth diagnostic knob (2026-08-08 pacing
+     * investigation). KWin Wayland fullscreen showed multi-vsync
+     * swapchain acquires; a third image was the queue-depth test
+     * (field: no effect on dellbian — kept as a diagnostic). */
+    const char *fif_env = SDL_getenv("DSVP_FRAMES_IN_FLIGHT");
+    if (fif_env && *fif_env) {
+        int fif = SDL_atoi(fif_env);
+        if (fif >= 1 && fif <= 3) {
+            if (SDL_SetGPUAllowedFramesInFlight(gpu_device, fif))
+                log_msg("GPU: frames in flight set to %d (env)", fif);
+            else
+                log_msg("GPU: frames-in-flight request failed: %s",
+                        SDL_GetError());
+        } else {
+            log_msg("GPU: DSVP_FRAMES_IN_FLIGHT=%s ignored (want 1-3)",
+                    fif_env);
+        }
+    }
+
     /* ── Initialize subtitle font (Phase 2 will use for GPU overlay) ── */
     if (sub_init_font() < 0) {
         log_msg("WARNING: Subtitle rendering disabled (no font)");
@@ -755,10 +778,13 @@ int main(int argc, char *argv[]) {
                         }
                     } else {
                         log_msg("File dialog cancelled");
-                        /* Resume audio and resync frame timer */
+                        /* Resume audio and resync frame timer (not
+                         * during an in-flight seek — its recovery
+                         * path owns the resume then) */
                         if (was_playing && ps.audio_stream) {
                             ps.frame_timer = get_time_sec();
-                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                            if (!ps.seek_request && !ps.seek_recovering)
+                                SDL_ResumeAudioStreamDevice(ps.audio_stream);
                         }
                     }
                     break;
@@ -770,8 +796,9 @@ int main(int argc, char *argv[]) {
                         if (ps.audio_stream) {
                             if (ps.paused)
                                 SDL_PauseAudioStreamDevice(ps.audio_stream);
-                            else
+                            else if (!ps.seek_request && !ps.seek_recovering)
                                 SDL_ResumeAudioStreamDevice(ps.audio_stream);
+                            /* else: seek recovery owns the resume */
                         }
                         if (!ps.paused) {
                             ps.frame_timer = get_time_sec();
@@ -1339,7 +1366,17 @@ int main(int argc, char *argv[]) {
                  *   Backward seek: video_clock < audio_clock → massive
                  *     negative drift, burst of frame drops.
                  */
-                if (ps.seek_recovering) {
+                if (ps.seek_recovering
+                        && ps.video_frame_serial
+                           == ps.video_frame_q.flush_serial) {
+                    /* Serial gate: main can legitimately pop a PRE-seek
+                     * frame and spend 5-20ms displaying it while the
+                     * demux thread completes the ENTIRE seek — without
+                     * this check, recovery resynced every clock to the
+                     * pre-seek position (the consumer-side twin of the
+                     * fq_put expect_serial bug; see that comment). A
+                     * mismatched serial just means: not the recovery
+                     * frame yet, keep waiting. */
                     ps.seek_recovering = 0;
                     ps.seek_recovering_start = 0.0;
                     ps.frame_timer = get_time_sec();
@@ -1426,6 +1463,49 @@ int main(int argc, char *argv[]) {
                         av_now * 1000.0,
                         ps.diag_max_av_drift * 1000.0,
                         ps.av_bias * 1000.0);
+#ifdef DSVP_PROFILE
+#define PROF_AVG(sum, n) ((n) > 0 ? (sum) / (n) : 0.0)
+                if (ps.prof_n > 0 || ps.prof_rb_n > 0
+                        || ps.prof_dec_n > 0) {
+                    log_msg("PROF: [%.0fs] disp n=%d "
+                            "upload=%.1f/%.1f peak=%.1f/%.1f "
+                            "vsync=%.1f/%.1f render=%.1f/%.1f "
+                            "total=%.1f/%.1f | reblit n=%d "
+                            "vsync=%.1f/%.1f total=%.1f/%.1f | "
+                            "decode n=%d %.1f/%.1f (avg/max ms)",
+                            ps.video_clock, ps.prof_n,
+                            PROF_AVG(ps.prof_sum_upload, ps.prof_n),
+                            ps.prof_max_upload,
+                            PROF_AVG(ps.prof_sum_peak, ps.prof_n),
+                            ps.prof_max_peak,
+                            PROF_AVG(ps.prof_sum_vsync, ps.prof_n),
+                            ps.prof_max_vsync,
+                            PROF_AVG(ps.prof_sum_render, ps.prof_n),
+                            ps.prof_max_render,
+                            PROF_AVG(ps.prof_sum_total, ps.prof_n),
+                            ps.prof_max_total,
+                            ps.prof_rb_n,
+                            PROF_AVG(ps.prof_sum_rb_vsync, ps.prof_rb_n),
+                            ps.prof_max_rb_vsync,
+                            PROF_AVG(ps.prof_sum_rb_total, ps.prof_rb_n),
+                            ps.prof_max_rb_total,
+                            ps.prof_dec_n,
+                            PROF_AVG(ps.prof_sum_decode, ps.prof_dec_n),
+                            ps.prof_max_decode);
+                    ps.prof_n = 0;
+                    ps.prof_sum_upload = ps.prof_max_upload = 0.0;
+                    ps.prof_sum_peak   = ps.prof_max_peak   = 0.0;
+                    ps.prof_sum_vsync  = ps.prof_max_vsync  = 0.0;
+                    ps.prof_sum_render = ps.prof_max_render = 0.0;
+                    ps.prof_sum_total  = ps.prof_max_total  = 0.0;
+                    ps.prof_rb_n = 0;
+                    ps.prof_sum_rb_vsync = ps.prof_max_rb_vsync = 0.0;
+                    ps.prof_sum_rb_total = ps.prof_max_rb_total = 0.0;
+                    ps.prof_dec_n = 0;
+                    ps.prof_sum_decode = ps.prof_max_decode = 0.0;
+                }
+#undef PROF_AVG
+#endif
                 ps.diag_last_report = now;
             }
 
@@ -1483,10 +1563,15 @@ int main(int argc, char *argv[]) {
             overlay_render(&ps);
             if (!ps.show_seekbar && !ps.show_debug && !ps.show_info)
                 SDL_HideCursor();
-            if (ps.gpu_tex_y) {
+            if (ps.gpu_tex_y && ps.video_ready) {
                 video_reblit(&ps);
             } else if (ps.video_stream_idx < 0) {
                 /* Audio-only: no video texture — background + overlay */
+                gpu_submit_background(&ps);
+            } else {
+                /* Paused before the first decoded frame: the textures
+                 * exist but were never uploaded — reblitting samples
+                 * undefined memory (and caches it). Background instead. */
                 gpu_submit_background(&ps);
             }
         } else {

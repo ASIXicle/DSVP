@@ -795,10 +795,19 @@ void overlay_render_idle(PlayerState *ps) {
     }
 
     size_t buf_size = (size_t)w * h * 4;
-    if (s_pix_w != w || s_pix_h != h) {
+    if (s_pix_w != w || s_pix_h != h || ps->overlay_force_full) {
+        /* force_full: texture was recreated (possibly at identical
+         * dims) — the buffer may hold stale last-session pixels, so
+         * take the full-realloc-and-wipe path. */
         free(s_pixels);
         s_pixels = malloc(buf_size);
-        if (!s_pixels) { ps->overlay_active = 0; return; }
+        if (!s_pixels) {
+            /* Stale dims + NULL buffer = NULL deref when the window
+             * returns to this size and the "unchanged" test passes. */
+            s_pix_w = s_pix_h = 0;
+            ps->overlay_active = 0;
+            return;
+        }
         s_pix_w = w;
         s_pix_h = h;
     }
@@ -876,6 +885,8 @@ void overlay_render_idle(PlayerState *ps) {
                   keys[i][1], key_scale, 130, 130, 140);
     }
 
+    ps->overlay_force_full = 0;   /* full-height upload defines the
+                                    * freshly created texture entirely */
     gpu_overlay_upload(ps, s_pixels, w, h, 0, h);
     ps->overlay_active = 1;
 }
@@ -945,10 +956,19 @@ void overlay_render(PlayerState *ps) {
 
     /* ── Ensure pixel buffer ── */
     size_t buf_size = (size_t)w * h * 4;
-    if (s_pix_w != w || s_pix_h != h) {
+    if (s_pix_w != w || s_pix_h != h || ps->overlay_force_full) {
+        /* force_full: texture was recreated (possibly at identical
+         * dims) — the buffer may hold stale last-session pixels, so
+         * take the full-realloc-and-wipe path. */
         free(s_pixels);
         s_pixels = malloc(buf_size);
-        if (!s_pixels) { ps->overlay_active = 0; return; }
+        if (!s_pixels) {
+            /* Stale dims + NULL buffer = NULL deref when the window
+             * returns to this size and the "unchanged" test passes. */
+            s_pix_w = s_pix_h = 0;
+            ps->overlay_active = 0;
+            return;
+        }
         s_pix_w = w;
         s_pix_h = h;
         /* Full clear on resize — no valid dirty tracking yet */
@@ -1004,6 +1024,16 @@ void overlay_render(PlayerState *ps) {
     int up_y0 = (prev_y0 < s_frame_y0) ? prev_y0 : s_frame_y0;
     int up_y1 = (prev_y1 > s_frame_y1) ? prev_y1 : s_frame_y1;
     if (up_y1 <= up_y0) { up_y0 = 0; up_y1 = 0; }  /* nothing changed */
+    if (ps->overlay_force_full) {
+        /* Texture was just (re)created — its GPU contents are
+         * undefined and the dirty window only covers what was drawn
+         * this frame (possibly nothing). Wipe the buffer rows we
+         * won't redraw and upload the full height once so every
+         * texel is defined; zeros are transparent. */
+        up_y0 = 0;
+        up_y1 = h;
+        ps->overlay_force_full = 0;
+    }
     gpu_overlay_upload(ps, s_pixels, w, h, up_y0, up_y1);
     ps->overlay_active = 1;
 }

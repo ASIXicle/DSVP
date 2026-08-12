@@ -1,5 +1,5 @@
 #!/bin/bash
-# DSVP Portable Packaging Script (Linux/macOS)
+# DSVP Portable Packaging Script (Linux)
 # Creates a self-contained DSVP-portable/ folder with binary + shared libs.
 #
 # Usage:
@@ -10,6 +10,10 @@ set -e
 
 # Version derives from src/dsvp.h — single source of truth, never hardcode here
 VERSION=$(sed -n 's/.*DSVP_VERSION *"\(.*\)"/\1/p' src/dsvp.h)
+if [ -z "$VERSION" ]; then
+    echo "ERROR: could not extract DSVP_VERSION from src/dsvp.h"
+    exit 1
+fi
 OUTDIR="DSVP-portable"
 SKIP_BUILD=0
 
@@ -37,6 +41,17 @@ if [ ! -f "build/dsvp" ]; then
     exit 1
 fi
 
+# Refuse to package with unresolved libraries. The bundling walk below
+# has no path field for a "not found" line and would SILENTLY skip it —
+# a clean shell / sudo / CI run (no interactive LD_LIBRARY_PATH) used
+# to produce a tarball missing every FFmpeg/SDL lib, exit code 0.
+if ldd build/dsvp | grep -q "not found"; then
+    echo "ERROR: unresolved shared libraries — export LD_LIBRARY_PATH for"
+    echo "       your ffmpeg/sdl prefixes (see SETUP.md) and retry:"
+    ldd build/dsvp | grep "not found"
+    exit 1
+fi
+
 # ── Create output directory ────────────────────────────────────────
 
 echo "[2/5] Creating ${OUTDIR}/"
@@ -47,6 +62,7 @@ mkdir -p "$OUTDIR/lib"
 
 echo "[3/5] Copying binary..."
 cp build/dsvp "$OUTDIR/"
+cp LICENSE "$OUTDIR/"   # GPL-3: binary distribution requires the license text
 
 # ── Bundle shared libraries ───────────────────────────────────────
 
@@ -70,6 +86,11 @@ if [ "$(uname)" = "Linux" ]; then
         for so in "$SC_LIB"/*.so.*; do
             if [ -f "$so" ] && [ ! -L "$so" ]; then
                 base=$(basename "$so")
+                case "$base" in
+                    libSDL3.so.*) continue ;;  # CI artifact's own SDL —
+                        # the real one arrives via ldd; bundling this
+                        # 0.5.0 copy is dead weight and a rename trap
+                esac
                 if [ ! -f "$OUTDIR/lib/$base" ]; then
                     cp "$so" "$OUTDIR/lib/"
                     echo "      $base (shadercross)"
@@ -100,62 +121,6 @@ if [ "$(uname)" = "Linux" ]; then
 # DSVP launcher — sets library path for bundled shared libs
 DIR="$(cd "$(dirname "$0")" && pwd)"
 export LD_LIBRARY_PATH="$DIR/lib:$LD_LIBRARY_PATH"
-exec "$DIR/dsvp" "$@"
-LAUNCHER
-    chmod +x "$OUTDIR/dsvp.sh"
-    echo "      Created launcher: dsvp.sh"
-
-    # Create README
-    cat > "$OUTDIR/README.txt" << 'README'
-DSVP — Dead Simple Video Player
-
-Run:
-  ./dsvp.sh                        Open DSVP (press O to open a file)
-  ./dsvp.sh /path/to/movie.mkv    Open a file directly
-
-Do NOT run ./dsvp directly — the launcher script sets up the bundled libraries.
-
-Controls:
-  O          Open file
-  Q          Quit / close file
-  Space      Pause / resume
-  F          Toggle fullscreen
-  S          Cycle subtitle tracks
-  A          Cycle audio tracks
-  Left/Right Seek ±5 seconds
-  Up/Down    Volume
-  B/N        Previous / next file in folder
-  D          Debug overlay
-  I          Media info overlay
-  H          Cycle HDR debug views (normal/comparison/PQ bypass/grayscale)
-  T          Cycle SDR target nits (203/300/400)
-  G          Cycle midtone gain (1.0/1.1/1.2/1.3/1.35/1.4)
-
-More info: https://github.com/ASIXicle/DSVP
-README
-    echo "      Created README.txt"
-fi
-
-if [ "$(uname)" = "Darwin" ]; then
-    # On macOS, use otool to find dylibs
-    SYSTEM_LIBS="/usr/lib/|/System/"
-
-    otool -L build/dsvp | tail -n +2 | awk '{print $1}' | \
-        grep -vE "$SYSTEM_LIBS" | sort -u | while read -r lib; do
-        if [ -f "$lib" ]; then
-            cp "$lib" "$OUTDIR/lib/"
-            echo "      $(basename "$lib")"
-        fi
-    done
-
-    LIB_COUNT=$(ls -1 "$OUTDIR/lib/" 2>/dev/null | wc -l)
-    echo "      Bundled $LIB_COUNT dylibs"
-
-    # Create launcher script
-    cat > "$OUTDIR/dsvp.sh" << 'LAUNCHER'
-#!/bin/bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-export DYLD_LIBRARY_PATH="$DIR/lib:$DYLD_LIBRARY_PATH"
 exec "$DIR/dsvp" "$@"
 LAUNCHER
     chmod +x "$OUTDIR/dsvp.sh"

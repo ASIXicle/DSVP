@@ -85,32 +85,60 @@ builds. The portable tarball and .deb bundle whatever the binary links
 against (package.sh walks the link dependencies), so upgrading a local
 prefix and rebuilding is all it takes — no packaging changes needed.
 
-### FFmpeg: 8.1 → 8.1.2 (drop-in, same branch, ~10 min)
+### FFmpeg: major version bump (e.g. 8.1.x → 9.0) — NEW prefix
 
-Bugfix releases on a branch are ABI-compatible. Rebuild the local
-prefix with the same configure line as the initial install:
+Major bumps change sonames, so they get their own prefix: the old one
+stays on disk as an instant rollback (re-aim two `~/.bashrc` lines and
+rebuild). Bugfix releases within a branch instead over-install the
+same prefix with the same configure.
 
 ```bash
 cd ~/Documents
-wget https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz
-tar xf ffmpeg-8.1.2.tar.xz
-cd ffmpeg-8.1.2
-./configure --prefix=$HOME/ffmpeg-8.1-local \
+wget https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz
+tar xf ffmpeg-9.0.tar.xz
+cd ffmpeg-9.0
+./configure --prefix=$HOME/ffmpeg-9.0-local \
     --enable-shared --disable-static \
     --enable-gpl \
     --disable-programs --disable-doc \
     --disable-encoders --disable-muxers \
+    --enable-muxer=spdif \
     --enable-libdav1d
 make -j$(nproc)
-make install        # installs over the old 8.1 prefix — intended
+make install
 ```
 
-DSVP now needs libavfilter (bwdif deinterlacing) — the configure line
-above builds it by default; do NOT add --disable-filters.
+Every flag is load-bearing; three have bitten before:
 
-Then relink DSVP and confirm the startup log line reads `FFmpeg 8.1.2`:
+- `--enable-gpl`: bwdif deinterlacing is a GPL filter — without this
+  it silently vanishes from libavfilter and interlaced content
+  breaks. (Field case 2026-08-10: a 9.0 build made from the deck
+  repo's configure — which doesn't deinterlace — shipped without it.)
+- `--enable-muxer=spdif`: bitstream.c frames passthrough audio with
+  the spdif muxer; a plain `--disable-muxers` eats it silently and
+  passthrough degrades to PCM with only a log line to show for it.
+  (The original 8.1 prefix had exactly this hole on Linux; Windows
+  never saw it because MSYS2 ships full FFmpeg.)
+- NO `--enable-vaapi`: the x64 tree is software-decode only — the
+  flag adds nothing and fails configure when libva-dev is absent.
+  (VAAPI is a DSVP-deck thing; the repos have diverged.)
+
+Do NOT add `--disable-filters` — libavfilter must build.
+
+Re-aim `~/.bashrc` (comment the old lines — that comment IS the
+rollback):
 
 ```bash
+# export PKG_CONFIG_PATH="$HOME/ffmpeg-8.1-local/lib/pkgconfig:$PKG_CONFIG_PATH"
+# export LD_LIBRARY_PATH="$HOME/ffmpeg-8.1-local/lib:$LD_LIBRARY_PATH"
+export PKG_CONFIG_PATH="$HOME/ffmpeg-9.0-local/lib/pkgconfig:$HOME/sdl3-local/lib/pkgconfig:$PKG_CONFIG_PATH"
+export LD_LIBRARY_PATH="$HOME/ffmpeg-9.0-local/lib:$HOME/sdl3-local/lib:$LD_LIBRARY_PATH"
+```
+
+Fresh shell (`exec bash`), then relink and confirm the startup line:
+
+```bash
+pkg-config --modversion libavcodec    # 63.x = FFmpeg 9.0
 cd ~/Documents/DSVP/DSVP && make clean && make
 ```
 
@@ -127,9 +155,26 @@ pkg-config --modversion sdl3
 If it's below the current upstream release, build SDL3 + SDL3_ttf into
 a local prefix (does not touch the system packages):
 
+Install the backend dev packages FIRST — a source SDL only enables
+backends whose headers it finds at configure time. Miss libwayland-dev
+and it silently builds X11-only, which changes presentation behavior:
+
+```bash
+sudo apt install -y cmake build-essential \
+  libwayland-dev wayland-protocols libxkbcommon-dev libdecor-0-dev \
+  libegl1-mesa-dev libgl1-mesa-dev libvulkan-dev \
+  libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+  libxfixes-dev libxtst-dev \
+  libpipewire-0.3-dev libasound2-dev libpulse-dev libudev-dev \
+  libdbus-1-dev libfreetype-dev libharfbuzz-dev
+```
+
+Then build (check cmake's summary for Wayland/Vulkan/PipeWire before
+letting it compile):
+
 ```bash
 cd ~/Documents
-git clone --depth 1 --branch release-3.4.12 https://github.com/libsdl-org/SDL
+git clone --depth 1 --branch release-3.4.14 https://github.com/libsdl-org/SDL
 cmake -S SDL -B SDL/build -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=$HOME/sdl3-local
 cmake --build SDL/build -j$(nproc) && cmake --install SDL/build
@@ -142,20 +187,22 @@ cmake -S SDL_ttf -B SDL_ttf/build -DCMAKE_BUILD_TYPE=Release \
 cmake --build SDL_ttf/build -j$(nproc) && cmake --install SDL_ttf/build
 ```
 
-Put the local prefix FIRST in `PKG_CONFIG_PATH` and `LD_LIBRARY_PATH`
-(alongside the ffmpeg-8.1-local entries in `~/.bashrc`):
+Note: newer SDL3_ttf installs its pkg-config file as `sdl3-ttf.pc`
+(lowercase) where older/distro packages used `SDL3_ttf.pc`. The
+Makefile probes both names — nothing to fix, but manual
+`pkg-config --modversion` checks need the name that exists:
+`pkg-config --modversion sdl3 sdl3-ttf`. Field result 2026-08-10:
+SDL 3.2.10 → 3.4.14 cut fullscreen Wayland present starvation on an
+Intel UHD 620 laptop by ~10x (multi_ticks 86-147 → 7 per 40s run) —
+this upgrade is worth it for desktop Linux users specifically.
 
-```bash
-export PKG_CONFIG_PATH=$HOME/sdl3-local/lib/pkgconfig:$PKG_CONFIG_PATH
-export LD_LIBRARY_PATH=$HOME/sdl3-local/lib:$LD_LIBRARY_PATH
-```
-
-Rebuild (`make clean && make`), then verify which SDL the binary
-actually linked before packaging:
+The `~/.bashrc` wiring above (FFmpeg section) already includes the
+sdl3-local entries. Rebuild (`make clean && make`), then verify which
+libraries the binary actually linked before packaging:
 
 ```bash
 ldd build/dsvp | grep -E 'SDL3|avcodec'
-# should show ~/sdl3-local and ~/ffmpeg-8.1-local paths
+# every line should resolve into ~/sdl3-local and ~/ffmpeg-9.0-local
 ```
 
 `./package.sh` and `./installer/package-deb.sh` bundle exactly what ldd
@@ -194,7 +241,7 @@ sudo apt install libavformat-dev libavcodec-dev libavfilter-dev libswscale-dev \
     libswresample-dev libavutil-dev
 ```
 
-**If your system FFmpeg is older (e.g. Debian ships 7.x)**, build FFmpeg 8.1 from source into a local prefix. This does not replace your system FFmpeg — it installs alongside it in your home directory.
+**If your system FFmpeg is older (e.g. Debian ships 7.x)**, build FFmpeg 9.0 from source into a local prefix. This does not replace your system FFmpeg — it installs alongside it in your home directory.
 
 ```bash
 # Install build dependencies
@@ -203,19 +250,24 @@ sudo apt install build-essential nasm yasm \
 
 # Download and extract
 cd ~/Documents
-wget https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz
-tar xf ffmpeg-8.1.tar.xz
-cd ffmpeg-8.1
+wget https://ffmpeg.org/releases/ffmpeg-9.0.tar.xz
+tar xf ffmpeg-9.0.tar.xz
+cd ffmpeg-9.0
 
-# Configure for decode-only (no CLI tools, no encoders — just the libraries DSVP links against)
-./configure --prefix=$HOME/ffmpeg-8.1-local \
+# Configure for decode-only (no CLI tools, no encoders — just the
+# libraries DSVP links against). Every flag is load-bearing — see the
+# annotated version in "Updating dependencies (Linux)" above; in
+# particular --enable-muxer=spdif (bitstream passthrough silently
+# degrades without it) and --enable-gpl (bwdif deinterlacing).
+./configure --prefix=$HOME/ffmpeg-9.0-local \
     --enable-shared --disable-static \
     --enable-gpl \
     --disable-programs --disable-doc \
     --disable-encoders --disable-muxers \
+    --enable-muxer=spdif \
     --enable-libdav1d
 
-# Build and install to ~/ffmpeg-8.1-local/
+# Build and install to ~/ffmpeg-9.0-local/
 make -j$(nproc)
 make install
 ```
@@ -223,8 +275,8 @@ make install
 Then set `PKG_CONFIG_PATH` so the DSVP Makefile finds the local FFmpeg, and `LD_LIBRARY_PATH` so the binary can find the `.so` files at runtime. Add both to your `~/.bashrc` for persistence:
 
 ```bash
-export PKG_CONFIG_PATH=$HOME/ffmpeg-8.1-local/lib/pkgconfig:$PKG_CONFIG_PATH
-export LD_LIBRARY_PATH=$HOME/ffmpeg-8.1-local/lib:$LD_LIBRARY_PATH
+export PKG_CONFIG_PATH=$HOME/ffmpeg-9.0-local/lib/pkgconfig:$PKG_CONFIG_PATH
+export LD_LIBRARY_PATH=$HOME/ffmpeg-9.0-local/lib:$LD_LIBRARY_PATH
 ```
 
 Verify it took effect:
@@ -232,7 +284,7 @@ Verify it took effect:
 ```bash
 source ~/.bashrc
 pkg-config --modversion libavcodec
-# Should print 62.28.100 (FFmpeg 8.1)
+# Should print 63.x (FFmpeg 9.0)
 ```
 
 ### Step 3: SDL3_shadercross
@@ -264,14 +316,14 @@ make
 
 Output: `build/dsvp`
 
-If you built FFmpeg from source, the binary will link against the 8.1 `.so` files. At runtime you'll need `LD_LIBRARY_PATH` to find them (or use `package.sh` which bundles everything):
+If you built FFmpeg from source, the binary links against your local prefix's `.so` files. At runtime you'll need `LD_LIBRARY_PATH` to find them (or use `package.sh`, which bundles everything — and refuses to package if any library is unresolved):
 
 ```bash
 # Run directly (with local FFmpeg)
-LD_LIBRARY_PATH=$HOME/ffmpeg-8.1-local/lib ./build/dsvp /path/to/movie.mkv
+LD_LIBRARY_PATH=$HOME/ffmpeg-9.0-local/lib ./build/dsvp /path/to/movie.mkv
 
 # Or package for distribution (bundles all libs automatically)
-LD_LIBRARY_PATH=$HOME/ffmpeg-8.1-local/lib ./package.sh
+LD_LIBRARY_PATH=$HOME/ffmpeg-9.0-local/lib ./package.sh
 ```
 
 ### Step 5: Run

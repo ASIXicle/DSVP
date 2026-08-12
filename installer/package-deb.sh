@@ -9,18 +9,26 @@
 # Options:
 #   --skip-build    Skip compilation, use existing DSVP-portable/
 #
-# Output: dsvp_0.3.0-beta_amd64.deb in repo root
+# Output: dsvp_<version>_amd64.deb in repo root
 #
-# Install:  sudo dpkg -i dsvp_0.3.0-beta_amd64.deb
+# Install:  sudo dpkg -i dsvp_<version>_amd64.deb
 # Remove:   sudo dpkg -r dsvp
 
 set -e
 
 # Version derives from src/dsvp.h — single source of truth, never hardcode here
 VERSION=$(sed -n 's/.*DSVP_VERSION *"\(.*\)"/\1/p' src/dsvp.h)
+if [ -z "$VERSION" ]; then
+    echo "ERROR: could not extract DSVP_VERSION from src/dsvp.h"
+    exit 1
+fi
+# Debian version: '-' would be parsed as a Debian revision, making
+# "0.3.0-beta" sort NEWER than the final "0.3.0" and blocking the
+# upgrade path. '~' sorts BEFORE — the Debian pre-release convention.
+DEB_VERSION=$(echo "$VERSION" | sed 's/-/~/g')
 ARCH="amd64"
 PKG_NAME="dsvp"
-PKG_DIR="${PKG_NAME}_${VERSION}_${ARCH}"
+PKG_DIR="${PKG_NAME}_${DEB_VERSION}_${ARCH}"
 PORTABLE_DIR="DSVP-portable"
 SKIP_BUILD=0
 
@@ -212,13 +220,10 @@ cat > "${PKG_DIR}/usr/share/metainfo/${PKG_NAME}.metainfo.xml" << METAINFO
   <content_rating type="oars-1.1" />
 
   <releases>
-    <release version="${VERSION}" date="$(date +%Y-%m-%d)">
-      <description>
-        <p>Full-codebase review round: chroma siting correction, seek and
-        EOF timing fixes, subtitle memory and safety hardening, HLG
-        support, and content-aware deinterlacing.</p>
-      </description>
-    </release>
+    <!-- Current release carries no prose: pairing hardcoded notes
+         with ${VERSION} + build date mis-attributed old notes to every
+         new version. Notes live in GitHub Releases. -->
+    <release version="${VERSION}" date="$(date +%Y-%m-%d)"/>
     <release version="0.2.8-beta" date="2026-05-25">
       <description>
         <p>Subtitle: extended font fallback chain covers Arabic, Hebrew,
@@ -252,7 +257,7 @@ INSTALLED_SIZE=$(du -sk "${PKG_DIR}" | cut -f1)
 
 cat > "${PKG_DIR}/DEBIAN/control" << CONTROL
 Package: ${PKG_NAME}
-Version: ${VERSION}
+Version: ${DEB_VERSION}
 Section: video
 Priority: optional
 Architecture: ${ARCH}
@@ -266,7 +271,7 @@ Description: Dead Simple Video Player — reference-quality playback
  Features Lanczos-2 luma scaling, Catmull-Rom chroma upsampling,
  temporal blue noise dithering, HDR-to-SDR tone mapping (BT.2390),
  Dolby Vision Profile 5/8, 10-bit passthrough, and software decode
- for bit-exact output. Bundles FFmpeg 8.1, SDL3, and all dependencies.
+ for bit-exact output. Bundles FFmpeg, SDL3, and all dependencies.
 CONTROL
 
 # ── Create DEBIAN/postinst (update desktop database) ──────────
@@ -298,7 +303,7 @@ chmod 755 "${PKG_DIR}/DEBIAN/postrm"
 # ── Build .deb ────────────────────────────────────────────────
 
 echo "[3/3] Building .deb..."
-DEB_FILE="${PKG_NAME}_${VERSION}_${ARCH}.deb"
+DEB_FILE="${PKG_NAME}_${DEB_VERSION}_${ARCH}.deb"
 dpkg-deb --root-owner-group --build "$PKG_DIR" "$DEB_FILE"
 
 # ── Cleanup and summary ──────────────────────────────────────

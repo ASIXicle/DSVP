@@ -7,16 +7,16 @@ WHY? Because I can. And education. And I'm a config-fiddler that wanted to offer
 
 TODO: bitstream support and HDR autodetect/output. Soon. ish.
 
-There are portable Windows and Linux builds on the Releases page, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP-deck). The portable tarballs bundle all dependencies including FFmpeg 8.1.2 — just extract and run. Windows and Debian installers are also available.
+There are portable Windows and Linux builds on the Releases page, and Steam Deck builds you can download and try [HERE](https://github.com/ASIXicle/DSVP-deck). The portable tarballs bundle all dependencies including FFmpeg — just extract and run. Windows and Debian installers are also available.
 
 REQUIRES Visual C++ Redistributable runtime on Windows (vcruntime140.dll). It's probably already on your PC but you can get it here:
 https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170
 
 ## Installation
 
-**Windows:** Download `DSVP-0.3.0-beta-setup.exe` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and run it. Installs to Program Files with Start Menu shortcuts and an uninstaller. Alternatively, download the portable `.zip` — extract and run, no installation needed.
+**Windows:** Download the `DSVP-<version>-setup.exe` installer from [Releases](https://github.com/ASIXicle/DSVP/releases/) and run it. Installs to Program Files with Start Menu shortcuts and an uninstaller. Alternatively, download the portable `.zip` — extract and run, no installation needed.
 
-**Debian/Ubuntu:** Download `dsvp_0.3.0-beta_amd64.deb` from [Releases](https://github.com/ASIXicle/DSVP/releases/) and install with `sudo dpkg -i dsvp_0.3.0-beta_amd64.deb`. Bundles all dependencies. Run `dsvp` from a terminal or your application launcher.
+**Debian/Ubuntu:** Download the `dsvp_<version>_amd64.deb` package from [Releases](https://github.com/ASIXicle/DSVP/releases/) and install with `sudo dpkg -i <the .deb>`. Bundles all dependencies. Run `dsvp` from a terminal or your application launcher.
 
 **Steam Deck:** See [SteamOS.md](https://github.com/ASIXicle/DSVP-deck/blob/main/SteamOS.md) for the dedicated Steam Deck build with VAAPI hardware decode.
 
@@ -62,7 +62,7 @@ https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=ms
 ### Requirements
 
 - **GCC** (MSYS2 MinGW64 on Windows, gcc on Linux, clang on macOS)
-- **FFmpeg 8.1+** shared development libraries
+- **FFmpeg 8.1+** shared development libraries (9.0 recommended — see SETUP.md)
 - **SDL3** development libraries
 - **SDL3_ttf** development libraries
 - **SDL3_shadercross 3.0.0** (bundled — not available via package managers)
@@ -108,7 +108,7 @@ The binary lands in `build/dsvp.exe` with all required DLLs auto-copied.
 ```bash
 makensis installer/dsvp.nsi
 ```
-Produces `DSVP-0.3.0-beta-setup.exe` in the repo root.
+Produces `DSVP-<version>-setup.exe` in the repo root.
 
 ### Linux (Debian/Ubuntu)
 
@@ -119,7 +119,7 @@ sudo apt install gcc make pkg-config \
     zlib1g-dev fonts-dejavu-core fonts-noto-cjk zenity
 ```
 
-> **FFmpeg 8.1+ required.** Debian/Ubuntu may ship an older version (check with `ffmpeg -version`). If your system FFmpeg is below 8.1, see [SETUP.md](SETUP.md) for instructions on building FFmpeg 8.1 from source into a local prefix. The portable tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/) bundles FFmpeg 8.1.2 and requires no system FFmpeg.
+> **FFmpeg 8.1+ required** (9.0 recommended). Debian/Ubuntu may ship an older version (check with `ffmpeg -version`). If your system FFmpeg is too old, see [SETUP.md](SETUP.md) for building FFmpeg into a local prefix. The portable tarball from [Releases](https://github.com/ASIXicle/DSVP/releases/) bundles FFmpeg and requires no system FFmpeg.
 
 **2. SDL3_shadercross** is bundled in `shadercross/SDL3_shadercross-3.0.0-linux-x64/`. No action needed — the Makefile finds it automatically.
 
@@ -152,7 +152,7 @@ Binary: `build/dsvp`
 ```bash
 ./installer/package-deb.sh
 ```
-Produces `dsvp_0.3.0-beta_amd64.deb` in the repo root. Builds, packages, and assembles the `.deb` in one step. Use `--skip-build` to repackage without recompiling.
+Produces `dsvp_<version>_amd64.deb` in the repo root. Builds, packages, and assembles the `.deb` in one step. Use `--skip-build` to repackage without recompiling.
 
 ### macOS (untested as of 3/16/26)
 

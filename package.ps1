@@ -1,4 +1,4 @@
-# DSVP Portable Packaging Script (Windows)
+﻿# DSVP Portable Packaging Script (Windows)
 # Creates a clean DSVP-portable/ folder with exe + all DLLs.
 #
 # Run from PowerShell in the DSVP repo root.
@@ -27,8 +27,11 @@ if (Test-Path "$msysRoot\bin") {
     Write-Host "WARNING: MSYS2 MinGW64 not found at $msysRoot." -ForegroundColor Yellow
 }
 
-# Verify pkg-config can find SDL3
-$pkgCheck = & pkg-config --cflags sdl3 2>&1
+# Verify pkg-config can find SDL3. No stderr redirect: under Windows
+# PowerShell 5.1 with ErrorActionPreference=Stop, stderr from a
+# redirected native command throws NativeCommandError before the
+# friendly message below could ever run. --exists is silent anyway.
+& pkg-config --exists sdl3
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: pkg-config cannot find sdl3. Install MSYS2 deps first (see SETUP.md)." -ForegroundColor Red
     exit 1
@@ -45,7 +48,8 @@ if (-not (Test-Path "$scDir\include\SDL3_shadercross\SDL_shadercross.h")) {
 
 if (-not $SkipBuild) {
     Write-Host "`n[1/5] Building..." -ForegroundColor Yellow
-    mingw32-make clean 2>$null
+    cmd /c "mingw32-make clean >nul 2>&1"   # cmd wrapper: stderr from a
+    # redirected native command is a terminating error under PS 5.1
     mingw32-make
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: Build failed." -ForegroundColor Red
@@ -75,6 +79,7 @@ New-Item -ItemType Directory -Path $outDir | Out-Null
 
 Write-Host "[3/5] Copying exe and build DLLs..." -ForegroundColor Yellow
 Copy-Item "build\dsvp.exe" "$outDir\"
+Copy-Item "LICENSE" "$outDir\"   # GPL-3: binary distribution requires the license text
 
 # Makefile already copies SDL3.dll, SDL3_ttf.dll, SDL3_shadercross.dll,
 # dxcompiler.dll, dxil.dll to build/
@@ -98,7 +103,8 @@ if (Test-Path "deps\SDL3_shadercross-3.0.0-windows-mingw-x64\bin") {
     $searchDirs += (Resolve-Path "deps\SDL3_shadercross-3.0.0-windows-mingw-x64\bin").Path
 }
 if (Test-Path "C:\msys64\mingw64\bin")              { $searchDirs += "C:\msys64\mingw64\bin" }
-if (Test-Path "C:\vcpkg\installed\x64-windows\bin") { $searchDirs += "C:\vcpkg\installed\x64-windows\bin" }
+# vcpkg deliberately NOT searched: its DLLs are MSVC-ABI builds —
+# bundling one next to MinGW binaries is a different-CRT trap.
 
 # Fallback: try pkg-config
 if ($searchDirs.Count -eq 0) {

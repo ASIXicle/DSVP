@@ -455,12 +455,21 @@ static const char hlsl_yuv_planar_frag[] =
     "        float3 sig = float3(y, cb, cr);\n"
     "        float3 ipt;\n"
     "        ipt.x = dovi_reshape(sig.x, 0);\n"
-    "        /* Chroma: MMR when the RPU says so (nearly all real P5\n"
-    "         * content), else the per-component polynomial. */\n"
-    "        ipt.y = (dovi_mmr_meta.x > 0.5) ? dovi_mmr_eval(sig, 1)\n"
-    "                                        : dovi_reshape(sig.y, 1);\n"
-    "        ipt.z = (dovi_mmr_meta.y > 0.5) ? dovi_mmr_eval(sig, 2)\n"
-    "                                        : dovi_reshape(sig.z, 2);\n"
+    "        /* Chroma: MMR when the RPU says so — but only for pixels\n"
+    "         * in piece 0's pivot range: the CPU packs MMR coefficients\n"
+    "         * for piece 0 alone, and dispatching before the pivot\n"
+    "         * search routed EVERY pixel of a multi-piece curve through\n"
+    "         * piece 0's MMR. Single-piece curves (nearly all real P5\n"
+    "         * content) are unchanged by construction; outside piece 0,\n"
+    "         * dovi_reshape's own search lands the right poly piece. */\n"
+    "        ipt.y = (dovi_mmr_meta.x > 0.5 &&\n"
+    "                 (sel3(dovi_num_pieces, 1) <= 1.5 ||\n"
+    "                  sig.y < sel3(dovi_pivots[1], 1)))\n"
+    "                    ? dovi_mmr_eval(sig, 1) : dovi_reshape(sig.y, 1);\n"
+    "        ipt.z = (dovi_mmr_meta.y > 0.5 &&\n"
+    "                 (sel3(dovi_num_pieces, 2) <= 1.5 ||\n"
+    "                  sig.z < sel3(dovi_pivots[1], 2)))\n"
+    "                    ? dovi_mmr_eval(sig, 2) : dovi_reshape(sig.z, 2);\n"
     "        ipt = saturate(ipt);\n"
     "\n"
     "        float3 centered = ipt - float3(dovi_ycc_r0.w, dovi_ycc_r1.w, dovi_ycc_r2.w);\n"
@@ -764,6 +773,29 @@ static void shadercache_save(const char *stage, uint64_t key,
  *
  * Note: CompileGraphicsShaderFromHLSL does NOT exist in 3.0.0.
  */
+
+/* True when the content signals the BT.2020/HDR family by ANY of its
+ * container hints — 2020 colorspace/primaries tags, PQ/HLG transfer,
+ * or a Dolby Vision configuration record. Real-world HDR re-encodes
+ * strip these inconsistently (DV P5 routinely tags everything
+ * UNSPECIFIED), so any one signal suffices. Consumers: the chroma
+ * siting defaults in gpu_setup_uniforms and the sws dst_chr_pos
+ * pinning — keep both on this single predicate. */
+static int content_is_2020_family(const AVCodecParameters *par)
+{
+    if (par->color_space     == AVCOL_SPC_BT2020_NCL ||
+        par->color_space     == AVCOL_SPC_BT2020_CL  ||
+        par->color_primaries == AVCOL_PRI_BT2020     ||
+        par->color_trc       == AVCOL_TRC_SMPTE2084  ||
+        par->color_trc       == AVCOL_TRC_ARIB_STD_B67)
+        return 1;
+    if (av_packet_side_data_get(par->coded_side_data,
+                                par->nb_coded_side_data,
+                                AV_PKT_DATA_DOVI_CONF))
+        return 1;
+    return 0;
+}
+
 
 static SDL_GPUShader *compile_shader(
     SDL_GPUDevice *device,
@@ -1492,6 +1524,14 @@ static void gpu_setup_uniforms(PlayerState *ps) {
             ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
         if (par->chroma_location != AVCHROMA_LOC_UNSPECIFIED)
             chroma_loc = par->chroma_location;
+        else if (content_is_2020_family(par))
+            /* BT.2020-family sites 4:2:0 chroma TOP-LEFT per spec, and
+             * re-encodes strip the VUI flag constantly — the LEFT
+             * fallback gave most HDR files a quarter-texel vertical
+             * chroma error (deck ad4ab7f lineage). Family membership by
+             * ANY signal (tags, PQ/HLG, DV conf): tag-only matching
+             * missed DV P5 and most stripped re-encodes in the field. */
+            chroma_loc = AVCHROMA_LOC_TOPLEFT;
     }
     ps->chroma_location = (int)chroma_loc;
 
@@ -1867,6 +1907,9 @@ int gpu_overlay_ensure(PlayerState *ps, int width, int height) {
     ps->overlay_tex_w = width;
     ps->overlay_tex_h = height;
     ps->overlay_dirty = 0;
+    ps->overlay_force_full = 1;  /* fresh texture = undefined contents;
+                                  * next overlay render must upload the
+                                  * full height (overlay.c honors this) */
 
     log_msg("GPU: overlay texture created (%dx%d RGBA)", width, height);
     return 0;
@@ -2241,6 +2284,8 @@ int fq_get(FrameQueue *q, AVFrame **frame_out, int block) {
             q->nb_frames--;
             *frame_out = node->frame;
             av_free(node);
+            q->last_pop_serial = q->flush_serial;  /* consumer-side seek
+                                                    * race gate (main.c) */
             SDL_SignalCondition(q->cond);  /* wake any blocked fq_put */
             ret = 1;
             break;
@@ -2437,6 +2482,7 @@ int player_open(PlayerState *ps, const char *filename) {
 
         ps->vid_w = ps->video_codec_ctx->width;
         ps->vid_h = ps->video_codec_ctx->height;
+        ps->expected_pix_fmt = ps->video_codec_ctx->pix_fmt;
         log_msg("Video: %dx%d, pix_fmt=%s, threads=%d",
             ps->vid_w, ps->vid_h,
             av_get_pix_fmt_name(ps->video_codec_ctx->pix_fmt),
@@ -2525,6 +2571,10 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->video_frame = av_frame_alloc();
     ps->rgb_frame   = av_frame_alloc();
     ps->audio_frame = av_frame_alloc();
+    if (!ps->video_frame || !ps->rgb_frame || !ps->audio_frame) {
+        log_msg("ERROR: frame allocation failed");
+        return -1;
+    }
 
     /* ── Set up swscale (or skip for GPU passthrough) ──
      *
@@ -2594,11 +2644,23 @@ int player_open(PlayerState *ps, const char *filename) {
                 AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
 
                 int src_cs;
-                if (par->color_space != AVCOL_SPC_UNSPECIFIED) {
-                    src_cs = (par->color_space == AVCOL_SPC_BT709)
-                        ? SWS_CS_ITU709 : SWS_CS_ITU601;
-                } else {
-                    src_cs = (ps->vid_h >= 720) ? SWS_CS_ITU709 : SWS_CS_ITU601;
+                switch (par->color_space) {
+                case AVCOL_SPC_BT709:
+                    src_cs = SWS_CS_ITU709;
+                    break;
+                case AVCOL_SPC_BT470BG:
+                case AVCOL_SPC_SMPTE170M:
+                    src_cs = SWS_CS_ITU601;
+                    break;
+                default:
+                    /* RGB, unspecified, and exotic tags: mirror the
+                     * shader's decode heuristic (gpu_setup_uniforms) so
+                     * encode and decode matrices cannot diverge —
+                     * AVCOL_SPC_RGB != UNSPECIFIED and used to take the
+                     * 601 arm here while the shader decoded 709. */
+                    src_cs = (ps->vid_h >= 720) ? SWS_CS_ITU709
+                                                : SWS_CS_ITU601;
+                    break;
                 }
 
                 int dst_cs = src_cs;
@@ -2645,7 +2707,11 @@ int player_open(PlayerState *ps, const char *filename) {
                 AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
                 enum AVChromaLocation src_loc = par->chroma_location;
                 if (src_loc == AVCHROMA_LOC_UNSPECIFIED)
-                    src_loc = AVCHROMA_LOC_LEFT;
+                    /* BT.2020-family spec-sites 4:2:0 top-left; everything
+                     * else defaults LEFT as before (in lockstep with the
+                     * GPU-path selection in gpu_setup_uniforms) */
+                    src_loc = content_is_2020_family(par)
+                              ? AVCHROMA_LOC_TOPLEFT : AVCHROMA_LOC_LEFT;
 
                 /* AVChromaLocation → swscale chr_pos (1/256 luma units):
                  * h: left=0 center=128; v: top=0 center=128 bottom=256 */
@@ -2679,6 +2745,11 @@ int player_open(PlayerState *ps, const char *filename) {
             /* Allocate buffer for the converted frame */
             int buf_size = av_image_get_buffer_size(dst_fmt, dst_w, dst_h, 32);
             ps->rgb_buffer = av_malloc(buf_size);
+            if (!ps->rgb_buffer) {
+                log_msg("ERROR: conversion buffer allocation failed (%d bytes)",
+                        buf_size);
+                return -1;
+            }
             av_image_fill_arrays(ps->rgb_frame->data, ps->rgb_frame->linesize,
                                  ps->rgb_buffer, dst_fmt, dst_w, dst_h, 32);
         }
@@ -3127,6 +3198,9 @@ int video_decode_thread_func(void *arg) {
             continue;
         }
 
+#ifdef DSVP_PROFILE
+        double t_dec0 = get_time_sec();
+#endif
         int ret = avcodec_receive_frame(ps->video_codec_ctx, frame);
 
         if (ret == 0) {
@@ -3158,6 +3232,26 @@ int video_decode_thread_func(void *arg) {
                     continue;
                 }
             }
+
+#ifdef DSVP_PROFILE
+            {
+                /* Frame production cost: receive + deint. Excludes the
+                 * fq_put below — a full queue is backpressure, not
+                 * decode time. */
+                double dec_ms = (get_time_sec() - t_dec0) * 1000.0;
+                ps->prof_dec_n++;
+                ps->prof_sum_decode += dec_ms;
+                if (dec_ms > ps->prof_max_decode)
+                    ps->prof_max_decode = dec_ms;
+                /* Spike: decode nearing the content frame budget
+                 * (80% of period; 24p→33ms, 60fps→13ms). */
+                double dec_thr = ps->frame_last_delay > 0.001
+                    ? ps->frame_last_delay * 800.0 : 13.0;
+                if (dec_ms > dec_thr)
+                    log_msg("PROF DECODE SPIKE: %.1fms (frame %d)",
+                            dec_ms, ps->diag_frames_decoded);
+            }
+#endif
 
             /* Capture the queue serial while still under seek_mutex — a
              * seek cannot run concurrently here, so this frame provably
@@ -3318,6 +3412,13 @@ int demux_thread_func(void *arg) {
         /* ── Handle seek requests ── */
         if (ps->seek_request) {
             int64_t target = ps->seek_target;
+            int     tflags = ps->seek_flags;
+            /* Re-arm IMMEDIATELY: clearing only after the full
+             * seek+flush swallowed any second seek issued during
+             * service (double-tap on slow media; audio_cycle's
+             * recovery seek). The audio callback stays gated via
+             * ps->seeking for the whole window. */
+            ps->seek_request = 0;
             log_msg("Demux: seeking to %.3f s", (double)target / AV_TIME_BASE);
 
             /* CRITICAL: Lock the seek mutex. This prevents the main thread
@@ -3338,7 +3439,7 @@ int demux_thread_func(void *arg) {
                 SDL_UnlockAudioStream(ps->audio_stream);
             }
 
-            int ret = av_seek_frame(ps->fmt_ctx, -1, target, ps->seek_flags);
+            int ret = av_seek_frame(ps->fmt_ctx, -1, target, tflags);
             if (ret < 0) {
                 /* Nothing moved — playback continues from the old
                  * position. The old code still rewrote both clocks to the
@@ -3347,7 +3448,6 @@ int demux_thread_func(void *arg) {
                  * transient sync scramble for a seek that never happened. */
                 log_msg("ERROR: Seek failed: %s — state unchanged",
                         av_err2str(ret));
-                ps->seek_request = 0;
                 ps->seeking = 0;
                 /* Resume under the mutex: audio_cycle and the
                  * device-removed handler destroy/replace audio_stream
@@ -3388,7 +3488,6 @@ int demux_thread_func(void *arg) {
                 ps->sub_text[0] = '\0';
                 log_msg("Demux: all codecs flushed");
             }
-            ps->seek_request = 0;
             ps->eof = 0;
 
             /* Reset audio decode buffer (safe — callback is paused) */
@@ -3560,6 +3659,9 @@ int video_decode_frame(PlayerState *ps) {
     av_frame_unref(ps->video_frame);
     av_frame_move_ref(ps->video_frame, queued);
     av_frame_free(&queued);
+    /* Same-thread read of the value fq_get just stored under the queue
+     * mutex — only main pops this queue. */
+    ps->video_frame_serial = ps->video_frame_q.last_pop_serial;
 
     /* Update video clock from new frame's PTS in seconds.
      * best_effort_timestamp is preferred: FFmpeg computes it from
@@ -3639,6 +3741,16 @@ static Uint32 upload_plane(
          * so the caller skips this plane's GPU copy (previous texture
          * content holds) and log the failure. */
         log_msg("ERROR: transfer buffer map failed: %s", SDL_GetError());
+        return 0;
+    }
+
+    if ((Uint64)width_bytes * (Uint64)height > (Uint64)xfer_capacity) {
+        /* Never write past the mapped buffer even if a caller-side
+         * guard is bypassed (mid-stream format change class). */
+        log_msg("ERROR: plane upload %dx%d exceeds transfer capacity %u "
+                "— frame skipped", width_bytes, height,
+                (unsigned)xfer_capacity);
+        SDL_UnmapGPUTransferBuffer(device, xfer);
         return 0;
     }
 
@@ -4438,14 +4550,21 @@ void video_display(PlayerState *ps) {
      * frames — the previous picture holds until the stream returns to
      * its open-time size. */
     if (ps->video_frame->width  != ps->vid_w ||
-        ps->video_frame->height != ps->vid_h) {
+        ps->video_frame->height != ps->vid_h ||
+        ps->video_frame->format != ps->expected_pix_fmt) {
+        /* Format changes get the resolution treatment: textures AND
+         * transfer buffers were sized at open — an 8->10-bit switch
+         * doubles the row bytes and overran the mapped staging
+         * memory. Skip the frame; the previous picture holds. */
         /* per-file, not per-process — a static here silenced every
          * later file's resolution anomaly after the first */
         if (!ps->res_change_logged) {
-            log_msg("WARN: mid-stream resolution change %dx%d -> %dx%d — "
-                    "frames at the new size are skipped",
-                    ps->vid_w, ps->vid_h,
-                    ps->video_frame->width, ps->video_frame->height);
+            log_msg("WARN: mid-stream resolution/format change "
+                    "%dx%d fmt %d -> %dx%d fmt %d — "
+                    "frames at the new geometry are skipped",
+                    ps->vid_w, ps->vid_h, ps->expected_pix_fmt,
+                    ps->video_frame->width, ps->video_frame->height,
+                    ps->video_frame->format);
             ps->res_change_logged = 1;
         }
         return;
@@ -4455,6 +4574,10 @@ void video_display(PlayerState *ps) {
     int h  = ps->vid_h;
     int cw = (w + 1) / 2;   /* ceil — matches texture + FFmpeg alloc */
     int ch = (h + 1) / 2;
+
+#ifdef DSVP_PROFILE
+    double t_enter = get_time_sec();
+#endif
 
     /* ── Determine source frame and byte width ── */
     AVFrame *src_frame;
@@ -4495,8 +4618,15 @@ void video_display(PlayerState *ps) {
      * Updates hdr_peak_nits uniform with temporally smoothed value.
      * PQ only — the histogram converts bins through the PQ EOTF, which
      * is meaningless for HLG's relative signal (fixed 1000-nit OOTF). */
+#ifdef DSVP_PROFILE
+    ps->prof_peak_ms = 0.0;
+    double t_before_peak = get_time_sec();
+#endif
     if (ps->gpu_uniforms.is_hlg < 0.5f)
         hdr_compute_scene_peak(ps, src_frame, bpp == 2 /* upload is 10-bit */);
+#ifdef DSVP_PROFILE
+    ps->prof_peak_ms = (get_time_sec() - t_before_peak) * 1000.0;
+#endif
 
     /* ── Upload plane data to GPU transfer buffers ── */
     Uint32 ppr_y = upload_plane(ps->gpu_device, ps->gpu_xfer_y, ps->gpu_xfer_y_cap,
@@ -4505,6 +4635,13 @@ void video_display(PlayerState *ps) {
                  src_frame->data[1], src_frame->linesize[1], cw * bpp, ch, bpp);
     Uint32 ppr_v = upload_plane(ps->gpu_device, ps->gpu_xfer_v, ps->gpu_xfer_uv_cap,
                  src_frame->data[2], src_frame->linesize[2], cw * bpp, ch, bpp);
+
+#ifdef DSVP_PROFILE
+    /* upload column = CPU-side prep since entry (sws convert, DV RPU,
+     * transfer-buffer memcpy) minus the separately-counted peak scan. */
+    double t_before_gpu = get_time_sec();
+    ps->prof_upload_ms = (t_before_gpu - t_enter) * 1000.0 - ps->prof_peak_ms;
+#endif
 
     /* ── GPU command buffer ── */
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
@@ -4591,6 +4728,13 @@ void video_display(PlayerState *ps) {
     ps->sc_w = (int)sc_w;
     ps->sc_h = (int)sc_h;
 
+#ifdef DSVP_PROFILE
+    /* vsync column = command-buffer acquire + copy-pass recording +
+     * swapchain acquire (the VSync/backpressure wait lives here). */
+    double t_after_vsync = get_time_sec();
+    ps->prof_vsync_ms = (t_after_vsync - t_before_gpu) * 1000.0;
+#endif
+
     /* ── Render shaded frame into the cache, then blit + overlay ──
      * Fallback: if the cache texture or blit pipeline is unavailable,
      * shade directly into the swapchain (the pre-cache behavior). */
@@ -4620,6 +4764,44 @@ void video_display(PlayerState *ps) {
     SDL_EndGPURenderPass(pass);
     SDL_SubmitGPUCommandBuffer(cmd);
 
+#ifdef DSVP_PROFILE
+    {
+        double t_exit = get_time_sec();
+        ps->prof_render_ms  = (t_exit - t_after_vsync) * 1000.0;
+        ps->prof_display_ms = (t_exit - t_enter) * 1000.0;
+
+        /* Spike log: flag individual frames that blow the budget.
+         * Total includes the normal VSync wait (~14ms at 60Hz), so
+         * only genuine anomalies trip the 20ms line. */
+        if (ps->prof_peak_ms > 3.0 || ps->prof_upload_ms > 8.0
+                || ps->prof_display_ms > 20.0) {
+            log_msg("PROF SPIKE: upload=%.1f peak=%.1f vsync=%.1f "
+                    "render=%.1f total=%.1fms (frame %d)",
+                    ps->prof_upload_ms, ps->prof_peak_ms,
+                    ps->prof_vsync_ms, ps->prof_render_ms,
+                    ps->prof_display_ms, ps->diag_frames_displayed);
+        }
+
+        /* Running stats (reset by main.c's 10s DIAG report) */
+        ps->prof_n++;
+        ps->prof_sum_upload += ps->prof_upload_ms;
+        ps->prof_sum_peak   += ps->prof_peak_ms;
+        ps->prof_sum_vsync  += ps->prof_vsync_ms;
+        ps->prof_sum_render += ps->prof_render_ms;
+        ps->prof_sum_total  += ps->prof_display_ms;
+        if (ps->prof_upload_ms  > ps->prof_max_upload)
+            ps->prof_max_upload = ps->prof_upload_ms;
+        if (ps->prof_peak_ms    > ps->prof_max_peak)
+            ps->prof_max_peak   = ps->prof_peak_ms;
+        if (ps->prof_vsync_ms   > ps->prof_max_vsync)
+            ps->prof_max_vsync  = ps->prof_vsync_ms;
+        if (ps->prof_render_ms  > ps->prof_max_render)
+            ps->prof_max_render = ps->prof_render_ms;
+        if (ps->prof_display_ms > ps->prof_max_total)
+            ps->prof_max_total  = ps->prof_display_ms;
+    }
+#endif
+
     ps->video_ready = 1;
 }
 
@@ -4636,6 +4818,13 @@ void video_display(PlayerState *ps) {
  * on the GPU, so re-rendering needs no new upload. */
 void video_reblit(PlayerState *ps) {
     if (!ps->gpu_tex_y) return;
+
+#ifdef DSVP_PROFILE
+    /* Reblit is nominally a 1-fetch blit; if its acquire blocks for
+     * multiple vsyncs the swapchain queue is backed up by earlier
+     * work — that split (vsync vs total) is the reason it's timed. */
+    double t_rb_enter = get_time_sec();
+#endif
 
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(ps->gpu_device);
     if (!cmd) return;
@@ -4658,6 +4847,10 @@ void video_reblit(PlayerState *ps) {
     /* Cache physical pixel dimensions for DPI-correct overlay sizing */
     ps->sc_w = (int)sc_w;
     ps->sc_h = (int)sc_h;
+
+#ifdef DSVP_PROFILE
+    double t_rb_vsync = get_time_sec();
+#endif
 
     int use_cache = (ps->gpu_pipeline_blit != NULL
                      && gpu_cache_ensure(ps, (int)sc_w, (int)sc_h) == 0);
@@ -4694,6 +4887,21 @@ void video_reblit(PlayerState *ps) {
     }
     SDL_EndGPURenderPass(pass);
     SDL_SubmitGPUCommandBuffer(cmd);
+
+#ifdef DSVP_PROFILE
+    {
+        double t_rb_exit  = get_time_sec();
+        double rb_vsync   = (t_rb_vsync - t_rb_enter) * 1000.0;
+        double rb_total   = (t_rb_exit  - t_rb_enter) * 1000.0;
+        ps->prof_rb_n++;
+        ps->prof_sum_rb_vsync += rb_vsync;
+        ps->prof_sum_rb_total += rb_total;
+        if (rb_vsync > ps->prof_max_rb_vsync)
+            ps->prof_max_rb_vsync = rb_vsync;
+        if (rb_total > ps->prof_max_rb_total)
+            ps->prof_max_rb_total = rb_total;
+    }
+#endif
 }
 
 

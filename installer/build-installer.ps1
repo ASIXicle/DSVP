@@ -1,4 +1,4 @@
-# DSVP — One-Shot Windows Installer Builder
+﻿# DSVP — One-Shot Windows Installer Builder
 #
 # Builds DSVP, creates portable package, then compiles NSIS installer.
 # Single command:  .\installer\build-installer.ps1
@@ -14,22 +14,28 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# ── Ensure we're in repo root FIRST ───────────────────────────
+# (The version extraction below throws under ErrorActionPreference=Stop
+# when src/dsvp.h isn't at the CWD — running via double-click or from
+# installer\ used to kill the script before any error could print.)
+
+if (-not (Test-Path "src\dsvp.h")) {
+    if (Test-Path "..\src\dsvp.h") {
+        Set-Location ..                     # invoked from installer\
+    } elseif ($PSScriptRoot -and (Test-Path (Join-Path $PSScriptRoot "..\src\dsvp.h"))) {
+        Set-Location (Join-Path $PSScriptRoot "..")   # invoked by absolute path / double-click
+    } else {
+        Write-Host "ERROR: Run this script from the DSVP repo root." -ForegroundColor Red
+        Read-Host  "Press Enter to close"   # keep the window alive for double-click runs
+        exit 1
+    }
+}
+
 # Version derives from src/dsvp.h — single source of truth, never hardcode here
 $version = (Select-String -Path "src/dsvp.h" -Pattern 'DSVP_VERSION\s+"([^"]+)"').Matches[0].Groups[1].Value
 
 Write-Host "`n=== DSVP Installer Builder v${version} ===" -ForegroundColor Cyan
-
-# ── Ensure we're in repo root ─────────────────────────────────
-
-if (-not (Test-Path "src\dsvp.h")) {
-    # Try running from installer/ subdirectory
-    if (Test-Path "..\src\dsvp.h") {
-        Set-Location ..
-    } else {
-        Write-Host "ERROR: Run this script from the DSVP repo root." -ForegroundColor Red
-        exit 1
-    }
-}
 
 # ── Step 1: Build and package ─────────────────────────────────
 

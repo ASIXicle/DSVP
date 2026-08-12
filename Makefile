@@ -14,8 +14,19 @@ BASE_LDFLAGS = $(shell pkg-config --libs sdl3 SDL3_ttf libavformat libavcodec li
 
 # If pkg-config doesn't find SDL3_ttf, try sdl3-ttf
 ifeq ($(shell pkg-config --exists SDL3_ttf 2>/dev/null && echo yes),)
+  ifeq ($(shell pkg-config --exists sdl3-ttf 2>/dev/null && echo yes),)
+    $(error pkg-config found neither 'SDL3_ttf' nor 'sdl3-ttf' — check PKG_CONFIG_PATH (see SETUP.md); without this the flags expand empty and the build fails with a cryptic missing-header error)
+  endif
   BASE_CFLAGS  = -Wall -Wextra -O2 $(shell pkg-config --cflags sdl3 sdl3-ttf libavformat libavcodec libavfilter libavutil libswscale libswresample 2>/dev/null)
   BASE_LDFLAGS = $(shell pkg-config --libs sdl3 sdl3-ttf libavformat libavcodec libavfilter libavutil libswscale libswresample 2>/dev/null) -lm -lz
+endif
+
+# FFmpeg presence check — without it, a missing .pc set expands the
+# flags EMPTY (the 2>/dev/null above) and the user gets a cryptic
+# missing-header error instead of this message. System SDL .pc files
+# often exist while FFmpeg's don't (field case: clean-shell build).
+ifeq ($(shell pkg-config --exists libavformat libavcodec libavfilter 2>/dev/null && echo yes),)
+  $(error pkg-config cannot find FFmpeg dev libraries — set PKG_CONFIG_PATH to your prefix (see SETUP.md))
 endif
 
 # ── Windows: explicit link for Unicode Win32 APIs ──
@@ -38,7 +49,10 @@ endif
 # which tree produced it — a wrong-branch binary once cost a day of debugging a
 # fix that was never in the binary being tested. "unknown" outside a git tree.
 GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
-GIT_DIRTY  := $(shell git diff --quiet 2>/dev/null || echo +dirty)
+# diff-index vs HEAD: plain `git diff --quiet` ignores STAGED changes,
+# stamping a staged-but-uncommitted tree as clean — the exact ambiguity
+# this stamp exists to kill.
+GIT_DIRTY  := $(shell git diff-index --quiet HEAD -- 2>/dev/null || echo +dirty)
 BASE_CFLAGS += -DDSVP_GIT_COMMIT=\"$(GIT_COMMIT)$(GIT_DIRTY)\" -MMD -MP
 
 CFLAGS  = $(BASE_CFLAGS) $(SC_CFLAGS)
@@ -58,12 +72,35 @@ else
   RC_OBJ   =
 endif
 
-.PHONY: all clean debug
+.PHONY: all clean debug profile
 
 all: $(TARGET)
 
+# Same caveat as profile: no flag tracking on objects — an incremental
+# `make debug` after `make` finds everything up-to-date and links a
+# NON-debug binary. Always `make clean && make debug`.
 debug: CFLAGS += -g -DDSVP_DEBUG
 debug: $(TARGET)
+
+# Section timing (PROF: lines every 10s + spike logs). No flag
+# tracking on objects — always `make clean && make profile`, and
+# `make clean` again to return to a normal build.
+profile: CFLAGS += -DDSVP_PROFILE
+profile: $(TARGET)
+
+# The stamp is baked into main.o at compile time, so an incremental
+# build that does not touch main.c ships a STALE stamp (deck field
+# case: a binary logging a two-commits-old build id). The stamp file's
+# content changes exactly when the commit/dirty state does, and main.o
+# depends on it. NOTE: rules must stay BELOW `all:` — a rule above it
+# becomes make's default goal (deck field case: bare `make` built
+# FORCE, i.e. nothing).
+GITSTAMP = $(OBJDIR)/.gitstamp
+.PHONY: FORCE
+FORCE:
+$(GITSTAMP): FORCE | $(OBJDIR)
+	@echo '$(GIT_COMMIT)$(GIT_DIRTY)' | cmp -s - $@ 2>/dev/null || echo '$(GIT_COMMIT)$(GIT_DIRTY)' > $@
+$(OBJDIR)/main.o: $(GITSTAMP)
 
 $(OBJDIR):
 	mkdir -p $(OBJDIR)

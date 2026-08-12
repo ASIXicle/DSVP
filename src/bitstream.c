@@ -168,7 +168,11 @@ int bitstream_probe(BitstreamCaps *caps)
         if (strncmp(ent->d_name, "card", 4) != 0)  continue;
         if (!strchr(ent->d_name, '-'))               continue;
 
-        /* Only HDMI and DisplayPort carry audio */
+        /* Only HDMI and DisplayPort carry audio. "DP" also matches
+         * "eDP" — the laptop's internal panel, which carries a CEA
+         * block but no external audio sink; it must never win the
+         * probe over a real HDMI/DP connector. */
+        if (strstr(ent->d_name, "eDP"))             continue;
         if (!strstr(ent->d_name, "HDMI") &&
             !strstr(ent->d_name, "DP"))             continue;
 
@@ -212,11 +216,25 @@ int bitstream_probe(BitstreamCaps *caps)
             int offset = (i + 1) * 128;
             if (offset + 128 > len) break;
 
-            if (parse_cea_extension(&edid[offset], caps))
-                found = 1;
+            parse_cea_extension(&edid[offset], caps);
         }
 
-        if (found) break;  /* use first connected HDMI/DP with CEA data */
+        /* A CEA extension alone proves nothing — virtually every
+         * monitor carries one with zero Audio Data Blocks, and with
+         * arbitrary readdir order an audio-less connector used to win
+         * the probe and silently kill passthrough. Accept a connector
+         * only if it contributed at least one SAD (every SAD sets
+         * max_channels >= 1); otherwise discard its parse results and
+         * keep scanning. */
+        if (caps->max_channels > 0) {
+            found = 1;
+        } else {
+            int keep_probed = caps->probed;
+            memset(caps, 0, sizeof(*caps));
+            caps->probed = keep_probed;
+        }
+
+        if (found) break;  /* first connected sink with audio SADs */
     }
 
     closedir(drm);
@@ -254,6 +272,15 @@ int bitstream_probe(BitstreamCaps *caps)
 int bitstream_can_passthrough(const BitstreamCaps *caps,
                                enum AVCodecID codec_id)
 {
+    /* The promise in the doc block above was never implemented: an
+     * FFmpeg build without the spdif muxer (the shipped 8.1 Linux
+     * prefix was exactly that) reported eligibility it couldn't
+     * deliver. The registry is fixed at runtime — check once. */
+    static int have_spdif = -1;
+    if (have_spdif < 0)
+        have_spdif = av_guess_format("spdif", NULL, NULL) != NULL;
+    if (!have_spdif) return 0;
+
     if (!caps->probed) return 0;
 
     switch (codec_id) {

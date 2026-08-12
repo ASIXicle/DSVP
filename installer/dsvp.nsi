@@ -7,7 +7,7 @@
 ;   2. Install NSIS:  pacman -S mingw-w64-x86_64-nsis
 ;   3. Build:         makensis installer/dsvp.nsi
 ;
-; Output: DSVP-0.3.0-beta-setup.exe in repo root
+; Output: DSVP-<version>-setup.exe in repo root
 ;
 ; ─── Configuration ──────────────────────────────────────────────
 
@@ -15,7 +15,7 @@
 ; Version is passed by build-installer.ps1 from src/dsvp.h (/DPRODUCT_VERSION=...).
 ; This fallback exists only for a bare `makensis installer\dsvp.nsi` invocation.
 !ifndef PRODUCT_VERSION
-!define PRODUCT_VERSION "0.3.0-beta"
+!define PRODUCT_VERSION "0.3.2-beta"
 !endif
 !define PRODUCT_PUBLISHER "Holden"
 !define PRODUCT_WEB     "https://github.com/ASIXicle/DSVP"
@@ -78,8 +78,10 @@ Section "DSVP (required)" SecCore
 
     SetOutPath "$INSTDIR"
 
-    ; Copy everything from DSVP-portable/ (embedded at compile time)
-    File /r "..\${PORTABLE_DIR}\*.*"
+    ; Copy everything from DSVP-portable/ (embedded at compile time).
+    ; /x dsvp.log: a test-run of the portable build before makensis
+    ; must not ship its log file.
+    File /r /x dsvp.log "..\${PORTABLE_DIR}\*.*"
 
     ; Write uninstaller
     WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -163,8 +165,18 @@ SectionEnd
 ; ─── Uninstaller ───────────────────────────────────────────────
 
 Section "Uninstall"
-    ; Remove files — delete the entire install directory
-    RMDir /r "$INSTDIR"
+    ; Remove KNOWN files only — never `RMDir /r $INSTDIR`. The user
+    ; picks the install directory freely on the DIRECTORY page; if
+    ; they chose an existing folder, a recursive delete would wipe
+    ; their data along with ours.
+    Delete "$INSTDIR\dsvp.exe"
+    Delete "$INSTDIR\*.dll"
+    Delete "$INSTDIR\LICENSE"
+    Delete "$INSTDIR\README.txt"
+    Delete "$INSTDIR\dsvp.log"
+    Delete "$INSTDIR\uninstall.exe"
+    RMDir /r "$INSTDIR\shadercaches"   ; app-owned cache dir only
+    RMDir "$INSTDIR"                     ; removes only if now empty
 
     ; Remove Start Menu shortcuts
     RMDir /r "$SMPROGRAMS\${PRODUCT_NAME}"

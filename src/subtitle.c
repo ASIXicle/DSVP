@@ -696,7 +696,15 @@ int sub_open_codec(PlayerState *ps, int stream_idx) {
     }
 
     ps->sub_codec_ctx = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(ps->sub_codec_ctx, st->codecpar);
+    if (!ps->sub_codec_ctx) {
+        log_msg("Sub: codec context allocation failed");
+        return -1;
+    }
+    if (avcodec_parameters_to_context(ps->sub_codec_ctx, st->codecpar) < 0) {
+        log_msg("Sub: codec parameter copy failed");
+        avcodec_free_context(&ps->sub_codec_ctx);
+        return -1;
+    }
 
     int ret = avcodec_open2(ps->sub_codec_ctx, codec, NULL);
     if (ret < 0) {
@@ -966,7 +974,8 @@ static void sub_decode_pending_impl(PlayerState *ps) {
     }
 
     AVPacket pkt;
-    int pgs_packets_this_drain = 0;
+    int pgs_pending = 0;              /* PGS packets in without a display
+                                       * set out — gates the END inject  */
     double last_pgs_pts = 0.0;
     for (;;) {
         /* While draining under a displayed bitmap, never consume packets
@@ -1051,7 +1060,6 @@ static void sub_decode_pending_impl(PlayerState *ps) {
 
         /* Track PGS packets fed this drain cycle */
         if (ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE) {
-            pgs_packets_this_drain++;
             AVStream *pgs_st = ps->fmt_ctx->streams[ps->sub_active_idx];
             if (pkt.pts != AV_NOPTS_VALUE)
                 last_pgs_pts = (double)pkt.pts * av_q2d(pgs_st->time_base);
@@ -1064,9 +1072,13 @@ static void sub_decode_pending_impl(PlayerState *ps) {
         if (!got_sub) {
             /* Normal for PGS: decoder accumulates segments (PCS, WDS,
              * PDS, ODS) and only outputs on DISPLAY_SEGMENT (0x80). */
+            if (ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE)
+                pgs_pending = 1;
             av_packet_unref(&pkt);
             continue;
         }
+        if (ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE)
+            pgs_pending = 0;   /* stream delivered its own END segment */
 
         /* Compute display timing */
         AVStream *st = ps->fmt_ctx->streams[ps->sub_active_idx];
@@ -1266,7 +1278,13 @@ static void sub_decode_pending_impl(PlayerState *ps) {
      * segments share the set's PTS, so consumed sets are complete.
      * The handler below treats rects-output as replacement and 0-rect
      * as clear, correct in both the fresh and replacing cases. */
-    if (pgs_packets_this_drain > 0 &&
+    /* Inject only when packets went IN without a display set coming
+     * OUT. Gating on the raw packet counter fired on well-formed
+     * streams that carry their own END segments (Blu-ray remux, M2TS):
+     * pgssubdec's retained presentation state re-output the display
+     * set — every caption rasterized twice and its end time clobbered
+     * by the fallback below. */
+    if (pgs_pending &&
         ps->sub_codec_ctx &&
         ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE) {
 
@@ -1279,13 +1297,14 @@ static void sub_decode_pending_impl(PlayerState *ps) {
         AVSubtitle sub;
         int got_sub = 0;
         int ret = avcodec_decode_subtitle2(ps->sub_codec_ctx, &sub, &got_sub, &end_pkt);
-        sub_vlog("Sub: PGS-END inject after %d pkts: got_sub=%d rects=%u ret=%d last_pts=%.1f",
-                pgs_packets_this_drain, got_sub, got_sub ? sub.num_rects : 0, ret, last_pgs_pts);
+        sub_vlog("Sub: PGS-END inject: got_sub=%d rects=%u ret=%d last_pts=%.1f",
+                got_sub, got_sub ? sub.num_rects : 0, ret, last_pgs_pts);
 
         if (ret >= 0 && got_sub) {
             double start = last_pgs_pts + (double)sub.start_display_time / 1000.0;
             double end   = last_pgs_pts + (double)sub.end_display_time / 1000.0;
-            if (sub.end_display_time == 0) end = start + 5.0;
+            if (sub.end_display_time == 0) end = start + 3.0; /* match
+                                     * the main loop's last-resort value */
             if (end - start > 30.0) end = start + 30.0;
 
             if (sub.num_rects == 0) {

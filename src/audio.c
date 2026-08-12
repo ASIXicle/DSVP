@@ -80,7 +80,7 @@ int audio_decode_frame(PlayerState *ps) {
                     &out_layout, AV_SAMPLE_FMT_FLT, ps->audio_spec.freq,    // was AV_SAMPLE_FMT_S16
                     &ps->audio_frame->ch_layout, ps->audio_frame->format,
                     ps->audio_frame->sample_rate, 0, NULL);
-                if (ret < 0 || swr_init(ps->swr_ctx) < 0) {
+                if (ret < 0 || (ret = swr_init(ps->swr_ctx)) < 0) {
                     log_msg("ERROR: swr init failed: %s", av_err2str(ret));
                     /* Free the half-built context — a non-NULL but
                      * uninitialized swr_ctx skipped this branch forever
@@ -139,7 +139,12 @@ int audio_decode_frame(PlayerState *ps) {
                 AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
                 ps->audio_clock = (double)frame_pts * av_q2d(as->time_base);
             }
-            ps->audio_clock += (double)converted / ps->audio_spec.freq;
+            /* Advance by the INPUT frame's duration, not the resampled
+             * output count: `converted` includes the previous frame's
+             * FIR tail and excludes this frame's, so under true rate
+             * conversion the clock drifted by the swr delay. */
+            ps->audio_clock += (double)ps->audio_frame->nb_samples
+                             / (double)ps->audio_frame->sample_rate;
 
             av_frame_unref(ps->audio_frame);
             return data_size;
@@ -174,7 +179,9 @@ void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
     while (written < additional_amount) {
         if (ps->audio_buf_index >= ps->audio_buf_size) {
             int decoded = audio_decode_frame(ps);
-            if (decoded <= 0) break;
+            if (decoded < 0) break;
+            if (decoded == 0) continue;  /* swr buffered the whole frame —
+                                          * pull the next, don't underrun */
             ps->audio_buf_size  = decoded;
             ps->audio_buf_index = 0;
         }

@@ -40,7 +40,7 @@
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.3.0-beta"
+#define DSVP_VERSION        "0.3.2-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -127,6 +127,7 @@ typedef struct FrameQueue {
     FrameNode     *last;
     int            nb_frames;
     int            flush_serial;  /* incremented on fq_flush; fq_put returns -2 if changed mid-wait */
+    int            last_pop_serial; /* serial observed by fq_get at pop time (consumer-side seek race) */
     SDL_Mutex     *mutex;
     SDL_Condition *cond;
     int            abort_request; /* signal threads to stop blocking */
@@ -339,6 +340,16 @@ typedef struct PlayerState {
     int                 eof;              /* demuxer hit end of file    */
     int                 io_error;         /* persistent decode failure — main.c tears down */
     int                 res_change_logged; /* per-file: mid-stream size warn shown  */
+    int                 expected_pix_fmt;  /* AVPixelFormat textures were sized for —
+                                            * mid-stream format changes are skipped
+                                            * like resolution changes (upload paths
+                                            * would overrun the transfer buffer)    */
+    int                 video_frame_serial; /* flush_serial of the displayed frame —
+                                             * seek recovery accepts only a frame
+                                             * popped after the flush              */
+    int                 overlay_force_full; /* overlay texture just (re)created:
+                                             * GPU contents undefined, next render
+                                             * must clear + upload full height     */
     int                 cache_fail_logged; /* per-file: frame-cache create fail shown */
     int                 video_ready;      /* 1 after first frame uploaded — gates reblit */
 
@@ -398,6 +409,28 @@ typedef struct PlayerState {
     int                 diag_timer_snaps;      /* frame_timer snap-forwards*/
     double              diag_max_av_drift;     /* worst A/V drift (signed) */
     double              diag_last_report;      /* time of last periodic log*/
+
+    /* ── Profiling (make profile → -DDSVP_PROFILE; deck port) ──
+     * Per-frame section timings for video_display / video_reblit /
+     * the decode thread, accumulated between 10s DIAG reports.
+     * decode_* is written from the decode thread without locking —
+     * a torn read costs one bad sample in a diagnostic, not state. */
+    double              prof_upload_ms;       /* last frame: convert+upload */
+    double              prof_peak_ms;         /* last frame: scene-peak scan */
+    double              prof_vsync_ms;        /* last frame: acquire (VSync) */
+    double              prof_render_ms;       /* last frame: render + submit */
+    double              prof_display_ms;      /* last frame: video_display() */
+    int                 prof_n;               /* display ticks in window     */
+    double              prof_sum_upload,  prof_max_upload;
+    double              prof_sum_peak,    prof_max_peak;
+    double              prof_sum_vsync,   prof_max_vsync;
+    double              prof_sum_render,  prof_max_render;
+    double              prof_sum_total,   prof_max_total;
+    int                 prof_dec_n;           /* decoded frames in window    */
+    double              prof_sum_decode,  prof_max_decode;
+    int                 prof_rb_n;            /* reblit ticks in window      */
+    double              prof_sum_rb_vsync, prof_max_rb_vsync;
+    double              prof_sum_rb_total, prof_max_rb_total;
 
     /* ── Real-time FPS measurement (debug overlay, 0.5s window) ── */
     double              fps_window_start;      /* window anchor (wall sec) */
