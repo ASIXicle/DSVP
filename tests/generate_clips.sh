@@ -7,9 +7,9 @@
 # ─────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-OUTDIR="tests/clips"
-DUR=30          # seconds — enough for 2-3 DIAG intervals
-SEEK_DUR=60     # seconds — for seek stress tests
+OUTDIR="${DSVP_CLIP_DIR:-tests/clips}"
+DUR="${DSVP_CLIP_DUR:-30}"          # seconds — enough for 2-3 DIAG intervals
+SEEK_DUR="${DSVP_CLIP_SEEK_DUR:-60}"  # seconds — for seek stress tests
 AUDIO_HZ=48000
 AUDIO_CH=2      # stereo (real-world content is stereo)
 
@@ -27,15 +27,30 @@ skip_count=0
 
 # Sine tone: 440Hz left, 1kHz right (easy to verify stereo mapping)
 AUDIO_FILTER="sine=frequency=440:sample_rate=${AUDIO_HZ}:duration=${DUR}[l];sine=frequency=1000:sample_rate=${AUDIO_HZ}:duration=${DUR}[r];[l][r]amerge=inputs=2,aformat=channel_layouts=stereo"
-AUDIO_FILTER_LONG="sine=frequency=440:sample_rate=${AUDIO_HZ}:duration=${SEEK_DUR}[l];sine=frequency=1000:sample_rate=${AUDIO_HZ}:duration=${SEEK_DUR}[r];[l][r]amerge=inputs=2,aformat=channel_layouts=stereo"
 
 gen() {
     local name="$1"; shift
     local outfile="$OUTDIR/$name"
+    # DSVP_CLIP_ONLY='glob [glob ...]' generates only matching clips,
+    # e.g. DSVP_CLIP_ONLY='hlg_* hdr10_pq_*' (space-separated globs).
+    if [[ -n "${DSVP_CLIP_ONLY:-}" ]]; then
+        local pat match=0
+        for pat in $DSVP_CLIP_ONLY; do
+            # shellcheck disable=SC2053  # unquoted RHS = glob match, by design
+            [[ "$name" == $pat ]] && match=1
+        done
+        [[ $match -eq 1 ]] || return 0
+    fi
     if [[ -f "$outfile" ]]; then
-        echo "  SKIP  $name (exists)"
-        skip_count=$((skip_count + 1))
-        return
+        # Validate on skip (review M23/S6-14): a stale or partial clip
+        # from an interrupted run must not be reused forever.
+        if ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$outfile" 2>/dev/null | grep -q video; then
+            echo "  SKIP  $name (exists, probes OK)"
+            skip_count=$((skip_count + 1))
+            return
+        fi
+        echo "  REGEN $name (exists but does not probe — regenerating)"
+        rm -f "$outfile"
     fi
     echo "  GEN   $name"
     ffmpeg -hide_banner -loglevel warning "$@" -y "$outfile"
@@ -278,6 +293,11 @@ gen "container_vp9_4k.webm" \
 echo "── Category 6: HDR10 ──"
 
 HDR_META="-color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc"
+# The ffmpeg-level flags above do NOT reach the x265 VUI on every
+# ffmpeg build (Debian 7.1.5: the clip came out transfer=unknown,
+# primaries=unknown, and x265 refused hdr-opt). The x265 params are
+# the form that always lands; the flags stay for the container.
+HDR_X265="colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc"
 MASTER_DISPLAY="G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)"
 MAX_CLL="1000,400"
 
@@ -285,21 +305,78 @@ gen "hdr10_hevc_1080p.mkv" \
     -f lavfi -i "testsrc2=size=1920x1080:rate=24:duration=$DUR" \
     -f lavfi -i "$AUDIO_FILTER" \
     -c:v libx265 -pix_fmt yuv420p10le -b:v $V_BR_1080 \
-    -x265-params "keyint=48:master-display=${MASTER_DISPLAY}:max-cll=${MAX_CLL}:hdr-opt=1" \
+    -x265-params "keyint=48:${HDR_X265}:master-display=${MASTER_DISPLAY}:max-cll=${MAX_CLL}:hdr-opt=1" \
     $HDR_META -c:a aac -b:a 128k -ac $AUDIO_CH
 
 gen "hdr10_hevc_4k.mkv" \
     -f lavfi -i "testsrc2=size=3840x2160:rate=24:duration=$DUR" \
     -f lavfi -i "$AUDIO_FILTER" \
     -c:v libx265 -pix_fmt yuv420p10le -b:v $V_BR_4K \
-    -x265-params "keyint=48:master-display=${MASTER_DISPLAY}:max-cll=${MAX_CLL}:hdr-opt=1" \
+    -x265-params "keyint=48:${HDR_X265}:master-display=${MASTER_DISPLAY}:max-cll=${MAX_CLL}:hdr-opt=1" \
     $HDR_META -c:a aac -b:a 128k -ac $AUDIO_CH
+
+# HLG (ARIB STD-B67): the second HDR transfer the shader carries
+# (hlg_oetf_inv + BT.2100 OOTF at 1000 nits); the suite had no clip
+# for it (review M23). testsrc2 values are SDR-range; the clip drives
+# the code PATH, not a known luminance — see the staircase below.
+gen "hlg_hevc_1080p.mkv" \
+    -f lavfi -i "testsrc2=size=1920x1080:rate=24:duration=$DUR" \
+    -f lavfi -i "$AUDIO_FILTER" \
+    -c:v libx265 -pix_fmt yuv420p10le -b:v $V_BR_1080 \
+    -x265-params "keyint=48:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc" \
+    -color_primaries bt2020 -color_trc arib-std-b67 -colorspace bt2020nc \
+    -c:a aac -b:a 128k -ac $AUDIO_CH
+
+# PQ STAIRCASE PROBE (review M23/S6-13): patches of KNOWN luminance so a
+# screenshot is a measurement. 13 vertical bars at 1, 5, 10, 25, 50,
+# 100, 203, 300, 400, 600, 1000, 2000, 4000 nits, encoded as genuine PQ
+# code values (10-bit full-range code = round(1023*PQ(nits/10000))),
+# one clip per master-display peak. Read each bar's output code off a
+# capture and compare with tools/eetf-audit.c's spec column.
+pq_code10() {   # nits -> 10-bit PQ code (full range), via awk
+    awk -v n="$1" 'BEGIN { m1=0.1593017578125; m2=78.84375; c1=0.8359375; c2=18.8515625; c3=18.6875;
+        Np=(n/10000.0)^m1; v=((c1+c2*Np)/(1+c3*Np))^m2; printf "%d", int(v*1023+0.5) }'
+}
+STAIR_NITS=(1 5 10 25 50 100 203 300 400 600 1000 2000 4000)
+stair_filter() {
+    # geq works in the plane's native depth, so the luma expression IS the
+    # 10-bit code. 13 disjoint bars of 1920/13 px; chroma pinned at 512
+    # (neutral). (lutyuv silently fell back to an 8-bit format and
+    # saturated every bar to 1023 — read back before trusting a probe.)
+    local expr="" i x0 x1 n code
+    for i in "${!STAIR_NITS[@]}"; do
+        n=${STAIR_NITS[$i]}; code=$(pq_code10 "$n")
+        x0=$(( i * 1920 / 13 )); x1=$(( (i + 1) * 1920 / 13 - 1 ))
+        expr+="${expr:++}${code}*between(X,${x0},${x1})"
+    done
+    printf 'nullsrc=s=1920x1080:r=24:d=%s,format=yuv444p10le,setrange=pc,geq=lum=%s:cb=512:cr=512,format=yuv420p10le[v]' "$DUR" "'${expr}'"
+}
+for peak in 600 1000 4000 10000; do
+    md="G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L($((peak*10000)),50)"
+    gen "hdr10_pq_staircase_${peak}.mkv" \
+        -f lavfi -i "$AUDIO_FILTER" \
+        -filter_complex "$(stair_filter)" -map "[v]" -map 0:a \
+        -c:v libx265 -pix_fmt yuv420p10le -b:v $V_BR_1080 \
+        -x265-params "keyint=48:${HDR_X265}:range=full:master-display=${md}:max-cll=${peak},400:hdr-opt=1" \
+        -color_range pc $HDR_META -c:a aac -b:a 128k -ac $AUDIO_CH
+done
+
+# Dolby Vision cannot be synthesised by stock ffmpeg encoders. A P5
+# fixture is external: set DSVP_DV_FIXTURE=/path/to/p5.mkv and it is
+# linked into the suite; otherwise the absence is announced, not silent.
+if [[ -n "${DSVP_DV_FIXTURE:-}" && -f "${DSVP_DV_FIXTURE}" ]]; then
+    ln -sf "$(readlink -f "$DSVP_DV_FIXTURE")" "$OUTDIR/dovi_p5_fixture.mkv"
+    echo "  LINK  dovi_p5_fixture.mkv -> $DSVP_DV_FIXTURE"
+else
+    echo "  NONE  Dolby Vision P5: no fixture (set DSVP_DV_FIXTURE=<p5.mkv>) — the DV reshape/MMR path is NOT exercised by this suite"
+fi
 
 # BT.2020 gamut WITHOUT PQ (SDR BT.2020 — tests gamut path alone)
 gen "hdr10_bt2020_sdr.mkv" \
     -f lavfi -i "testsrc2=size=1920x1080:rate=24:duration=$DUR" \
     -f lavfi -i "$AUDIO_FILTER" \
-    -c:v libx265 -pix_fmt yuv420p10le -b:v $V_BR_1080 -x265-params keyint=48 \
+    -c:v libx265 -pix_fmt yuv420p10le -b:v $V_BR_1080 \
+    -x265-params "keyint=48:colorprim=bt2020:transfer=bt709:colormatrix=bt2020nc" \
     -color_primaries bt2020 -color_trc bt709 -colorspace bt2020nc \
     -c:a aac -b:a 128k -ac $AUDIO_CH
 

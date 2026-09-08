@@ -1,4 +1,4 @@
-; ═══════════════════════════════════════════════════════════════════
+﻿; ═══════════════════════════════════════════════════════════════════
 ; DSVP — Dead Simple Video Player — NSIS Installer
 ; ═══════════════════════════════════════════════════════════════════
 ;
@@ -12,15 +12,40 @@
 ; ─── Configuration ──────────────────────────────────────────────
 
 !define PRODUCT_NAME    "DSVP"
-; Version is passed by build-installer.ps1 from src/dsvp.h (/DPRODUCT_VERSION=...).
-; This fallback exists only for a bare `makensis installer\dsvp.nsi` invocation.
+; Version: passed by build-installer.ps1 (/DPRODUCT_VERSION=...) or, for
+; a bare `makensis installer\dsvp.nsi`, parsed from src/dsvp.h — the
+; single source of truth. A hardcoded fallback drifted one release
+; behind the binary it wrapped (review M14); there is none now.
 !ifndef PRODUCT_VERSION
-!define PRODUCT_VERSION "0.3.2-beta"
+!searchparse /noerrors /file "..\src\dsvp.h" `#define DSVP_VERSION` _DSVP_VER_WS `"` PRODUCT_VERSION `"`
 !endif
+!ifndef PRODUCT_VERSION
+!error "PRODUCT_VERSION not found in ..\src\dsvp.h — pass /DPRODUCT_VERSION=... (build-installer.ps1 does)"
+!endif
+!echo "PRODUCT_VERSION=${PRODUCT_VERSION}" 
 !define PRODUCT_PUBLISHER "Holden"
 !define PRODUCT_WEB     "https://github.com/ASIXicle/DSVP"
 !define PRODUCT_EXE     "dsvp.exe"
 !define PORTABLE_DIR    "DSVP-portable"
+
+; Provenance gate (review M9, Windows half; field 2026-09-07: a bare
+; makensis after a failed package.ps1 embedded the previous day's
+; bundle under a new version number). package.ps1 writes the binary's
+; build stamp ("<sha>[+dirty] <mode>") into the bundle; no stamp means
+; the bundle did not come from package.ps1, and anything but a clean
+; release stamp must not ship. The freshness check against HEAD lives
+; in package.ps1 (git is not available to NSIS).
+!searchparse /noerrors /file "..\${PORTABLE_DIR}\dsvp.stamp" " " BUNDLE_STAMP_MODE
+!ifndef BUNDLE_STAMP_MODE
+!error "..\${PORTABLE_DIR}\dsvp.stamp missing — the bundle did not come from package.ps1 (run installer\build-installer.ps1, which packages first)"
+!endif
+!searchparse /noerrors /file "..\${PORTABLE_DIR}\dsvp.stamp" "+dirty" BUNDLE_STAMP_DIRTY
+!ifdef BUNDLE_STAMP_DIRTY
+!error "bundle stamp is +dirty (uncommitted changes) — not shipping it"
+!endif
+!if "${BUNDLE_STAMP_MODE}" != "release"
+!error "bundle stamp mode is '${BUNDLE_STAMP_MODE}', not release — not shipping it"
+!endif
 
 ; Installer display name (appears in welcome page, title bar, etc.)
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"

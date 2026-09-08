@@ -31,3 +31,5 @@ test_logs/
 # Synthetic test clips and results (generated locally, too large for git)
 tests/clips/
 tests/logs/
+# Internal review archive (stale docs, local only)
+docs/Archive/

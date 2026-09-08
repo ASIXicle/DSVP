@@ -46,18 +46,40 @@ int audio_decode_frame(PlayerState *ps) {
              * the recovery point.  The 50ms tolerance absorbs normal
              * interleave jitter without rejecting valid frames.  The floor
              * clears itself on the first accepted frame. */
-            if (ps->audio_pts_floor > 0.0) {
+            if (ps->audio_pts_floor > 0.0 || ps->seekdiag_aud_pending) {
                 int64_t fp = ps->audio_frame->best_effort_timestamp;
                 if (fp == AV_NOPTS_VALUE) fp = ps->audio_frame->pts;
-                if (fp != AV_NOPTS_VALUE) {
+                int pts_known = (fp != AV_NOPTS_VALUE);
+                double pts_sec = 0.0;
+                if (pts_known) {
                     AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
-                    double pts_sec = (double)fp * av_q2d(as->time_base);
-                    if (pts_sec < ps->audio_pts_floor - 0.05) {
+                    pts_sec = (double)fp * av_q2d(as->time_base);
+                }
+                /* SEEKDIAG one-shot (deck 20325d1 port): where the
+                 * demuxer put AUDIO after the seek — logged before the
+                 * floor can eat it. The floor guards only BELOW the
+                 * recovery point; audio landing ABOVE it is accepted
+                 * silently and becomes the sync clock. */
+                if (ps->seekdiag_aud_pending) {
+                    ps->seekdiag_aud_pending = 0;
+                    if (pts_known)
+                        log_msg("SEEKDIAG: first audio frame post-seek "
+                                "pts=%.3f floor=%.3f delta=%+.3f",
+                                pts_sec, ps->audio_pts_floor,
+                                pts_sec - ps->audio_pts_floor);
+                    else
+                        log_msg("SEEKDIAG: first audio frame post-seek "
+                                "pts=NOPTS floor=%.3f",
+                                ps->audio_pts_floor);
+                }
+                if (ps->audio_pts_floor > 0.0) {
+                    if (pts_known
+                            && pts_sec < ps->audio_pts_floor - 0.05) {
                         av_frame_unref(ps->audio_frame);
                         continue;   /* skip stale frame, pull next */
                     }
+                    ps->audio_pts_floor = 0.0;  /* floor satisfied — clear */
                 }
-                ps->audio_pts_floor = 0.0;  /* floor satisfied — clear */
             }
 
             /* Rebuild the resampler if the stream's format changed under

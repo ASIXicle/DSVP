@@ -8,7 +8,8 @@
 #   .\package.ps1 -SkipBuild    # skip compilation, just package
 
 param(
-    [switch]$SkipBuild
+    [switch]$SkipBuild,
+    [switch]$AllowDirty   # package an unknown/+dirty/debug stamp (test bundles only)
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,8 +49,15 @@ if (-not (Test-Path "$scDir\include\SDL3_shadercross\SDL_shadercross.h")) {
 
 if (-not $SkipBuild) {
     Write-Host "`n[1/5] Building..." -ForegroundColor Yellow
-    cmd /c "mingw32-make clean >nul 2>&1"   # cmd wrapper: stderr from a
-    # redirected native command is a terminating error under PS 5.1
+    # No `cmd /c` wrapper (field 2026-09-07): with C:\msys64\usr\bin at
+    # the front of PATH, PowerShell resolves the bare name `cmd` to the
+    # extension-less MSYS wrapper C:\msys64\usr\bin\cmd and ShellExecutes
+    # it as a document — the "what program do you want to use to open
+    # this file" dialog on every packager run. Stdout only is silenced;
+    # stderr is left alone (a redirected native stderr is a terminating
+    # error under PS 5.1), and `rm -rf` of a missing build/ is silent
+    # anyway (receipted twice, rc 0).
+    mingw32-make clean | Out-Null
     mingw32-make
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: Build failed." -ForegroundColor Red
@@ -67,6 +75,50 @@ if (-not (Test-Path "build\dsvp.exe")) {
     exit 1
 }
 
+# ── Provenance gate (review M9, Windows half; field 2026-09-07: a bare
+# makensis after a failed package step shipped the previous day's
+# bundle as a new version). The Makefile writes build\dsvp.stamp
+# ("<sha>[+dirty] <mode>") at link; the bundle must carry a real,
+# clean, release stamp whose build inputs match HEAD — same rules as
+# package.sh. The stamp is copied into the bundle so dsvp.nsi can
+# refuse a stampless or non-release bundle on its own.
+$stamp = if (Test-Path "build\dsvp.stamp") { (Get-Content "build\dsvp.stamp" -First 1).Trim() } else { "missing" }
+$stampSha  = ($stamp -split ' ')[0]
+$stampMode = ($stamp -split ' ')[-1]
+Write-Host "      Binary stamp: $stamp" -ForegroundColor White
+$stampBad = ""
+if ($stampSha -eq "unknown" -or $stampSha -eq "missing") {
+    $stampBad = "stamp is '$stampSha' (no git tree or pre-stamp binary)"
+} elseif ($stampSha -like "*+dirty") {
+    $stampBad = "stamp is +dirty (uncommitted changes)"
+} elseif ($stampMode -ne "release") {
+    $stampBad = "binary is a $stampMode build"
+} elseif (Test-Path ".git") {
+    $headSha = (& git rev-parse --short HEAD 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $headSha -and $stampSha -ne $headSha) {
+        & git cat-file -e "$stampSha^{commit}" 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            $stampBad = "stamp $stampSha is not a commit in this repository"
+        } else {
+            & git diff --quiet $stampSha HEAD -- src Makefile dsvp.rc shadercross deps 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                $changed = (& git diff --stat $stampSha HEAD -- src Makefile dsvp.rc shadercross deps | Select-Object -Last 1)
+                $stampBad = "build inputs changed between stamp $stampSha and HEAD $headSha (stale binary): $changed"
+            } else {
+                Write-Host "      Stamp $stampSha predates HEAD $headSha, but no build input changed between them - binary is current" -ForegroundColor DarkGray
+            }
+        }
+    }
+}
+if ($stampBad) {
+    if ($AllowDirty) {
+        Write-Host "      WARNING: $stampBad - packaging anyway (-AllowDirty)" -ForegroundColor Yellow
+    } else {
+        Write-Host "ERROR: refusing to package: $stampBad (pass -AllowDirty for a test bundle)" -ForegroundColor Red
+        exit 1
+    }
+}
+
 # ── Create output directory ────────────────────────────────────────
 
 Write-Host "[2/5] Creating $outDir\" -ForegroundColor Yellow
@@ -80,6 +132,9 @@ New-Item -ItemType Directory -Path $outDir | Out-Null
 Write-Host "[3/5] Copying exe and build DLLs..." -ForegroundColor Yellow
 Copy-Item "build\dsvp.exe" "$outDir\"
 Copy-Item "LICENSE" "$outDir\"   # GPL-3: binary distribution requires the license text
+# The bundle carries its provenance: dsvp.nsi reads this and refuses a
+# bundle that has none or is not a release build.
+Set-Content -Path "$outDir\dsvp.stamp" -Value $stamp -NoNewline
 
 # Makefile already copies SDL3.dll, SDL3_ttf.dll, SDL3_shadercross.dll,
 # dxcompiler.dll, dxil.dll to build/
@@ -93,75 +148,151 @@ Write-Host "      Copied $($buildDlls.Count) DLLs from build/" -ForegroundColor 
 
 Write-Host "[4/5] Resolving DLL dependencies..." -ForegroundColor Yellow
 
-# Build list of directories to search for DLLs (MSYS2 + vcpkg)
+# Build the DLL search list (review M12 / d-S5-c / S5-10):
+#   1. the bin/ of every prefix the exe was LINKED against (pkg-config)
+#   2. the toolchain's own bin (the GCC that linked the exe — the
+#      libstdc++/libgcc_s/libwinpthread trio must come from here)
+#   3. C:\msys64\mingw64\bin as a catch-all
+#   4. the shadercross CI bin LAST — only libspirv-cross-c-shared.dll
+#      is unique to it; its own SDL3.dll and MinGW runtime must never
+#      win over the toolchain's.
+# Every copied DLL prints the directory it came from, and an import
+# found nowhere is a hard failure, not a silent skip.
 $searchDirs = @()
-# Bundled shadercross FIRST: it ships DLLs that exist nowhere else on
-# the system (libspirv-cross-c-shared.dll and the MinGW runtime the
-# bundle was built against), so a portable package assembled without
-# this directory is missing dependencies no other search dir can supply.
-if (Test-Path "deps\SDL3_shadercross-3.0.0-windows-mingw-x64\bin") {
-    $searchDirs += (Resolve-Path "deps\SDL3_shadercross-3.0.0-windows-mingw-x64\bin").Path
+# --exists first (silent on a miss), then --variable only for a package
+# that exists (no stderr, so no PS 5.1 NativeCommandError). A cmd /c
+# wrapper returned nothing when launched from PowerShell (field
+# 2026-09-06), which silently emptied this list.
+function Get-PkgPrefix([string]$pkg) {
+    & pkg-config --exists $pkg
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return (& pkg-config --variable=prefix $pkg)
 }
-if (Test-Path "C:\msys64\mingw64\bin")              { $searchDirs += "C:\msys64\mingw64\bin" }
+foreach ($pkg in @("sdl3", "SDL3_ttf", "libavcodec", "libavformat", "libavfilter",
+                   "libavutil", "libswscale", "libswresample")) {
+    $prefix = Get-PkgPrefix $pkg
+    if ($prefix) {
+        $bin = Join-Path ($prefix -replace '/', '\') "bin"
+        if ((Test-Path $bin) -and ($searchDirs -notcontains $bin)) { $searchDirs += $bin }
+    }
+}
+$gcc = Get-Command gcc -ErrorAction SilentlyContinue
+if ($gcc) {
+    $tcBin = Split-Path $gcc.Source
+    if ($searchDirs -notcontains $tcBin) { $searchDirs += $tcBin }
+}
+if ((Test-Path "C:\msys64\mingw64\bin") -and ($searchDirs -notcontains "C:\msys64\mingw64\bin")) {
+    $searchDirs += "C:\msys64\mingw64\bin"
+}
+if (Test-Path "$scDir\bin") {
+    $searchDirs += (Resolve-Path "$scDir\bin").Path
+}
 # vcpkg deliberately NOT searched: its DLLs are MSVC-ABI builds —
 # bundling one next to MinGW binaries is a different-CRT trap.
 
-# Fallback: try pkg-config
 if ($searchDirs.Count -eq 0) {
-    $prefix = & pkg-config --variable=prefix sdl3 2>$null
-    if ($prefix -and (Test-Path (Join-Path $prefix "bin"))) {
-        $searchDirs += Join-Path $prefix "bin"
+    Write-Host "ERROR: no DLL search directories (pkg-config prefixes, gcc, msys64, shadercross all absent)." -ForegroundColor Red
+    exit 1
+}
+Write-Host "      Search dirs (in order):" -ForegroundColor DarkGray
+foreach ($d in $searchDirs) { Write-Host "        $d" -ForegroundColor DarkGray }
+
+# A dependency is "system" by NAME on a fixed allowlist, not by name
+# collision with a file in system32 (review m-S5-c). A name that is
+# found in system32 but is not on the list is reported, not silently
+# trusted.
+$systemAllow = @(
+    "kernel32.dll","user32.dll","gdi32.dll","advapi32.dll","shell32.dll","ole32.dll",
+    "oleaut32.dll","comdlg32.dll","comctl32.dll","ws2_32.dll","winmm.dll","imm32.dll",
+    "version.dll","setupapi.dll","cfgmgr32.dll","dwmapi.dll","shlwapi.dll","uxtheme.dll",
+    "msvcrt.dll","ntdll.dll","bcrypt.dll","crypt32.dll","secur32.dll","dxgi.dll","d3d11.dll",
+    "d3d12.dll","dxcore.dll","opengl32.dll","hid.dll","dinput8.dll","avrt.dll","ksuser.dll",
+    "propsys.dll","wintrust.dll","rpcrt4.dll","sechost.dll","ucrtbase.dll","psapi.dll",
+    "iphlpapi.dll","dbghelp.dll","shcore.dll","windowscodecs.dll","dsound.dll","gdiplus.dll",
+    "netapi32.dll","userenv.dll","wldap32.dll","normaliz.dll","mpr.dll","wtsapi32.dll",
+    "mfplat.dll","mf.dll","mfreadwrite.dll","mfuuid.dll","kernelbase.dll","powrprof.dll",
+    "winhttp.dll","wininet.dll","oleacc.dll","msimg32.dll","d3dcompiler_47.dll",
+    # field 2026-09-06 (first packager run on WIN11 flagged these as WARN):
+    "dwrite.dll","usp10.dll","ncrypt.dll","bcryptprimitives.dll","wsock32.dll","dnsapi.dll"
+)
+$systemDirs = @("C:\Windows\system32", "C:\Windows")
+$resolved = @{}
+$unresolved = @()
+$changed = $true
+
+while ($changed) {
+    $changed = $false
+    $files = Get-ChildItem "$outDir\*.dll", "$outDir\*.exe" -ErrorAction SilentlyContinue
+
+    foreach ($f in $files) {
+        if ($resolved[$f.Name]) { continue }
+        $resolved[$f.Name] = $true
+
+        # Use objdump to find DLL imports
+        $deps = & objdump -p $f.FullName 2>$null | Select-String "DLL Name:" |
+            ForEach-Object { ($_ -replace '.*DLL Name:\s*', '').Trim() }
+
+        foreach ($dep in $deps) {
+            $destPath = Join-Path $outDir $dep
+            if (Test-Path $destPath) { continue }
+            $depL = $dep.ToLower()
+
+            # System DLLs: allowlist by name, or api-ms-win-*/ext-ms-* forwarders
+            if (($systemAllow -contains $depL) -or ($depL -like "api-ms-win-*") -or ($depL -like "ext-ms-*")) { continue }
+
+            # Search the known directories in order
+            $found = $false
+            foreach ($searchDir in $searchDirs) {
+                $srcPath = Join-Path $searchDir $dep
+                if (Test-Path $srcPath) {
+                    Copy-Item $srcPath "$outDir\"
+                    Write-Host "      + $dep  ($searchDir)" -ForegroundColor DarkGray
+                    $changed = $true
+                    $found = $true
+                    break
+                }
+            }
+            if ($found) { continue }
+
+            # Not on the allowlist, not in any search dir: is it a system
+            # DLL we did not list? Say so — never trust by collision silently.
+            $inSys = $false
+            foreach ($sysDir in $systemDirs) {
+                if (Test-Path (Join-Path $sysDir $dep)) { $inSys = $true; break }
+            }
+            if ($inSys) {
+                Write-Host "      WARN: $dep (needed by $($f.Name)) treated as system — found in Windows dir, not on the allowlist" -ForegroundColor Yellow
+                continue
+            }
+            $unresolved += "$dep (needed by $($f.Name))"
+        }
     }
 }
 
-if ($searchDirs.Count -eq 0) {
-    Write-Host "WARNING: No MinGW/vcpkg bin dirs found. Skipping dependency resolution." -ForegroundColor Yellow
-} else {
-    Write-Host "      Search dirs: $($searchDirs -join ', ')" -ForegroundColor DarkGray
+if ($unresolved.Count -gt 0) {
+    Write-Host "ERROR: unresolved imports — not in any search dir and not a known system DLL:" -ForegroundColor Red
+    foreach ($u in ($unresolved | Sort-Object -Unique)) { Write-Host "        $u" -ForegroundColor Red }
+    exit 1
+}
 
-    # Iteratively resolve: check each DLL/exe in outDir, find missing deps
-    $systemDirs = @("C:\Windows\system32", "C:\Windows\SysWOW64", "C:\Windows")
-    $resolved = @{}
-    $changed = $true
-
-    while ($changed) {
-        $changed = $false
-        $files = Get-ChildItem "$outDir\*.dll", "$outDir\*.exe" -ErrorAction SilentlyContinue
-
-        foreach ($f in $files) {
-            if ($resolved[$f.Name]) { continue }
-            $resolved[$f.Name] = $true
-
-            # Use objdump to find DLL imports
-            $deps = & objdump -p $f.FullName 2>$null | Select-String "DLL Name:" |
-                ForEach-Object { ($_ -replace '.*DLL Name:\s*', '').Trim() }
-
-            foreach ($dep in $deps) {
-                $destPath = Join-Path $outDir $dep
-                if (Test-Path $destPath) { continue }
-
-                # Skip system DLLs
-                $isSystem = $false
-                foreach ($sysDir in $systemDirs) {
-                    if (Test-Path (Join-Path $sysDir $dep)) {
-                        $isSystem = $true
-                        break
-                    }
-                }
-                if ($isSystem) { continue }
-
-                # Search all known directories
-                foreach ($searchDir in $searchDirs) {
-                    $srcPath = Join-Path $searchDir $dep
-                    if (Test-Path $srcPath) {
-                        Copy-Item $srcPath "$outDir\"
-                        Write-Host "      + $dep" -ForegroundColor DarkGray
-                        $changed = $true
-                        break
-                    }
-                }
-            }
+# The SDL3.dll that ships must be the one the exe was linked against
+# (review S5-6): compare against the sdl3 pkg-config prefix's copy.
+$sdlPrefix = Get-PkgPrefix "sdl3"
+if ($sdlPrefix) {
+    $refSdl = Join-Path (Join-Path ($sdlPrefix -replace '/', '\') "bin") "SDL3.dll"
+    $outSdl = Join-Path $outDir "SDL3.dll"
+    if ((Test-Path $refSdl) -and (Test-Path $outSdl)) {
+        # .NET hasher, not Get-FileHash: that cmdlet's module does not
+        # auto-load in a PowerShell launched from the MSYS shell (field
+        # 2026-09-06, "not recognized").
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $h1 = [BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes((Resolve-Path $refSdl).Path)))
+        $h2 = [BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes((Resolve-Path $outSdl).Path)))
+        if ($h1 -ne $h2) {
+            Write-Host "ERROR: bundled SDL3.dll differs from $refSdl (the one the exe was linked against)." -ForegroundColor Red
+            exit 1
         }
+        Write-Host "      SDL3.dll matches $refSdl" -ForegroundColor Green
     }
 }
 

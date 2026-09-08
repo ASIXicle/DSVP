@@ -25,6 +25,14 @@
 #endif
 #ifndef _WIN32
   #include <dirent.h>
+  #include <spawn.h>      /* async file dialog: posix_spawnp, no shell */
+  #include <sys/wait.h>
+  #include <fcntl.h>
+  #include <unistd.h>
+  #include <signal.h>
+  #include <errno.h>
+  #include <limits.h>     /* PATH_MAX — the dialog's path buffer */
+  #include <sys/stat.h>   /* mkdir — resume record's state dir */
 #endif
 
 /* Platform-specific file dialog */
@@ -33,6 +41,7 @@
   #include <windows.h>
   #include <commdlg.h>
   #include <shellapi.h>   /* CommandLineToArgvW */
+  #include <direct.h>     /* _mkdir — resume record's %LOCALAPPDATA% dir */
 
 /* Convert UTF-16 wide string to UTF-8.  Caller must free() the result. */
 static char *win_wide_to_utf8(const wchar_t *wstr) {
@@ -62,9 +71,11 @@ static wchar_t *win_utf8_to_wide(const char *str) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Returns 1 if a file was selected (path written to `out`), 0 if cancelled. */
-static int open_file_dialog(char *out, int out_size) {
 #ifdef _WIN32
-    /* Native Win32 file dialog — wide (Unicode) version */
+/* Native Win32 file dialog — wide (Unicode) version. Modal: the common
+ * dialog pumps its own message loop, so the app stays responsive to
+ * the OS while it is up. (Linux uses the async dialog below.) */
+static int open_file_dialog(char *out, int out_size) {
     OPENFILENAMEW ofn;
     wchar_t file[1024] = {0};
 
@@ -90,59 +101,8 @@ static int open_file_dialog(char *out, int out_size) {
         }
     }
     return 0;
-
-#else
-    /* Linux/macOS: try multiple dialog backends */
-    FILE *fp = NULL;
-
-    #ifdef __APPLE__
-    fp = popen("osascript -e 'POSIX path of (choose file of type {\"public.movie\", \"public.audio\"})'", "r");
-    #else
-    /* Try zenity, then kdialog, then yad */
-    const char *commands[] = {
-        "zenity --file-selection --title='Open Media File' "
-            "--file-filter='Media files|*.mkv *.mp4 *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts *.mpg *.mpeg *.mp3 *.flac *.wav *.aac *.ogg *.opus *.m4a *.wma' "
-            "--file-filter='All files|*' 2>/dev/null",
-        "kdialog --getopenfilename . "
-            "'Media files (*.mkv *.mp4 *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts *.mpg *.mpeg *.mp3 *.flac *.wav *.aac *.ogg *.opus *.m4a *.wma)' 2>/dev/null",
-        "yad --file-selection --title='Open Media File' 2>/dev/null",
-        NULL
-    };
-    const char *names[] = { "zenity", "kdialog", "yad" };
-
-    for (int i = 0; commands[i]; i++) {
-        /* Check if the tool exists before trying it */
-        char which_cmd[64];
-        snprintf(which_cmd, sizeof(which_cmd), "which %s >/dev/null 2>&1", names[i]);
-        if (system(which_cmd) == 0) {
-            log_msg("File dialog: using %s", names[i]);
-            fp = popen(commands[i], "r");
-            break;
-        }
-    }
-
-    if (!fp) {
-        log_msg("ERROR: No file dialog available. Install zenity, kdialog, or yad.");
-        log_msg("  Debian/Ubuntu: sudo apt install zenity");
-        log_msg("  Fedora: sudo dnf install zenity");
-        log_msg("  Tip: you can also pass a file path on the command line: ./dsvp video.mp4");
-        return 0;
-    }
-    #endif
-
-    if (!fp) return 0;
-
-    if (fgets(out, out_size, fp)) {
-        /* Remove trailing newline */
-        size_t len = strlen(out);
-        if (len > 0 && out[len - 1] == '\n') out[len - 1] = '\0';
-        pclose(fp);
-        return (strlen(out) > 0) ? 1 : 0;
-    }
-    pclose(fp);
-    return 0;
-#endif
 }
+#endif /* _WIN32 */
 
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -508,8 +468,13 @@ static void set_fullscreen(PlayerState *ps, SDL_Window *window, bool want_fs) {
          * in-flight seek plays run-ahead audio through the recovery
          * window, then recovery clears and clock-snaps it. */
         if (!ps->paused && !ps->seek_request && !ps->seek_recovering
-                && ps->audio_stream)
+                && !ps->seeking && ps->audio_stream)
             SDL_ResumeAudioStreamDevice(ps->audio_stream);
+        else if (!ps->paused && ps->seeking)
+            /* Between the demux clearing seek_request (4793) and arming
+             * seek_recovering (4926) neither old gate term is set, yet
+             * the device is paused for the flush (review d-D2-4). */
+            log_msg("FS: audio resume deferred (seek in flight)");
     }
     log_msg("FS: %s", want_fs ? "entered fullscreen (borderless)"
                               : "returned to windowed");
@@ -519,6 +484,529 @@ static void toggle_fullscreen(PlayerState *ps, SDL_Window *window) {
     bool is_fs = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0;
     set_fullscreen(ps, window, !is_fs);
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Resume last file (end-user request 2026-09-07, Holden's shape:
+ * position preferred, only the LAST file, idle-screen R, minimal)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * One file, three lines: a tag, the position in seconds, the path.
+ * It lives next to the executable like the log and the shader cache
+ * (the portable ethos) when that directory is writable; installed
+ * builds (Program Files, /usr/lib/dsvp) fall back to the per-user
+ * state dir (%LOCALAPPDATA%\DSVP, $XDG_STATE_HOME/dsvp). Nothing else
+ * is recorded, nothing leaves the machine, and DSVP_NO_RESUME=1 makes
+ * this code read and write nothing. Saved every 10 s while playing
+ * and at every close, so a crash still resumes near the spot; cleared
+ * when a file plays to its end. */
+static int resume_enabled(void) {
+    return SDL_getenv("DSVP_NO_RESUME") == NULL;
+}
+
+/* File ops for the record. Windows (field 2026-09-07, first Win11
+ * build with resume): the C library's rename() REFUSES to overwrite an
+ * existing file — so the first save landed, every later one failed and
+ * fell through to the %LOCALAPPDATA% copy (which then also stuck), and
+ * R offered the first file ever opened. Same class as the log sink
+ * (review DM26): narrow fopen reads a UTF-8 path in the ANSI code page,
+ * so a non-ASCII profile or media name fails silently. Wide paths and
+ * MoveFileExW(REPLACE_EXISTING) on Windows; plain POSIX elsewhere. */
+#ifdef _WIN32
+static FILE *resume_fopen(const char *path, const wchar_t *mode) {
+    wchar_t *w = win_utf8_to_wide(path);
+    if (!w) return NULL;
+    FILE *f = _wfopen(w, mode);
+    free(w);
+    return f;
+}
+static int resume_replace(const char *from, const char *to) {
+    wchar_t *wf = win_utf8_to_wide(from), *wt = win_utf8_to_wide(to);
+    int rc = -1;
+    if (wf && wt) rc = MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
+    free(wf); free(wt);
+    return rc;
+}
+static int resume_remove(const char *path) {
+    wchar_t *w = win_utf8_to_wide(path);
+    if (!w) return -1;
+    int rc = _wremove(w);
+    free(w);
+    return rc;
+}
+static int resume_mkdir(const char *p) {
+    wchar_t *w = win_utf8_to_wide(p);
+    if (!w) return -1;
+    int rc = _wmkdir(w);
+    free(w);
+    return rc;
+}
+#define RESUME_MODE_R  L"r"
+#define RESUME_MODE_RB L"rb"
+#define RESUME_MODE_W  L"w"
+#else
+static FILE *resume_fopen(const char *path, const char *mode) { return fopen(path, mode); }
+static int resume_replace(const char *from, const char *to) { return rename(from, to); }
+static int resume_remove(const char *path) { return remove(path); }
+static int resume_mkdir(const char *p) { return mkdir(p, 0755); }
+#define RESUME_MODE_R  "r"
+#define RESUME_MODE_RB "rb"
+#define RESUME_MODE_W  "w"
+#endif
+
+/* which: 0 = next to the executable, 1 = per-user state dir. Returns 0
+ * with the full path of dsvp.resume in out, -1 if that place is not
+ * available on this system. */
+static int resume_location(int which, char *out, size_t n) {
+    if (which == 0) {
+        const char *base = SDL_GetBasePath();
+        if (!base) return -1;
+        return (snprintf(out, n, "%sdsvp.resume", base) < (int)n) ? 0 : -1;
+    }
+#ifdef _WIN32
+    const char *base = SDL_getenv("LOCALAPPDATA");
+    if (!base || !base[0]) return -1;
+    char dir[1024];
+    if (snprintf(dir, sizeof(dir), "%s\\DSVP", base) >= (int)sizeof(dir)) return -1;
+    resume_mkdir(dir);
+    return (snprintf(out, n, "%s\\dsvp.resume", dir) < (int)n) ? 0 : -1;
+#else
+    const char *xdg = SDL_getenv("XDG_STATE_HOME");
+    const char *home = SDL_getenv("HOME");
+    char dir[1024];
+    if (xdg && xdg[0]) {
+        if (snprintf(dir, sizeof(dir), "%s/dsvp", xdg) >= (int)sizeof(dir)) return -1;
+    } else if (home && home[0]) {
+        char mid[1024];
+        if (snprintf(mid, sizeof(mid), "%s/.local", home) >= (int)sizeof(mid)) return -1;
+        resume_mkdir(mid);
+        if (snprintf(mid, sizeof(mid), "%s/.local/state", home) >= (int)sizeof(mid)) return -1;
+        resume_mkdir(mid);
+        if (snprintf(dir, sizeof(dir), "%s/.local/state/dsvp", home) >= (int)sizeof(dir)) return -1;
+    } else return -1;
+    resume_mkdir(dir);
+    return (snprintf(out, n, "%s/dsvp.resume", dir) < (int)n) ? 0 : -1;
+#endif
+}
+
+static void resume_load(PlayerState *ps) {
+    ps->resume_path[0] = '\0';
+    ps->resume_pos = 0.0;
+    if (!resume_enabled()) { log_msg("Resume: disabled (DSVP_NO_RESUME)"); return; }
+    for (int which = 0; which < 2; which++) {
+        char path[1100];
+        if (resume_location(which, path, sizeof(path)) != 0) continue;
+        FILE *f = resume_fopen(path, RESUME_MODE_R);
+        if (!f) continue;
+        char tag[32] = "", pos[64] = "", file[1024] = "";
+        int ok = fgets(tag, sizeof(tag), f) && fgets(pos, sizeof(pos), f)
+              && fgets(file, sizeof(file), f);
+        fclose(f);
+        if (!ok || strncmp(tag, "DSVP-RESUME 1", 13) != 0) {
+            log_msg("Resume: %s is not a resume record — ignored", path);
+            continue;
+        }
+        file[strcspn(file, "\r\n")] = '\0';
+        double p = atof(pos);
+        if (!file[0]) continue;
+        FILE *probe = resume_fopen(file, RESUME_MODE_RB);
+        if (!probe) {
+            log_msg("Resume: last file is no longer readable — forgotten (%s)", file);
+            continue;
+        }
+        fclose(probe);
+        snprintf(ps->resume_path, sizeof(ps->resume_path), "%s", file);
+        ps->resume_pos = p > 0.0 ? p : 0.0;
+        log_msg("Resume: last file at %.1f s (R on the idle screen) — record in %s",
+                ps->resume_pos, path);
+        return;
+    }
+}
+
+static void resume_write(PlayerState *ps, const char *file, double pos) {
+    if (!resume_enabled()) return;
+    for (int which = 0; which < 2; which++) {
+        char path[1100], tmp[1110];
+        if (resume_location(which, path, sizeof(path)) != 0) continue;
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        FILE *f = resume_fopen(tmp, RESUME_MODE_W);
+        if (!f) continue;                    /* not writable here — next place */
+        fprintf(f, "DSVP-RESUME 1\n%.3f\n%s\n", pos, file);
+        fclose(f);
+        if (resume_replace(tmp, path) != 0) {
+            log_msg("Resume: could not replace %s — trying the next place", path);
+            resume_remove(tmp);
+            continue;
+        }
+        static int s_logged = 0;
+        if (!s_logged) {
+            log_msg("Resume: record kept in %s", path);
+            s_logged = 1;
+        }
+        snprintf(ps->resume_path, sizeof(ps->resume_path), "%s", file);
+        ps->resume_pos = pos;
+        return;
+    }
+}
+
+/* Called while a file is open: remember it and where we are. */
+static void resume_save(PlayerState *ps) {
+    if (!ps->playing || !ps->filepath[0]) return;
+    double pos = (ps->video_stream_idx >= 0) ? ps->video_clock : ps->audio_clock_sync;
+    if (pos < 0.0) pos = 0.0;
+    resume_write(ps, ps->filepath, pos);
+}
+
+/* The file played to its end: nothing to come back to. */
+static void resume_clear(PlayerState *ps) {
+    ps->resume_path[0] = '\0';
+    ps->resume_pos = 0.0;
+    if (!resume_enabled()) return;
+    for (int which = 0; which < 2; which++) {
+        char path[1100];
+        if (resume_location(which, path, sizeof(path)) == 0) resume_remove(path);
+    }
+}
+
+#ifndef _WIN32
+/* ═══════════════════════════════════════════════════════════════════
+ * Async file dialog (Linux)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * The old popen()+fgets() dialog blocked the event loop for the whole
+ * life of the dialog: KWin saw an unresponsive window, the fullscreen
+ * surface hid the dialog, and the only exit was KWin's kill prompt
+ * (SIGABRT so coredumpd records it, then SIGKILL — dellbian core
+ * 2026-09-05: seven threads all parked in syscalls, none ours).
+ *
+ * Everything here runs from the main loop, once per tick, and NEVER
+ * waits (review C3/DM4: the first async version still had a 500 ms
+ * sleep-loop reap and an unbounded post-SIGKILL waitpid — reached on
+ * every EOF-before-exit completion, on Esc, and at shutdown ahead of
+ * the display revert). The child's life is a small state machine:
+ *
+ *   spawned ──(pipe EOF)──► eof ──(exit)──► done
+ *      │                     │ 500 ms         ▲
+ *      │ Esc                 ▼ no exit        │
+ *      └──► SIGTERM ──500ms──► SIGKILL ──2 s──► ABANDONED (logged;
+ *                                               init reaps it)
+ *
+ * Each arrow is a deadline checked at the next tick, so playback and
+ * events keep running throughout. The tool runs in its OWN process
+ * group so a forking wrapper (snap/flatpak shim) dies with it; the
+ * pipe fds are close-on-exec so the child inherits neither the log
+ * nor the media fd; SIGCHLD is reset to default at startup (main),
+ * so waitpid cannot come back ECHILD from a launcher that ignored it
+ * — and if it ever does, that is logged, not read as "exit 0".
+ */
+typedef struct {
+    int    active;
+    pid_t  pid;
+    int    fd;                  /* read end, -1 once closed             */
+    char   buf[PATH_MAX + 2];   /* the chosen path (+ newline + NUL)    */
+    int    len;
+    int    overflow;            /* the tool wrote more than PATH_MAX    */
+    int    was_fullscreen;
+    int    eof;                 /* pipe closed by the tool              */
+    int    exited;              /* waitpid reaped it (or lost it)       */
+    int    lost;                /* waitpid ECHILD — status unknown      */
+    int    abandoned;           /* did not die after SIGKILL            */
+    int    cancel;              /* Esc pressed                          */
+    int    status;              /* raw waitpid status when exited       */
+    double t_start, t_eof, t_term, t_kill;
+} FileDialog;
+static FileDialog s_dlg = { .active = 0, .pid = -1, .fd = -1 };
+
+extern char **environ;
+
+#define DLG_EXIT_GRACE_S   0.5   /* EOF → exit expected within this       */
+#define DLG_TERM_GRACE_S   0.5   /* SIGTERM → exit expected within this   */
+#define DLG_KILL_GRACE_S   2.0   /* SIGKILL → exit; then abandon           */
+
+static void dialog_signal(int sig) {
+    /* The whole process group: the tool AND anything it forked. */
+    if (kill(-s_dlg.pid, sig) != 0) kill(s_dlg.pid, sig);
+}
+
+/* Spawn argv (own process group) with stdout piped to us and stderr to
+ * /dev/null. Returns 0 with pid/fd filled, -1 on failure (tool missing
+ * → try the next). */
+static int dialog_spawn(char *const argv[], pid_t *pid_out, int *fd_out) {
+    int pfds[2];
+    if (pipe(pfds) != 0) return -1;
+    /* close-on-exec on both ends: the child must inherit nothing but
+     * its dup2'd stdout (review d-D2-7 — it used to inherit the log fd,
+     * the media fd and the DRM/display sockets). */
+    fcntl(pfds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pfds[1], F_SETFD, FD_CLOEXEC);
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, pfds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null",
+                                     O_WRONLY, 0);
+    posix_spawnattr_t at;
+    posix_spawnattr_init(&at);
+    posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
+    posix_spawnattr_setpgroup(&at, 0);       /* new group, id = child pid */
+    pid_t pid = -1;
+    int rc = posix_spawnp(&pid, argv[0], &fa, &at, argv, environ);
+    posix_spawnattr_destroy(&at);
+    posix_spawn_file_actions_destroy(&fa);
+    close(pfds[1]);
+    if (rc != 0) { close(pfds[0]); return -1; }
+    int fl = fcntl(pfds[0], F_GETFL, 0);
+    if (fl >= 0) fcntl(pfds[0], F_SETFL, fl | O_NONBLOCK);
+    *pid_out = pid;
+    *fd_out  = pfds[0];
+    return 0;
+}
+
+static void dialog_begin(PlayerState *ps, SDL_Window *window) {
+    if (s_dlg.active) {
+        log_msg("File dialog: already open (pid %d)", (int)s_dlg.pid);
+        return;
+    }
+    log_msg("File open dialog requested");
+    static const char *filt =
+        "*.mkv *.mp4 *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts *.mpg "
+        "*.mpeg *.mp3 *.flac *.wav *.aac *.ogg *.opus *.m4a *.wma";
+    char zfilt[320], kfilt[320];
+    snprintf(zfilt, sizeof(zfilt), "--file-filter=Media files|%s", filt);
+    snprintf(kfilt, sizeof(kfilt), "Media files (%s)", filt);
+    char *argv_zenity[]  = { "zenity", "--file-selection",
+                             "--title=Open Media File", zfilt,
+                             "--file-filter=All files|*", NULL };
+    char *argv_kdialog[] = { "kdialog", "--getopenfilename", ".", kfilt,
+                             NULL };
+    char *argv_yad[]     = { "yad", "--file-selection",
+                             "--title=Open Media File", NULL };
+    char *const *tools[] = { argv_zenity, argv_kdialog, argv_yad };
+    for (int i = 0; i < 3; i++) {
+        if (dialog_spawn(tools[i], &s_dlg.pid, &s_dlg.fd) == 0) {
+            log_msg("File dialog: using %s (async; Esc cancels; pid %d)",
+                    tools[i][0], (int)s_dlg.pid);
+            FileDialog d = { .active = 1, .pid = s_dlg.pid, .fd = s_dlg.fd };
+            s_dlg = d;
+            s_dlg.t_start = get_time_sec();
+            /* A fullscreen surface can sit above the dialog under KWin
+             * — windowed while it is up, restored as found after. The
+             * window flag can lag a pending Wayland transition, so the
+             * intent mirror counts too (review d-D2-6). */
+            s_dlg.was_fullscreen =
+                ((SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0)
+                || ps->fullscreen;
+            if (s_dlg.was_fullscreen) set_fullscreen(ps, window, false);
+            snprintf(ps->aud_osd, sizeof(ps->aud_osd),
+                     "File dialog open — Esc cancels");
+            ps->aud_osd_until = get_time_sec() + 3600.0;
+            return;
+        }
+    }
+    log_msg("ERROR: No file dialog available. Install zenity, kdialog, or yad.");
+    log_msg("  Debian/Ubuntu: sudo apt install zenity");
+    log_msg("  Tip: you can also pass a file path on the command line: ./dsvp video.mp4");
+}
+
+/* Read everything currently available (non-blocking). Sets s_dlg.eof
+ * at pipe EOF. Past the buffer the rest is drained and discarded so
+ * the tool can never block on a full pipe; overflow is remembered. */
+static void dialog_drain(void) {
+    if (s_dlg.fd < 0 || s_dlg.eof) return;
+    for (;;) {
+        char scratch[256];
+        int room = (int)sizeof(s_dlg.buf) - 1 - s_dlg.len;
+        char *dst = room > 0 ? s_dlg.buf + s_dlg.len : scratch;
+        size_t want = room > 0 ? (size_t)room : sizeof(scratch);
+        ssize_t n = read(s_dlg.fd, dst, want);
+        if (n > 0) {
+            if (room > 0) { s_dlg.len += (int)n; s_dlg.buf[s_dlg.len] = '\0'; }
+            else s_dlg.overflow = 1;
+            continue;
+        }
+        if (n == 0) { s_dlg.eof = 1; s_dlg.t_eof = get_time_sec(); return; }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        s_dlg.eof = 1; s_dlg.t_eof = get_time_sec();   /* read error = EOF */
+        return;
+    }
+}
+
+static void dialog_cancel(void) {
+    if (!s_dlg.active || s_dlg.cancel) return;
+    log_msg("File dialog: cancel requested (Esc) — SIGTERM pid %d", (int)s_dlg.pid);
+    s_dlg.cancel = 1;
+    s_dlg.t_term = get_time_sec();
+    dialog_signal(SIGTERM);
+}
+
+/* One non-blocking waitpid. Sets exited (and lost on ECHILD). */
+static void dialog_check_exit(void) {
+    if (s_dlg.exited) return;
+    int status = 0;
+    pid_t r;
+    do { r = waitpid(s_dlg.pid, &status, WNOHANG); } while (r < 0 && errno == EINTR);
+    if (r == s_dlg.pid) {
+        s_dlg.exited = 1; s_dlg.status = status;
+    } else if (r < 0) {
+        /* ECHILD: nobody to reap — SIGCHLD ignored by an ancestor, or
+         * the pid was never ours. Never read that as "exit 0" (DM5). */
+        log_msg("File dialog: waitpid lost the child (errno %d) — status unknown", errno);
+        s_dlg.exited = 1; s_dlg.lost = 1; s_dlg.status = 0;
+    }
+}
+
+/* Escalate once per tick, by deadline, never by sleeping. Returns 1
+ * when the child is gone (exited, lost, or abandoned). */
+static int dialog_advance(double now) {
+    dialog_drain();
+    dialog_check_exit();
+    if (s_dlg.exited) return 1;
+
+    if (s_dlg.t_kill > 0.0) {
+        if (now - s_dlg.t_kill > DLG_KILL_GRACE_S) {
+            log_msg("File dialog: pid %d did not exit %.0f ms after SIGKILL "
+                    "— abandoning it (a stuck syscall; init reaps it)",
+                    (int)s_dlg.pid, (now - s_dlg.t_kill) * 1000.0);
+            s_dlg.abandoned = 1;
+            return 1;
+        }
+        return 0;
+    }
+    if (s_dlg.t_term > 0.0) {
+        if (now - s_dlg.t_term > DLG_TERM_GRACE_S) {
+            log_msg("File dialog: pid %d ignored SIGTERM for %.0f ms — SIGKILL",
+                    (int)s_dlg.pid, (now - s_dlg.t_term) * 1000.0);
+            s_dlg.t_kill = now;
+            dialog_signal(SIGKILL);
+        }
+        return 0;
+    }
+    if (s_dlg.eof) {
+        /* Normal completion: the pipe closed first, the exit follows.
+         * kdialog can spend a while tearing down D-Bus state here —
+         * the loop keeps running; only a stuck tool gets TERM. */
+        if (now - s_dlg.t_eof > DLG_EXIT_GRACE_S) {
+            log_msg("File dialog: pid %d still running %.0f ms after EOF — SIGTERM",
+                    (int)s_dlg.pid, (now - s_dlg.t_eof) * 1000.0);
+            s_dlg.t_term = now;
+            dialog_signal(SIGTERM);
+        }
+        return 0;
+    }
+    return 0;   /* still up, no output yet */
+}
+
+/* The child is gone: close, restore, act on the answer. */
+static void dialog_finish(PlayerState *ps, SDL_Window *window) {
+    double now = get_time_sec();
+    if (s_dlg.fd >= 0) { close(s_dlg.fd); s_dlg.fd = -1; }
+    s_dlg.active = 0;
+    ps->aud_osd[0] = '\0';
+    if (window && s_dlg.was_fullscreen) set_fullscreen(ps, window, true);
+    if (!s_dlg.abandoned && !s_dlg.lost)
+        log_msg("File dialog: reaped pid %d in %.0f ms%s", (int)s_dlg.pid,
+                (now - s_dlg.t_start) * 1000.0,
+                s_dlg.cancel ? " (after Esc)" : "");
+
+    char *nl = strchr(s_dlg.buf, '\n');      /* first line only */
+    if (nl) *nl = '\0';
+    if (s_dlg.overflow) {
+        log_msg("File dialog: path exceeds %d bytes — ignored", PATH_MAX);
+        return;
+    }
+    if (s_dlg.buf[0] == '\0' || s_dlg.cancel) {
+        /* Honest instrument: a tool that failed to run looks exactly
+         * like a user cancel from the pipe alone. zenity: 1 = cancel,
+         * 5 = timeout, -1/255 = error (stderr is discarded). */
+        if (s_dlg.abandoned)
+            log_msg("File dialog cancelled (tool abandoned after SIGKILL)");
+        else if (s_dlg.lost)
+            log_msg("File dialog cancelled (tool status unknown — child lost)");
+        else if (WIFEXITED(s_dlg.status))
+            log_msg("File dialog cancelled (tool exit %d)", WEXITSTATUS(s_dlg.status));
+        else if (WIFSIGNALED(s_dlg.status))
+            log_msg("File dialog cancelled (tool killed by signal %d%s)",
+                    WTERMSIG(s_dlg.status), s_dlg.cancel ? ", ours" : "");
+        else
+            log_msg("File dialog cancelled");
+        return;
+    }
+    /* Validate BEFORE closing the film that is playing (review d-D2-5):
+     * a truncated or vanished path used to land the user in the idle
+     * screen with nothing open. */
+    if (access(s_dlg.buf, R_OK) != 0) {
+        log_msg("File dialog: '%s' is not readable (errno %d) — keeping the current file",
+                s_dlg.buf, errno);
+        return;
+    }
+    log_msg("Opening file: %s", s_dlg.buf);
+    if (ps->playing) { resume_save(ps); player_close(ps); }
+    ps->quit = 0;
+    if (player_open(ps, s_dlg.buf) != 0) {
+        log_msg("ERROR: Failed to open: %s", s_dlg.buf);
+    } else {
+        reset_gain(ps);
+        playlist_scan(ps);
+    }
+}
+
+/* Once per main-loop tick: never blocks. */
+static void dialog_poll(PlayerState *ps, SDL_Window *window) {
+    if (!s_dlg.active) return;
+    if (dialog_advance(get_time_sec()))
+        dialog_finish(ps, window);
+}
+
+/* Shutdown: never leave a dialog process behind, never block the exit
+ * for more than the TERM+KILL graces (~2.5 s worst case, only for a
+ * tool that ignores SIGKILL — i.e. one stuck in a syscall). Runs AFTER
+ * the display revert (main), so a stuck dialog cannot hold the
+ * desktop in HDR. */
+static void dialog_shutdown(void) {
+    if (!s_dlg.active) return;
+    log_msg("File dialog: shutdown with dialog up — SIGTERM pid %d", (int)s_dlg.pid);
+    s_dlg.cancel = 1;
+    s_dlg.t_term = get_time_sec();
+    dialog_signal(SIGTERM);
+    for (;;) {
+        double now = get_time_sec();
+        if (dialog_advance(now)) break;
+        if (now - s_dlg.t_term > DLG_TERM_GRACE_S + DLG_KILL_GRACE_S + 0.5) {
+            log_msg("File dialog: shutdown wait exhausted — leaving pid %d to init",
+                    (int)s_dlg.pid);
+            break;
+        }
+        SDL_Delay(10);
+    }
+    /* Say what happened (batch 11a field 2026-09-07: the normal case —
+     * tool exits on SIGTERM — logged the request and then nothing;
+     * dialog_finish's reap line never runs on this path). */
+    if (s_dlg.exited && !s_dlg.lost) {
+        char how[32];
+        if (WIFEXITED(s_dlg.status))
+            snprintf(how, sizeof(how), "exit %d", WEXITSTATUS(s_dlg.status));
+        else if (WIFSIGNALED(s_dlg.status))
+            snprintf(how, sizeof(how), "signal %d", WTERMSIG(s_dlg.status));
+        else
+            snprintf(how, sizeof(how), "status 0x%x", s_dlg.status);
+        log_msg("File dialog: reaped pid %d at shutdown, %.0f ms after SIGTERM (%s)",
+                (int)s_dlg.pid, (get_time_sec() - s_dlg.t_term) * 1000.0, how);
+    }
+    if (s_dlg.fd >= 0) { close(s_dlg.fd); s_dlg.fd = -1; }
+    s_dlg.active = 0;
+}
+#endif /* !_WIN32 */
+
+#ifndef _WIN32
+static volatile sig_atomic_t s_sig_quit = 0;
+static void sig_quit_handler(int sig) {
+    if (s_sig_quit) {            /* second signal: stop being polite */
+        signal(sig, SIG_DFL);
+        raise(sig);
+        return;
+    }
+    s_sig_quit = sig;
+}
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════
  * Main
@@ -531,6 +1019,30 @@ int main(int argc, char *argv[]) {
     log_msg("Starting DSVP v" DSVP_VERSION " build " DSVP_GIT_COMMIT " (argc=%d)", argc);
     log_msg("FFmpeg %s (libavcodec %d.%d)", av_version_info(),
             LIBAVCODEC_VERSION_MAJOR, LIBAVCODEC_VERSION_MINOR);
+
+    /* Reconcile a dead session's display stamp BEFORE anything probes
+     * or touches display state (crash-restore, deck lineage — no-op
+     * on Windows and when no stamp exists). */
+    hdr_sys_reconcile_stamp();
+
+#ifndef _WIN32
+    /* SIG_IGN for SIGCHLD survives execve: a launcher that ignores it
+     * (some systemd --user units) makes every waitpid on the file
+     * dialog return ECHILD and the dialog would be torn down before
+     * the user saw it (review DM5). Default disposition, always. */
+    signal(SIGCHLD, SIG_DFL);
+    /* SIGTERM (Plasma logout), SIGINT (Ctrl-C in the launching
+     * terminal — the developer's and first tester's normal exit) and
+     * SIGHUP used to kill the process with the display still in HDR and
+     * 203 held; only atexit reverted, and signals skip it (review
+     * DM14). The handler only raises a flag; the main loop turns it
+     * into the normal quit so hdr_output_shutdown and the dialog reap
+     * run in order. A second signal while shutting down takes the
+     * default action. */
+    signal(SIGTERM, sig_quit_handler);
+    signal(SIGINT,  sig_quit_handler);
+    signal(SIGHUP,  sig_quit_handler);
+#endif
 
     /* ── Get UTF-8 filepath from command line ──
      * On Windows, argv[] is in the system ANSI codepage, which corrupts
@@ -688,6 +1200,20 @@ int main(int argc, char *argv[]) {
     ps.hdr_target_idx = 0;  /* default: 203 nits (industry standard) */
     ps.gpu_uniforms.hdr_target_nits = 203.0f;
     ps.gpu_uniforms.hdr_midtone_gain = 1.3f;  /* default: moderate midtone lift */
+    /* x64 default: TONE-MAP, passthrough opt-in via Z (Holden
+     * 2026-08-27, deliberate DIVERGENCE from deck parity): desktop
+     * HDR on typical Windows panels (IPS, edge-lit) is poor — the
+     * deck's docked-OLED world is where passthrough wins, and most
+     * x64 users are on the panels where it doesn't. Our reference
+     * tone map (PQ-domain BT.2390 + black lift, verified to 0.006
+     * codes) is the better default picture here. DSVP_HDR_PASS=1
+     * restores passthrough-by-default for the OLED-monitor minority
+     * without a per-launch keypress. */
+    ps.hdr_out_mode = SDL_getenv("DSVP_HDR_PASS") ? 1 : 0;
+    log_msg("HDR output default: %s (Z toggles%s)",
+            ps.hdr_out_mode ? "passthrough (DSVP_HDR_PASS)"
+                            : "tone-map",
+            ps.hdr_out_mode ? "" : "; DSVP_HDR_PASS=1 for passthrough default");
 
     /* Audio passthrough mode: PCM (default), auto (probe HDMI), passthrough (force).
      * Set via DSVP_AUDIO_MODE environment variable. */
@@ -717,6 +1243,8 @@ int main(int argc, char *argv[]) {
     }
 
     /* ── Open file from command line if provided ── */
+    resume_load(&ps);
+
     if (open_path) {
         if (player_open(&ps, open_path) != 0) {
             log_msg("ERROR: Failed to open: %s", open_path);
@@ -730,12 +1258,21 @@ int main(int argc, char *argv[]) {
 
     /* ── Main loop ── */
     while (!ps.quit) {
+#ifndef _WIN32
+        if (s_sig_quit) {
+            log_msg("Signal %d received — shutting down cleanly (display revert runs)",
+                    (int)s_sig_quit);
+            ps.quit = 1;
+            break;
+        }
+        dialog_poll(&ps, window);   /* async file dialog, if one is up */
+#endif
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
 
             case SDL_EVENT_QUIT:
-                if (ps.playing) player_close(&ps);
+                if (ps.playing) { resume_save(&ps); player_close(&ps); }
                 ps.quit = 1;
                 break;
 
@@ -752,6 +1289,8 @@ int main(int argc, char *argv[]) {
 
                 case SDLK_Q:
                     if (ps.playing) {
+                        resume_save(&ps);
+                        resume_save(&ps);
                         player_close(&ps);
                         ps.quit = 0; /* don't exit, return to idle */
                     } else {
@@ -760,15 +1299,16 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDLK_O: {
+#ifdef _WIN32
                     char path[1024] = {0};
                     log_msg("File open dialog requested");
-                    /* Pause audio while dialog blocks the render loop */
+                    /* Pause audio while the modal dialog holds the loop */
                     int was_playing = ps.playing && !ps.paused;
                     if (was_playing && ps.audio_stream)
                         SDL_PauseAudioStreamDevice(ps.audio_stream);
                     if (open_file_dialog(path, sizeof(path))) {
                         log_msg("Opening file: %s", path);
-                        if (ps.playing) player_close(&ps);
+                        if (ps.playing) { resume_save(&ps); player_close(&ps); }
                         ps.quit = 0;
                         if (player_open(&ps, path) != 0) {
                             log_msg("ERROR: Failed to open: %s", path);
@@ -781,14 +1321,50 @@ int main(int argc, char *argv[]) {
                         /* Resume audio and resync frame timer (not
                          * during an in-flight seek — its recovery
                          * path owns the resume then) */
-                        if (was_playing && ps.audio_stream) {
-                            ps.frame_timer = get_time_sec();
-                            if (!ps.seek_request && !ps.seek_recovering)
+                        if (was_playing) {
+                            ps.frame_timer = get_time_sec();   /* also video-only (d-D1-7) */
+                            if (ps.audio_stream && !ps.seek_request
+                                    && !ps.seek_recovering && !ps.seeking)
                                 SDL_ResumeAudioStreamDevice(ps.audio_stream);
                         }
                     }
+#else
+                    /* Async: playback and events keep running; the
+                     * answer lands in dialog_poll at the loop top. */
+                    dialog_begin(&ps, window);
+#endif
                     break;
                 }
+
+                case SDLK_ESCAPE:
+#ifndef _WIN32
+                    dialog_cancel();
+#endif
+                    break;
+
+                case SDLK_R:
+                    /* Idle screen only: open the remembered file and go
+                     * to the remembered spot (2 s early — a pre-roll so
+                     * the moment is not clipped by the seek landing). */
+                    if (!ps.playing && ps.resume_path[0]) {
+                        double at = ps.resume_pos;
+                        log_msg("Resume: opening %s at %.1f s (R)", ps.resume_path, at);
+                        if (player_open(&ps, ps.resume_path) != 0) {
+                            log_msg("ERROR: Failed to open: %s", ps.resume_path);
+                        } else {
+                            reset_gain(&ps);
+                            playlist_scan(&ps);
+                            /* Backward: land on the keyframe before the
+                             * spot. A forward seek overshoots by a whole
+                             * GOP (field 2026-09-07: +10 s on a 10 s GOP). */
+                            if (at > 3.0) player_seek_abs(&ps, at - 2.0, 1);
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                     "Resumed at %d:%02d:%02d",
+                                     (int)at / 3600, ((int)at / 60) % 60, (int)at % 60);
+                            ps.aud_osd_until = get_time_sec() + 3.0;
+                        }
+                    }
+                    break;
 
                 case SDLK_SPACE:
                     if (ps.playing) {
@@ -796,7 +1372,8 @@ int main(int argc, char *argv[]) {
                         if (ps.audio_stream) {
                             if (ps.paused)
                                 SDL_PauseAudioStreamDevice(ps.audio_stream);
-                            else if (!ps.seek_request && !ps.seek_recovering)
+                            else if (!ps.seek_request && !ps.seek_recovering
+                                     && !ps.seeking)
                                 SDL_ResumeAudioStreamDevice(ps.audio_stream);
                             /* else: seek recovery owns the resume */
                         }
@@ -837,6 +1414,13 @@ int main(int argc, char *argv[]) {
 
                 case SDLK_H:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                        if (ps.hdr_out_active) {
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                     "HDR debug: no effect in passthrough "
+                                     "(Z = tone-map)");
+                            ps.aud_osd_until = get_time_sec() + 2.0;
+                            break;
+                        }
                         int mode = (int)ps.gpu_uniforms.hdr_debug;
                         mode = (mode + 1) % 4;
                         ps.gpu_uniforms.hdr_debug = (float)mode;
@@ -856,6 +1440,13 @@ int main(int argc, char *argv[]) {
 
                 case SDLK_T:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                        if (ps.hdr_out_active) {
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                     "SDR target: no effect in passthrough "
+                                     "(Z = tone-map)");
+                            ps.aud_osd_until = get_time_sec() + 2.0;
+                            break;
+                        }
                         static const float targets[] = { 203.0f, 300.0f, 400.0f };
                         ps.hdr_target_idx = (ps.hdr_target_idx + 1) % 3;
                         ps.gpu_uniforms.hdr_target_nits = targets[ps.hdr_target_idx];
@@ -870,6 +1461,13 @@ int main(int argc, char *argv[]) {
 
                 case SDLK_G:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                        if (ps.hdr_out_active) {
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                     "Midtone gain: no effect in passthrough "
+                                     "(Z = tone-map)");
+                            ps.aud_osd_until = get_time_sec() + 2.0;
+                            break;
+                        }
                         static const float gains[] = { 1.0f, 1.1f, 1.2f, 1.3f, 1.35f, 1.4f };
                         s_gain_idx = (s_gain_idx + 1) % 6;
                         ps.gpu_uniforms.hdr_midtone_gain = gains[s_gain_idx];
@@ -879,6 +1477,30 @@ int main(int argc, char *argv[]) {
                         ps.aud_osd_until = get_time_sec() + 2.0;
                         log_msg("HDR: midtone gain changed to %.2f",
                                 gains[s_gain_idx]);
+                    }
+                    break;
+
+                case SDLK_Z:
+                    if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
+                        ps.hdr_out_mode = ps.hdr_out_mode ? 0 : 1;
+                        hdr_output_apply(&ps);
+                        if (ps.hdr_out_mode && !ps.hdr_out_active) {
+                            /* Vetoed (no ST2084, engage failed): drop the
+                             * mode back so the NEXT Z retries instead of
+                             * being a tone-map→tone-map no-op (deck
+                             * minor 8: "Z after a veto needs two presses"). */
+                            ps.hdr_out_mode = 0;
+                            log_msg("HDR out: passthrough vetoed — mode reset, next Z retries");
+                        }
+                        ps.cache_valid = 0;  /* render path changed — re-shade */
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd),
+                                 "HDR output: %s",
+                                 ps.hdr_out_active
+                                     ? "passthrough (display tone-maps)"
+                                     : "tone-map (SDR)");
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                        log_msg("HDR out: Z toggle — mode=%d active=%d",
+                                ps.hdr_out_mode, ps.hdr_out_active);
                     }
                     break;
 
@@ -897,6 +1519,51 @@ int main(int argc, char *argv[]) {
                 case SDLK_RIGHT:
                     player_seek(&ps, SEEK_STEP_SEC);
                     break;
+
+                /* Chapters (end-user request 2026-09-07). PgDn = next,
+                 * PgUp = start of the current one, or the previous one
+                 * when we are within 3 s of its start (the disc-player
+                 * convention). Backward seeks: a chapter start must
+                 * never be overshot. */
+                case SDLK_PAGEDOWN:
+                case SDLK_PAGEUP: {
+                    if (!ps.playing) break;
+                    if (ps.nb_chapters <= 0) {
+                        snprintf(ps.aud_osd, sizeof(ps.aud_osd), "No chapters in this file");
+                        ps.aud_osd_until = get_time_sec() + 2.0;
+                        break;
+                    }
+                    double pos = (ps.video_stream_idx >= 0) ? ps.video_clock : ps.audio_clock_sync;
+                    int cur = player_chapter_index(&ps, pos);
+                    /* A backward chapter seek lands on the keyframe BEFORE
+                     * the start (up to a GOP early). While we sit in that
+                     * pre-roll, we are already in the chapter we jumped to
+                     * — otherwise "next" answers the same chapter until the
+                     * boundary is crossed (field 2026-09-07). */
+                    if (ps.chapter_nav_idx > cur && ps.chapter_nav_idx < ps.nb_chapters
+                            && pos >= ps.chapter_start[ps.chapter_nav_idx] - 30.0)
+                        cur = ps.chapter_nav_idx;
+                    int to;
+                    if (ev.key.key == SDLK_PAGEDOWN) {
+                        to = cur + 1;
+                        if (to >= ps.nb_chapters) {
+                            snprintf(ps.aud_osd, sizeof(ps.aud_osd), "Last chapter");
+                            ps.aud_osd_until = get_time_sec() + 2.0;
+                            break;
+                        }
+                    } else {
+                        to = (pos - ps.chapter_start[cur] > 3.0 || cur == 0) ? cur : cur - 1;
+                    }
+                    player_seek_abs(&ps, ps.chapter_start[to], 1);
+                    ps.chapter_nav_idx = to;
+                    snprintf(ps.aud_osd, sizeof(ps.aud_osd), "Chapter %d/%d: %s",
+                             to + 1, ps.nb_chapters, ps.chapter_title[to]);
+                    ps.aud_osd_until = get_time_sec() + 3.0;
+                    log_msg("Chapter: -> %d/%d '%s' at %.1f s (%s)", to + 1, ps.nb_chapters,
+                            ps.chapter_title[to], ps.chapter_start[to],
+                            ev.key.key == SDLK_PAGEDOWN ? "PgDn" : "PgUp");
+                    break;
+                }
 
                 case SDLK_UP:
                     ps.volume += VOLUME_STEP;
@@ -933,6 +1600,7 @@ int main(int argc, char *argv[]) {
                              * playlist nor ps.fullscreen — the save/NULL/
                              * restore dance this used to do guarded against
                              * behavior that does not exist. */
+                            resume_save(&ps);
                             player_close(&ps);
 
                             log_msg("Playlist nav: opening [%d/%d] %s",
@@ -1081,7 +1749,7 @@ int main(int argc, char *argv[]) {
                             /* Don't resume into an in-flight seek — its
                              * recovery path owns the resume then. */
                             if (!ps.paused && !ps.seek_request
-                                    && !ps.seek_recovering)
+                                    && !ps.seek_recovering && !ps.seeking)
                                 SDL_ResumeAudioStreamDevice(ps.audio_stream);
                         } else {
                             log_msg("Audio: no output device — continuing video-only");
@@ -1314,6 +1982,7 @@ int main(int argc, char *argv[]) {
                          * decode thread — tear down cleanly instead of
                          * freezing on the last frame forever. */
                         log_msg("Playback aborted (decode failure), returning to idle");
+                        resume_save(&ps);
                         player_close(&ps);
                         ps.quit = 0;
                     } else if (ps.eof && ps.video_pq.nb_packets == 0
@@ -1324,6 +1993,8 @@ int main(int argc, char *argv[]) {
                          * otherwise the tail of the audio (matters for
                          * audio-only playback) is cut off at close. */
                         log_msg("Playback finished, returning to idle");
+                        resume_clear(&ps);
+                        resume_save(&ps);
                         player_close(&ps);
                         ps.quit = 0;
                     }
@@ -1366,17 +2037,55 @@ int main(int argc, char *argv[]) {
                  *   Backward seek: video_clock < audio_clock → massive
                  *     negative drift, burst of frame drops.
                  */
-                if (ps.seek_recovering
-                        && ps.video_frame_serial
-                           == ps.video_frame_q.flush_serial) {
-                    /* Serial gate: main can legitimately pop a PRE-seek
-                     * frame and spend 5-20ms displaying it while the
-                     * demux thread completes the ENTIRE seek — without
-                     * this check, recovery resynced every clock to the
-                     * pre-seek position (the consumer-side twin of the
-                     * fq_put expect_serial bug; see that comment). A
-                     * mismatched serial just means: not the recovery
-                     * frame yet, keep waiting. */
+                int recovery_refused = 0;
+                if (ps.seek_recovering) {
+                    if (ps.video_frame_serial
+                            != ps.video_frame_q.flush_serial) {
+                        /* Serial gate: main can legitimately pop a
+                         * PRE-seek frame and spend 5-20ms displaying
+                         * it while the demux thread completes the
+                         * ENTIRE seek — without this check, recovery
+                         * resynced every clock to the pre-seek
+                         * position (the consumer-side twin of the
+                         * fq_put expect_serial bug; see that
+                         * comment). A mismatched serial just means:
+                         * not the recovery frame yet, keep waiting.
+                         * Logged now (deck 32c74b0 vocabulary) — on
+                         * the deck this fired on ~40% of seeks and
+                         * the engage line is the proof it works. */
+                        recovery_refused = 1;
+                        log_msg("SEEKDIAG: recovery clear refused — "
+                                "displayed frame serial=%d, seek "
+                                "serial=%d", ps.video_frame_serial,
+                                ps.video_frame_q.flush_serial);
+                    } else if (ps.seekdiag_target_valid
+                               && (ps.seek_flags & AVSEEK_FLAG_BACKWARD)
+                               && ps.video_clock >
+                                   (double)ps.seek_target / AV_TIME_BASE
+                                       + 5.0) {
+                        /* Backward-landing veto (deck 8da58aa port):
+                         * AVSEEK_FLAG_BACKWARD lands at a keyframe AT
+                         * OR BELOW the target — a current-serial frame
+                         * far ABOVE it is pre-seek content (an async
+                         * flush survivor the drain missed; the serial
+                         * is blind to those — decoded from old input,
+                         * received under the new serial). Anchoring on
+                         * one pins the audio floor minutes high and
+                         * the floor then discards ALL replay audio:
+                         * the 200ms stall death spiral. Refuse and
+                         * wait for the honest keyframe. Fail-open is
+                         * the existing 2s recovery timeout below — no
+                         * file can wedge recovery. */
+                        recovery_refused = 1;
+                        log_msg("SEEKDIAG: recovery clear refused — "
+                                "backward seek landed %.1fs ABOVE "
+                                "target (flush survivor?)",
+                                ps.video_clock
+                                    - (double)ps.seek_target
+                                        / AV_TIME_BASE);
+                    }
+                }
+                if (ps.seek_recovering && !recovery_refused) {
                     ps.seek_recovering = 0;
                     ps.seek_recovering_start = 0.0;
                     ps.frame_timer = get_time_sec();
@@ -1398,8 +2107,17 @@ int main(int argc, char *argv[]) {
                             SDL_ResumeAudioStreamDevice(ps.audio_stream);
                     }
 
-                    log_msg("DIAG: seek recovery complete at %.3fs",
-                            ps.video_clock);
+                    if (ps.seekdiag_target_valid)
+                        log_msg("DIAG: seek recovery complete at %.3fs "
+                                "(target %.3f, landed %+.3fs)",
+                                ps.video_clock,
+                                (double)ps.seek_target / AV_TIME_BASE,
+                                ps.video_clock
+                                    - (double)ps.seek_target
+                                        / AV_TIME_BASE);
+                    else
+                        log_msg("DIAG: seek recovery complete at %.3fs",
+                                ps.video_clock);
                 }
             }
 
@@ -1449,6 +2167,7 @@ int main(int argc, char *argv[]) {
 
             /* Periodic diagnostics (every 10 seconds) */
             if (ps.playing && now - ps.diag_last_report >= 10.0) {
+                resume_save(&ps);   /* every 10 s: a crash still resumes near here */
                 double av_now = (ps.audio_stream_idx >= 0)
                     ? ps.video_clock - ps.audio_clock_sync : 0.0;
                 log_msg("DIAG: [%.0fs] decoded=%d displayed=%d "
@@ -1542,8 +2261,8 @@ int main(int argc, char *argv[]) {
             /* If playback ended this tick (player_close was called in the
              * decode loop above), draw idle immediately so the swapchain
              * gets a frame.  Without this, one tick has no GPU submission
-             * and some compositors (Gamescope/Steam Deck) show a stale
-             * buffer instead of the last presented frame. */
+             * and some compositors show a stale buffer instead of the
+             * last presented frame. */
             if (!ps.playing) {
                 gpu_draw_idle(&ps);
                 SDL_ShowCursor();
@@ -1590,7 +2309,11 @@ int main(int argc, char *argv[]) {
 
     /* ── Cleanup ── */
     log_msg("Shutting down");
-    if (ps.playing) player_close(&ps);
+    if (ps.playing) { resume_save(&ps); player_close(&ps); }
+    hdr_output_shutdown(&ps);   /* display revert even if close was skipped */
+#ifndef _WIN32
+    dialog_shutdown();          /* AFTER the revert: a stuck dialog must not hold the display (C3) */
+#endif
     playlist_free(&ps);
     overlay_cleanup();
     sub_close_font();

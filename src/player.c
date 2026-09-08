@@ -195,6 +195,9 @@ static const char hlsl_yuv_planar_frag[] =
     "    float4 dovi_mmr_meta;\n"
     "    float4 dovi_mmr_ct[6];\n"
     "    float4 dovi_mmr_cp[6];\n"
+    "    float hdr_pass;\n"
+    "    float out_black_nits;\n"
+    "    float2 _pad_hdrp;\n"
     "};\n"
     "\n"
     "#define PI 3.14159265358979\n"
@@ -309,26 +312,64 @@ static const char hlsl_yuv_planar_frag[] =
     "    return 10000.0 * pow(max(num / den, 0.0), 1.0 / m1);\n"
     "}\n"
     "\n"
+    "/* PQ OETF (forward): normalized linear light [0,1] (1.0 = 10000\n"
+    " * nits) → PQ code values [0,1]. Inverse of pq_eotf; used by the\n"
+    " * HDR passthrough path to re-encode display-linear results into\n"
+    " * the HDR10 container. */\n"
+    "float3 pq_oetf(float3 lin) {\n"
+    "    float m1 = 0.1593017578125;\n"
+    "    float m2 = 78.84375;\n"
+    "    float c1 = 0.8359375;\n"
+    "    float c2 = 18.8515625;\n"
+    "    float c3 = 18.6875;\n"
+    "    float3 Np = pow(max(lin, 0.0), m1);\n"
+    "    return pow((c1 + c2 * Np) / (1.0 + c3 * Np), m2);\n"
+    "}\n"
+    "\n"
+    "/* Scalar PQ pair for the tone-map path. BT.2390's EETF is defined\n"
+    " * on PQ-ENCODED luminance, so the tone map round-trips one scalar\n"
+    " * through the OETF and back per pixel. Same constants as the\n"
+    " * float3 pair above; pq_oetf1 takes normalized linear (nits/10000),\n"
+    " * pq_eotf1 returns nits. */\n"
+    "float pq_oetf1(float lin) {\n"
+    "    float m1 = 0.1593017578125;\n"
+    "    float m2 = 78.84375;\n"
+    "    float c1 = 0.8359375;\n"
+    "    float c2 = 18.8515625;\n"
+    "    float c3 = 18.6875;\n"
+    "    float Np = pow(max(lin, 0.0), m1);\n"
+    "    return pow((c1 + c2 * Np) / (1.0 + c3 * Np), m2);\n"
+    "}\n"
+    "float pq_eotf1(float pq) {\n"
+    "    float m1 = 0.1593017578125;\n"
+    "    float m2 = 78.84375;\n"
+    "    float c1 = 0.8359375;\n"
+    "    float c2 = 18.8515625;\n"
+    "    float c3 = 18.6875;\n"
+    "    float Np = pow(max(pq, 0.0), 1.0 / m2);\n"
+    "    float num = max(Np - c1, 0.0);\n"
+    "    float den = c2 - c3 * Np;\n"
+    "    return 10000.0 * pow(max(num / den, 0.0), 1.0 / m1);\n"
+    "}\n"
+    "\n"
     "/* BT.2390 EETF: Hermite spline shoulder rolloff for tone mapping.\n"
     " * Maps normalized luminance [0,1] through a soft knee at ks,\n"
     " * compressing highlights to maxLum. Below ks is linear passthrough.\n"
     " *\n"
-    " * Defensive output clamp: when the spec's KS = 1.5*maxLum - 0.5 is\n"
-    " * negative (i.e. maxLum < 1/3, i.e. smoothed peak > 3x target), the\n"
-    " * caller clamps KS to 0 to avoid producing negative outputs for dark\n"
-    " * pixels. That breaks the spline's monotonicity guarantee, and the\n"
-    " * Hermite cubic with endpoints (0, 0) → (1, maxLum) and tangents 1/0\n"
-    " * overshoots maxLum in the mid-range when maxLum < 0.5. Without a\n"
-    " * clamp, the resulting Yt > maxLum produces post-divide SDR values\n"
-    " * > 1 that rely on the final saturate() to clip — and feed slightly\n"
-    " * different intermediate values into the gamut matrix downstream.\n"
+    " * DOMAIN (fixed 2026-08-26, convicted in tools/eetf-audit.c): the\n"
+    " * callers feed PQ-ENCODED luminance normalized by PQ(peak), per\n"
+    " * spec. maxLum = PQ(target)/PQ(peak) lands ~0.58-0.9 for real\n"
+    " * peak/target pairs, so ks = 1.5*maxLum - 0.5 is ~0.37-0.85 and\n"
+    " * mids below the knee pass through untouched. (The old linear-\n"
+    " * domain form had maxLum = target/peak = 0.02-0.34, ks clamped to\n"
+    " * ~0, the whole range splined: mids -15..-19% dark at peak 600,\n"
+    " * and at high peaks everything above ~1/16 of peak clipped flat.)\n"
     " *\n"
-    " * Clamping the result to [0, maxLum] here forces the spec-implied\n"
-    " * output range, converts the overshoot artifact to a clean clip-to-\n"
-    " * ceiling, and keeps math bounded for any downstream stage (midtone\n"
-    " * gain, gamut matrix, etc.). Visual impact in well-behaved content\n"
-    " * (maxLum ≥ 0.5, smoothed ≤ 2x target) is none; both branches return\n"
-    " * the same values. */\n"
+    " * The output clamp to [0, maxLum] stays as the bounded-math belt:\n"
+    " * in PQ domain maxLum >= 0.5 for all real pairs so the Hermite\n"
+    " * never overshoots and the clamp is a no-op, but it keeps every\n"
+    " * downstream stage (midtone gain, gamut matrix) bounded for any\n"
+    " * metadata the sanitizer lets through. */\n"
     "float bt2390_eetf(float e, float ks, float maxLum) {\n"
     "    if (e <= ks) return e;\n"
     "    float t = (e - ks) / (1.0 - ks);\n"
@@ -338,6 +379,26 @@ static const char hlsl_yuv_planar_frag[] =
     "            + (t3 - 2.0*t2 + t) * (1.0 - ks)\n"
     "            + (-2.0*t3 + 3.0*t2) * maxLum;\n"
     "    return clamp(y, 0.0, maxLum);\n"
+    "}\n"
+    "\n"
+    "/* BT.2390 black-level lift: E3 = E2 + minLum*(1-E2)^4, minLum =\n"
+    " * PQ(display black)/PQ(peak) — same normalized-PQ domain as the\n"
+    " * spline (source black taken as 0). Keeps near-black detail above\n"
+    " * the display's real black instead of clipping into it (deck\n"
+    " * 4614882 port; Holden: \"reference means lift, we lift\").\n"
+    " * out_black_nits: <0 off, 0 auto (target/2000 — a 2000:1\n"
+    " * contrast assumption; halved from 1000:1 after the lift made\n"
+    " * WEB-DL baked-bar codec noise visible, Holden field 2026-08-27),\n"
+    " * >0 fixed nits. (1-e2)^4 by squaring —\n"
+    " * no pow (transcendental budget). */\n"
+    "float bt2390_lift(float e2, float target, float maxE) {\n"
+    "    if (out_black_nits < 0.0) return e2;\n"
+    "    float b = (out_black_nits > 0.0) ? out_black_nits\n"
+    "                                     : target / 2000.0;\n"
+    "    float minL = pq_oetf1(b / 10000.0) / maxE;\n"
+    "    float u = 1.0 - e2;\n"
+    "    u = u * u; u = u * u;\n"
+    "    return e2 + minL * u;\n"
     "}\n"
     "\n"
     "/* Encode tone-mapped display-linear output for the display's EOTF.\n"
@@ -416,6 +477,12 @@ static const char hlsl_yuv_planar_frag[] =
     "float dovi_reshape(float x, int comp) {\n"
     "    int n = (int)sel3(dovi_num_pieces, comp);\n"
     "    if (n <= 0) return x;\n"
+    "    /* Clamp to the curve's pivot span BEFORE piece selection and\n"
+    "     * evaluation (deck 9e5f245 port, libplacebo parity): kernel\n"
+    "     * overshoot otherwise extrapolates the last piece above the\n"
+    "     * top pivot. pivots has n+1 entries, [n] = top of span. */\n"
+    "    x = clamp(x, sel3(dovi_pivots[0], comp),\n"
+    "                 sel3(dovi_pivots[n], comp));\n"
     "    for (int p = 0; p < 8; p++) {\n"
     "        if (p >= n) break;\n"
     "        float hi = sel3(dovi_pivots[p + 1], comp);\n"
@@ -453,6 +520,11 @@ static const char hlsl_yuv_planar_frag[] =
     "         * 4. Output matrix → BT.2020 linear RGB\n"
     "         * 5. BT.2390 tone mapping (shared with HDR10 path) */\n"
     "        float3 sig = float3(y, cb, cr);\n"
+    "        /* Reshape input is defined on [0,1] code values; kernel\n"
+    "         * ringing goes outside it and the MMR's cross terms\n"
+    "         * amplify what the per-component pivot clamp alone cannot\n"
+    "         * catch (deck 9e5f245 port, review PQUALITY P4). */\n"
+    "        sig = saturate(sig);\n"
     "        float3 ipt;\n"
     "        ipt.x = dovi_reshape(sig.x, 0);\n"
     "        /* Chroma: MMR when the RPU says so — but only for pixels\n"
@@ -486,29 +558,36 @@ static const char hlsl_yuv_planar_frag[] =
     "        bt2020.b = dot(dovi_out_r2.xyz, lin);\n"
     "        bt2020 = max(bt2020, 0.0);\n"
     "\n"
-    "        /* BT.2390 tone mapping — always BT.2020 gamut for DV */\n"
-    "        float3 E = bt2020 / hdr_peak_nits;\n"
+    "        if (hdr_pass > 0.5) {\n"
+    "            /* DV-as-HDR10 (deck lineage): the per-frame RPU reshape\n"
+    "             * above IS Dolby Vision's dynamic metadata, applied by\n"
+    "             * us — the same processing an LLDV player does\n"
+    "             * internally. Re-encode the display-linear BT.2020\n"
+    "             * result (nits, from pq_eotf) into the PQ container and\n"
+    "             * let the display tone-map. */\n"
+    "            rgb = pq_oetf(bt2020 / 10000.0);\n"
+    "        } else {\n"
+    "        /* BT.2390 tone mapping (PQ domain, per spec) — always\n"
+    "         * BT.2020 gamut for DV. bt2020 is display-linear NITS here.\n"
+    "         * SHARED-SOURCE: this block and the HDR10/HLG block below\n"
+    "         * are the same transform — change BOTH together. */\n"
     "        float target = (hdr_debug > 0.5 && hdr_debug < 1.5)\n"
     "            ? hdr_target_nits + 100.0 : hdr_target_nits;\n"
-    "        float maxLum = target / hdr_peak_nits;\n"
-    "        float ks = max(1.5 * maxLum - 0.5, 0.0);\n"
-    "        ks = min(ks, 0.999);  /* keep (1-ks) > 0 in bt2390_eetf spline */\n"
+    "        float maxE   = pq_oetf1(hdr_peak_nits / 10000.0);\n"
+    "        float maxLum = min(pq_oetf1(target / 10000.0) / maxE, 1.0);\n"
+    "        float ks = clamp(1.5 * maxLum - 0.5, 0.0, 0.999);\n"
     "        float3 lc = float3(0.2627, 0.6780, 0.0593);\n"
-    "        float Y_l = dot(E, lc);\n"
-    "        /* Clamp luma into spline domain [0,1] before tone mapping.\n"
-    "         * The 99.875th-percentile peak excludes the top 0.125% of\n"
-    "         * specular pixels, so individual highlights can have Y_l > 1.\n"
-    "         * bt2390_eetf only handles e <= 1; for e > 1 with ks near 1\n"
-    "         * the spline divides by (1-ks) ≈ 0 and produces NaN, which\n"
-    "         * saturate() resolves to 0 on Vulkan — specular highlights\n"
-    "         * crush to literal black. Clamping Y_l before the spline\n"
-    "         * maps super-peak pixels cleanly to maxLum (→ SDR white\n"
-    "         * after divide), preserving chromaticity via the original\n"
-    "         * Y_l in the Yt/Y_l ratio below. */\n"
-    "        float Y_in = min(Y_l, 1.0);\n"
-    "        float Yt = bt2390_eetf(Y_in, ks, maxLum);\n"
-    "        float3 rgb_tm = (Y_l > 0.0) ? E * (Yt / Y_l) : float3(0,0,0);\n"
-    "        rgb_tm = rgb_tm / max(maxLum, 0.001);\n"
+    "        float Y_l = dot(bt2020, lc);   /* nits */\n"
+    "        /* Super-peak speculars (the percentile peak excludes the\n"
+    "         * top 0.125%) clamp to the spline endpoint → maxLum → SDR\n"
+    "         * white after the target divide; chromaticity rides the\n"
+    "         * original Y_l in the ratio below. */\n"
+    "        float e = min(pq_oetf1(Y_l / 10000.0) / maxE, 1.0);\n"
+    "        float e2 = bt2390_lift(bt2390_eetf(e, ks, maxLum),\n"
+    "                               target, maxE);\n"
+    "        float Yt_nits = pq_eotf1(e2 * maxE);\n"
+    "        float3 rgb_tm = (Y_l > 0.0)\n"
+    "            ? (bt2020 / target) * (Yt_nits / Y_l) : float3(0,0,0);\n"
     "\n"
     "        /* BT.2020→BT.709 gamut matrix */\n"
     "        float3 r2 = rgb_tm;\n"
@@ -523,6 +602,7 @@ static const char hlsl_yuv_planar_frag[] =
     "            rgb_tm = float3(pow(rgb_tm.r, inv), pow(rgb_tm.g, inv), pow(rgb_tm.b, inv));\n"
     "        }\n"
     "        rgb = encode_output(rgb_tm);\n"
+    "        } /* end DV SDR tone map */\n"
     "\n"
     "    } else {\n"
     "        /* Standard path (SDR + HDR10) */\n"
@@ -533,45 +613,63 @@ static const char hlsl_yuv_planar_frag[] =
     "     * Debug modes (H key): 0=normal, 1=target 300, 2=PQ bypass, 3=luma viz */\n"
     "    if (is_hdr > 0.5) {\n"
     "\n"
+    "        /* HDR passthrough: the swapchain is HDR10/ST2084 — rgb\n"
+    "         * already holds range-expanded PQ code values in BT.2020,\n"
+    "         * which is exactly the payload the display wants. No tone\n"
+    "         * map, no gamut squeeze, no output encode: the most\n"
+    "         * correct path is the code we skip. The debug modes and\n"
+    "         * T/G controls are SDR-render tools. */\n"
+    "        if (hdr_pass > 0.5) {\n"
+    "            /* PQ content ships as-is. HLG rides the same HDR10\n"
+    "             * container: inverse OETF + BT.2100 OOTF to display\n"
+    "             * light at the 1000-nit nominal, then PQ-encode — the\n"
+    "             * display tone-maps from there. */\n"
+    "            if (is_hlg > 0.5)\n"
+    "                rgb = pq_oetf(hlg_to_nits(rgb) / 10000.0);\n"
+    "        }\n"
     "        /* Mode 2: PQ bypass — raw PQ code values straight to display.\n"
     "         * Shows what the stream actually contains. If this looks\n"
     "         * reasonably bright, PQ values are valid and the issue\n"
     "         * is in tone mapping. If dark, values themselves are wrong. */\n"
-    "        if (hdr_debug > 1.5 && hdr_debug < 2.5) {\n"
+    "        else if (hdr_debug > 1.5 && hdr_debug < 2.5) {\n"
     "            /* rgb already holds PQ code values [0,1] — skip everything */\n"
     "        }\n"
-    "        /* Mode 3: luminance visualization — EOTF output with sRGB gamma.\n"
-    "         * Grayscale showing actual nit distribution in the frame. */\n"
+    "        /* Mode 3: luminance visualization — grayscale of the\n"
+    "         * frame's nit distribution. Routes through encode_output\n"
+    "         * so it follows the E-key transfer pref instead of a\n"
+    "         * hardwired sRGB (deck 9d108d8 port, debug-honesty). */\n"
     "        else if (hdr_debug > 2.5) {\n"
     "            float3 lin = (is_hlg > 0.5) ? hlg_to_nits(rgb) : pq_eotf(rgb);\n"
     "            float lum = lin.r * 0.2627 + lin.g * 0.6780 + lin.b * 0.0593;\n"
-    "            float v = lum / hdr_peak_nits;\n"
-    "            v = (v <= 0.0031308) ? 12.92*v : 1.055*pow(v, 1.0/2.4) - 0.055;\n"
-    "            rgb = float3(v, v, v);\n"
+    "            float v = saturate(lum / hdr_peak_nits);\n"
+    "            rgb = encode_output(float3(v, v, v));\n"
     "        }\n"
     "        else {\n"
     "            float3 lin = (is_hlg > 0.5) ? hlg_to_nits(rgb) : pq_eotf(rgb);\n"
-    "            float3 E = lin / hdr_peak_nits;\n"
     "\n"
-    "            /* Target comes from T-key toggle (203/300/400 nits).\n"
+    "            /* BT.2390 tone mapping (PQ domain, per spec). lin is\n"
+    "             * display-linear NITS. SHARED-SOURCE: same transform as\n"
+    "             * the DV block above — change BOTH together.\n"
+    "             * Target comes from T-key toggle (203/300/400 nits).\n"
     "             * Debug mode 1: override to target+100 for comparison. */\n"
     "            float target = (hdr_debug > 0.5 && hdr_debug < 1.5)\n"
     "                ? hdr_target_nits + 100.0 : hdr_target_nits;\n"
-    "            float maxLum = target / hdr_peak_nits;\n"
-    "            float ks = max(1.5 * maxLum - 0.5, 0.0);\n"
-    "            ks = min(ks, 0.999);  /* keep (1-ks) > 0 in bt2390_eetf spline */\n"
+    "            float maxE   = pq_oetf1(hdr_peak_nits / 10000.0);\n"
+    "            float maxLum = min(pq_oetf1(target / 10000.0) / maxE, 1.0);\n"
+    "            float ks = clamp(1.5 * maxLum - 0.5, 0.0, 0.999);\n"
     "\n"
     "            float3 lc = (hdr_gamut > 0.5)\n"
     "                ? float3(0.2627, 0.6780, 0.0593)\n"
     "                : float3(0.2126, 0.7152, 0.0722);\n"
-    "            float Y = dot(E, lc);\n"
-    "            /* See DV path comment: clamp Y into [0,1] spline domain to\n"
-    "             * prevent NaN-to-black crush on super-peak specular pixels. */\n"
-    "            float Y_in = min(Y, 1.0);\n"
-    "            float Yt = bt2390_eetf(Y_in, ks, maxLum);\n"
-    "            float3 rgb_tm = (Y > 0.0) ? E * (Yt / Y) : float3(0,0,0);\n"
-    "\n"
-    "            rgb_tm = rgb_tm / max(maxLum, 0.001);\n"
+    "            float Y = dot(lin, lc);   /* nits */\n"
+    "            /* See DV path comment: super-peak clamps to the spline\n"
+    "             * endpoint (SDR white), chromaticity via the Y ratio. */\n"
+    "            float e = min(pq_oetf1(Y / 10000.0) / maxE, 1.0);\n"
+    "            float e2 = bt2390_lift(bt2390_eetf(e, ks, maxLum),\n"
+    "                                   target, maxE);\n"
+    "            float Yt_nits = pq_eotf1(e2 * maxE);\n"
+    "            float3 rgb_tm = (Y > 0.0)\n"
+    "                ? (lin / target) * (Yt_nits / Y) : float3(0,0,0);\n"
     "\n"
     "            if (hdr_gamut > 0.5) {\n"
     "                float3 r2 = rgb_tm;\n"
@@ -613,7 +711,9 @@ static const char hlsl_yuv_planar_frag[] =
     "     * averages out over ~4 frames — perceived bit depth increases. */\n"
     "    uint fc = (uint)frameCount;\n"
     "    float2 ditherCoord = pos.xy + float2(fc % 4u, (fc / 4u) % 4u);\n"
-    "    float d = (texNoise.SampleLevel(sampNoise, frac(ditherCoord / 64.0), 0).r - 0.5) / 255.0;\n"
+    "    /* LSB matches the output surface: 10-bit in HDR passthrough. */\n"
+    "    float dith_lsb = (hdr_pass > 0.5) ? 1023.0 : 255.0;\n"
+    "    float d = (texNoise.SampleLevel(sampNoise, frac(ditherCoord / 64.0), 0).r - 0.5) / dith_lsb;\n"
     "    rgb += float3(d, d, d);\n"
     "\n"
     "    return float4(saturate(rgb), 1.0);\n"
@@ -626,8 +726,40 @@ static const char hlsl_overlay_frag[] =
     "Texture2D<float4> texOverlay : register(t0, space2);\n"
     "SamplerState sampOverlay : register(s0, space2);\n"
     "\n"
+    /* When the swapchain is HDR10/PQ, the overlay's SDR-authored
+     * pixels must be re-encoded to PQ at reference white (203 nits,
+     * BT.2408) — drawn raw, "white" would mean 10,000 nits and every
+     * subtitle would be a flashbang. (Deck lineage.) */
+    "cbuffer OvParams : register(b0, space3) {\n"
+    "    float ov_pq;\n"
+    "    float ov_white;\n"      /* encode white, nits (203 nominal; compensated for the KWin hold) */
+    "    float2 _pad;\n"
+    "};\n"
+    "\n"
     "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
-    "    return texOverlay.Sample(sampOverlay, uv);\n"
+    "    float4 c = texOverlay.Sample(sampOverlay, uv);\n"
+    "    if (ov_pq > 0.5) {\n"
+    "        /* SDR (2.2) → linear → ov_white nits → PQ OETF */\n"
+    "        float3 lin = pow(max(c.rgb, 0.0), 2.2) * (ov_white / 10000.0);\n"
+    "        float m1 = 0.1593017578125, m2 = 78.84375;\n"
+    "        float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
+    "        float3 Np = pow(lin, m1);\n"
+    "        c.rgb = pow((c1 + c2 * Np) / (1.0 + c3 * Np), m2);\n"
+    "    }\n"
+    "    return c;\n"
+    "}\n";
+
+/* Pure-fetch blit fragment shader — cache→swapchain copy. MUST stay
+ * uniform-free: the blit draw pushes no fragment uniforms, and the
+ * overlay shader it used to share gained OvParams in the HDR cycle —
+ * sharing it made every reblit tick read stale slot-0 data as ov_pq
+ * and randomly PQ-encode the whole frame (the 2026-08-12 strobe). */
+static const char hlsl_blit_frag[] =
+    "Texture2D<float4> texSrc : register(t0, space2);\n"
+    "SamplerState sampSrc : register(s0, space2);\n"
+    "\n"
+    "float4 main(float2 uv : TEXCOORD0) : SV_Target0 {\n"
+    "    return texSrc.Sample(sampSrc, uv);\n"
     "}\n";
 
 
@@ -1015,7 +1147,7 @@ int gpu_create_pipelines(PlayerState *ps) {
             ps->gpu_device, hlsl_fullscreen_vert, "main",
             SDL_SHADERCROSS_SHADERSTAGE_VERTEX);
         SDL_GPUShader *frag_blit = compile_shader(
-            ps->gpu_device, hlsl_overlay_frag, "main",
+            ps->gpu_device, hlsl_blit_frag, "main",
             SDL_SHADERCROSS_SHADERSTAGE_FRAGMENT);
         if (!vert_blit || !frag_blit) {
             if (vert_blit) SDL_ReleaseGPUShader(ps->gpu_device, vert_blit);
@@ -1050,28 +1182,16 @@ int gpu_create_pipelines(PlayerState *ps) {
         log_msg("GPU: blit pipeline created (shaded-frame cache)");
     }
 
-    /* ── Create sampler (linear filtering, no anisotropy) ──
-     * The fragment shader does its own Lanczos/Catmull-Rom multi-tap
-     * resampling via SampleLevel(..., 0). Hardware anisotropy adds
-     * nothing on a flat fullscreen quad — it only helps when texture
-     * coordinates are foreshortened by perspective. */
-    SDL_GPUSamplerCreateInfo samp_info;
-    SDL_zero(samp_info);
-    samp_info.min_filter     = SDL_GPU_FILTER_LINEAR;
-    samp_info.mag_filter     = SDL_GPU_FILTER_LINEAR;
-    samp_info.mipmap_mode    = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
-    samp_info.address_mode_u = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
-    samp_info.address_mode_v = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
-    samp_info.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
+    /* ── Samplers (deck d2f5351 port, review PQUALITY P6a) ──
+     * ONE nearest sampler serves everything: the fragment shader does
+     * its own Lanczos/Catmull-Rom multi-tap resampling at explicit
+     * texel centers via SampleLevel(..., 0), so nearest is
+     * bit-identical to the old LINEAR binding for the video planes —
+     * and the no-bilinear rule stops depending on tap coordinates
+     * quantizing to centers. x64 has no PQ LUTs (the one place deck
+     * keeps LINEAR), so the linear sampler was deleted outright. */
 
-    ps->gpu_sampler = SDL_CreateGPUSampler(ps->gpu_device, &samp_info);
-    if (!ps->gpu_sampler) {
-        log_msg("ERROR: Failed to create sampler: %s", SDL_GetError());
-        return -1;
-    }
-    log_msg("GPU: sampler created (linear, no anisotropy)");
-
-    /* ── Create nearest-neighbor sampler for overlay ──
+    /* ── Create nearest-neighbor sampler (video planes + overlay) ──
      * Bitmap font pixels should be pixel-perfect, not bilinear-blurred. */
     SDL_GPUSamplerCreateInfo nearest_info;
     SDL_zero(nearest_info);
@@ -1087,7 +1207,8 @@ int gpu_create_pipelines(PlayerState *ps) {
         log_msg("ERROR: Failed to create nearest sampler: %s", SDL_GetError());
         return -1;
     }
-    log_msg("GPU: nearest sampler created (overlay)");
+    log_msg("GPU: sampler — NEAREST for video planes and overlay "
+            "(kernels do all filtering; deck d2f5351 port)");
 
     /* ── Create and upload blue noise dither texture (64×64, R8_UNORM) ──
      * Uploaded once at startup. Lives for the entire application lifetime.
@@ -1162,10 +1283,6 @@ void gpu_destroy_pipelines(PlayerState *ps) {
 
     gpu_overlay_destroy(ps);
 
-    if (ps->gpu_sampler) {
-        SDL_ReleaseGPUSampler(ps->gpu_device, ps->gpu_sampler);
-        ps->gpu_sampler = NULL;
-    }
     if (ps->gpu_sampler_nearest) {
         SDL_ReleaseGPUSampler(ps->gpu_device, ps->gpu_sampler_nearest);
         ps->gpu_sampler_nearest = NULL;
@@ -1332,25 +1449,109 @@ static void gpu_destroy_video_textures(PlayerState *ps) {
  *   swscale fallback:                 swscale does range → identity uniforms
  */
 
-static void gpu_setup_uniforms(PlayerState *ps) {
-    /* Determine YCbCr matrix from metadata or resolution heuristic.
-     * Three standards: BT.601 (SD), BT.709 (HD), BT.2020 NCL (UHD/HDR).
-     * color_space tag is authoritative; resolution heuristic is fallback. */
-    int colorspace = (ps->vid_h >= 720) ? 709 : 601;
-    if (ps->fmt_ctx) {
-        AVCodecParameters *par =
-            ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
-        if (par->color_space == AVCOL_SPC_BT709)
-            colorspace = 709;
-        else if (par->color_space == AVCOL_SPC_BT470BG ||
-                 par->color_space == AVCOL_SPC_SMPTE170M)
-            colorspace = 601;
-        else if (par->color_space == AVCOL_SPC_BT2020_NCL)
-            colorspace = 2020;
+/* CPU-side scalar PQ OETF (nits -> code [0,1]). Log lines that quote
+ * the tone map's KS/maxLum must compute them in the SAME PQ domain the
+ * shader uses — a linear-domain KS in a log line reads as the old
+ * domain bug's fingerprint (panel and log must never disagree about
+ * the same number). */
+static double pq_oetf_cpu(double nits) {
+    const double pm1 = 0.1593017578125, pm2 = 78.84375;
+    const double pc1 = 0.8359375, pc2 = 18.8515625, pc3 = 18.6875;
+    double np = pow(nits / 10000.0, pm1);
+    return pow((pc1 + pc2*np)/(1.0 + pc3*np), pm2);
+}
+
+/* Pick the YCbCr matrix (601/709/2020) for a stream (deck 315ee1c
+ * port, review PQUALITY P2). The tag is authoritative. For
+ * untagged/unmatched streams the fallback chain is primaries/transfer
+ * first — re-encodes strip the matrix flag far more often than
+ * primaries or PQ/HLG — then a size heuristic keyed on width AND
+ * height (scope-cropped HD keeps its 1280+ width at sub-720 heights;
+ * height alone sent that whole class to 601). Shared with the sws
+ * leg so an sws-encoded stream is always decoded with the matrix it
+ * was encoded with. cs_reason names which rule fired. */
+static int pick_ycbcr_matrix(const AVCodecParameters *par,
+                             int w, int h, const char **cs_reason) {
+    *cs_reason = "tag";
+    if (par) {
+        if (par->color_space == AVCOL_SPC_BT709)  return 709;
+        if (par->color_space == AVCOL_SPC_BT470BG ||
+            par->color_space == AVCOL_SPC_SMPTE170M) return 601;
+        if (par->color_space == AVCOL_SPC_BT2020_NCL) return 2020;
+        if (par->color_space == AVCOL_SPC_BT2020_CL) {
+            /* CL math is unimplemented; NCL is the least-wrong decode
+             * and keeps the primaries chain consistent. */
+            *cs_reason = "tag BT.2020-CL, decoded as NCL";
+            return 2020;
+        }
+        if (par->color_primaries == AVCOL_PRI_BT2020 ||
+            par->color_trc == AVCOL_TRC_SMPTE2084 ||
+            par->color_trc == AVCOL_TRC_ARIB_STD_B67) {
+            *cs_reason = "primaries/transfer fallback";
+            return 2020;
+        }
+        if (par->color_primaries == AVCOL_PRI_BT709) {
+            *cs_reason = "primaries fallback";
+            return 709;
+        }
+        if (par->color_primaries == AVCOL_PRI_SMPTE170M ||
+            par->color_primaries == AVCOL_PRI_BT470BG) {
+            *cs_reason = "primaries fallback";
+            return 601;
+        }
     }
+    *cs_reason = "size heuristic";
+    return (h >= 720 || w >= 1280) ? 709 : 601;
+}
+
+static void gpu_setup_uniforms(PlayerState *ps) {
+    /* Determine YCbCr matrix — see pick_ycbcr_matrix. */
+    const char *cs_reason = "no stream";
+    AVCodecParameters *upar = NULL;
+    if (ps->fmt_ctx)
+        upar = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+    int colorspace = pick_ycbcr_matrix(upar, ps->vid_w, ps->vid_h,
+                                       &cs_reason);
 
     const char *cs_name = (colorspace == 2020) ? "BT.2020"
                         : (colorspace == 709)  ? "BT.709" : "BT.601";
+    log_msg("GPU: YCbCr matrix %s (%s)", cs_name, cs_reason);
+
+    /* BT.2390 black-lift config (deck 4614882 port; see dsvp.h
+     * out_black_nits): parsed once. x64 DEFAULT = 0.01 nits FIXED —
+     * Holden's eye, ladder-tuned on WIN11 IPS 2026-08-27 ("best
+     * balance between lift and ink, specks practically invisible"):
+     * IPS-class native black is ~0.1-0.3 nits, so the target/2000
+     * auto floor rendered ~8/255 codes and lifted WEB-DL baked-bar
+     * codec noise into view; 0.01 renders ~3 codes — detail above
+     * the crush survives, bar noise sits at dark-room threshold.
+     * PLATFORM DIVERGENCE: deck keeps target/2000 auto (OLED renders
+     * those floors for real). DSVP_BLACK_NITS overrides: "0" = lift
+     * off; 0<v<=10 = fixed nits. */
+    {
+        static float s_black_nits = -2.0f;   /* -2 = unparsed */
+        static const char *s_black_src = "x64 default";
+        if (s_black_nits == -2.0f) {
+            s_black_nits = 0.01f;
+            const char *be = SDL_getenv("DSVP_BLACK_NITS");
+            if (be && be[0]) {
+                double bv = SDL_atof(be);
+                if (bv == 0.0) {
+                    s_black_nits = -1.0f;
+                    s_black_src = "DSVP_BLACK_NITS=0";
+                } else if (bv > 0.0 && bv <= 10.0) {
+                    s_black_nits = (float)bv;
+                    s_black_src = "DSVP_BLACK_NITS";
+                } else {
+                    log_msg("WARN: DSVP_BLACK_NITS='%s' ignored "
+                            "(want 0 to disable, or 0-10 nits) — "
+                            "x64 default 0.01", be);
+                }
+            }
+        }
+        ps->gpu_uniforms.out_black_nits = s_black_nits;
+        ps->black_src = s_black_src;
+    }
 
     /* ── Range parameters ──
      *
@@ -1591,12 +1792,39 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     int is_hlg = 0;
     int is_dolby_vision = 0;
     int has_pq_transfer = 0;
+    int dv_profile = -1;   /* hoisted for the P5-only gate (deck ccede14) */
     float peak_nits = 0.0f;
     int has_bt2020_primaries = 0;
 
     if (ps->fmt_ctx) {
         AVCodecParameters *par =
             ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
+
+        /* Honest instrument (field 2026-09-07: a properly tagged
+         * synthetic PQ clip — container AND VUI say smpte2084 to
+         * ffprobe — opened with no HDR line at all, and nothing logged
+         * what the player's own libavformat actually reported). Stream
+         * values after the open-time VUI backfill, and the decoder's
+         * own, by name and number, every open. */
+        {
+            const AVCodecContext *cc = ps->video_codec_ctx;
+            const char *s_trc = av_color_transfer_name(par->color_trc);
+            const char *s_pri = av_color_primaries_name(par->color_primaries);
+            const char *s_spc = av_color_space_name(par->color_space);
+            const char *s_rng = av_color_range_name(par->color_range);
+            int d_trc = cc ? (int)cc->color_trc : -1;
+            int d_pri = cc ? (int)cc->color_primaries : -1;
+            const char *d_trc_n = cc ? av_color_transfer_name(cc->color_trc) : "-";
+            const char *d_pri_n = cc ? av_color_primaries_name(cc->color_primaries) : "-";
+            log_msg("Colour tags: stream trc=%s(%d) primaries=%s(%d) matrix=%s(%d) range=%s"
+                    " | decoder trc=%s(%d) primaries=%s(%d)",
+                    s_trc ? s_trc : "?", (int)par->color_trc,
+                    s_pri ? s_pri : "?", (int)par->color_primaries,
+                    s_spc ? s_spc : "?", (int)par->color_space,
+                    s_rng ? s_rng : "?",
+                    d_trc_n ? d_trc_n : "?", d_trc,
+                    d_pri_n ? d_pri_n : "?", d_pri);
+        }
 
         /* --- Transfer function check --- */
         if (par->color_trc == AVCOL_TRC_SMPTE2084) {
@@ -1614,7 +1842,6 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         }
 
         /* --- Dolby Vision fallback (DV P5 often has UNSPECIFIED trc) --- */
-        int dv_profile = -1;
         const AVPacketSideData *dovi_sd = av_packet_side_data_get(
             par->coded_side_data, par->nb_coded_side_data,
             AV_PKT_DATA_DOVI_CONF);
@@ -1638,7 +1865,26 @@ static void gpu_setup_uniforms(PlayerState *ps) {
             has_bt2020_primaries = 1;
         }
 
-        /* --- Static metadata: peak luminance --- */
+        /* --- Static metadata: peak luminance ---
+         * Mastering max is read FIRST so MaxCLL can be sanitized
+         * against it (deck 5d8076f port, review PQUALITY P1): the
+         * tone map used to take MaxCLL raw — the field's
+         * 9918-on-a-4000-nit-master disc tone-mapped against 9918
+         * (knee ~30 nits instead of ~48). Trust the mastering block
+         * (measured at the facility) over CLL (computed by tools). */
+        float mast_max_nits = 0.0f;
+        {
+            const AVPacketSideData *mdm_sd = av_packet_side_data_get(
+                par->coded_side_data, par->nb_coded_side_data,
+                AV_PKT_DATA_MASTERING_DISPLAY_METADATA);
+            if (mdm_sd && mdm_sd->size >= (int)sizeof(AVMasteringDisplayMetadata)) {
+                const AVMasteringDisplayMetadata *mdm =
+                    (const AVMasteringDisplayMetadata *)mdm_sd->data;
+                if (mdm->has_luminance && av_q2d(mdm->max_luminance) > 0.0)
+                    mast_max_nits = (float)av_q2d(mdm->max_luminance);
+            }
+        }
+
         const AVPacketSideData *cll_sd = av_packet_side_data_get(
             par->coded_side_data, par->nb_coded_side_data,
             AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
@@ -1649,6 +1895,12 @@ static void gpu_setup_uniforms(PlayerState *ps) {
                 peak_nits = (float)cll->MaxCLL;
                 log_msg("HDR: MaxCLL=%u nits, MaxFALL=%u nits",
                         cll->MaxCLL, cll->MaxFALL);
+                if (mast_max_nits > 0.0f && peak_nits > mast_max_nits) {
+                    log_msg("HDR: MaxCLL %.0f exceeds mastering peak %.0f "
+                            "— tone-map peak clamped (trust the mastering "
+                            "block)", peak_nits, mast_max_nits);
+                    peak_nits = mast_max_nits;
+                }
             }
         }
 
@@ -1682,6 +1934,16 @@ static void gpu_setup_uniforms(PlayerState *ps) {
             }
         }
 
+        /* Belt: nothing above 10000 nits exists in PQ (deck 5d8076f
+         * port). A garbage declared peak with no mastering block to
+         * clamp against otherwise pushes maxE past 1.0 and crushes
+         * the whole image under the knee. */
+        if (peak_nits > 10000.0f) {
+            log_msg("HDR: declared peak %.0f exceeds the PQ ceiling "
+                    "— tone-map peak clamped to 10000", peak_nits);
+            peak_nits = 10000.0f;
+        }
+
         /* Fallback: no metadata → 1000 nits (standard HDR10 assumption) */
         if (is_hdr && peak_nits == 0.0f) {
             peak_nits = 1000.0f;
@@ -1701,8 +1963,19 @@ static void gpu_setup_uniforms(PlayerState *ps) {
      * - DV P5 without explicit BT.2020 primaries: DV decode handles gamut. */
     float hdr_gamut = 0.0f; /* 0.0 = BT.709 primaries */
     int is_dovi_active = 0;
-    if (is_hdr && is_dolby_vision && !has_pq_transfer) {
-        /* DV-only (no PQ transfer tag, e.g. Profile 5):
+    /* The IPTPQc2 reshape pipeline is PROFILE 5, by profile — not
+     * "any DV without a PQ tag" (deck ccede14 port, review PQUALITY
+     * M9): DV 8.4 is HLG-base (the phone-camera class) and satisfied
+     * the old gate, sending limited-range HLG through the P5
+     * full-range override and IPT math. 8.4 now falls through to the
+     * standard path, where is_hlg routes it through the HLG pipeline
+     * (BL-compatible, as an HLG TV would play it). */
+    if (is_hdr && is_dolby_vision && !has_pq_transfer && dv_profile != 5)
+        log_msg("HDR: DV Profile %d with non-PQ base — BL-compatible "
+                "standard path (%s pipeline), DV reshape not applicable",
+                dv_profile, is_hlg ? "HLG" : "SDR/other");
+    if (is_hdr && is_dolby_vision && !has_pq_transfer && dv_profile == 5) {
+        /* DV-only (no PQ transfer tag, Profile 5):
          * Base layer is IPTPQc2 — needs DV reshaping pipeline.
          * The DV decode chain outputs BT.2020, so set gamut accordingly.
          * DV uniforms will be populated from first decoded frame's RPU.
@@ -1733,6 +2006,8 @@ static void gpu_setup_uniforms(PlayerState *ps) {
      * OOTF output. The PQ-domain scene-peak histogram doesn't apply. */
     if (is_hlg)
         peak_nits = 1000.0f;
+
+    ps->hdr_pass_content = is_hdr;   /* hdr_output_apply() consumes */
 
     ps->gpu_uniforms.is_hdr        = is_hdr ? 1.0f : 0.0f;
     ps->gpu_uniforms.is_hlg        = is_hlg ? 1.0f : 0.0f;
@@ -1823,18 +2098,41 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     ps->hdr_smoothed_peak    = 0.0f;   /* 0 = uninitialized, first frame jumps */
     ps->hdr_prev_frame_peak  = 0.0f;
     ps->dovi_metadata_logged = 0;
+    ps->dovi_l1_peak_nits    = 0.0f;   /* per-file: no L1 until a frame carries it */
+    ps->dovi_l1_last_log     = 0.0;
 
     if (is_hdr) {
         float target = ps->gpu_uniforms.hdr_target_nits;
-        float maxLum = target / peak_nits;
-        float ks = 1.5f * maxLum - 0.5f;
-        if (ks < 0.0f) ks = 0.0f;
+        /* PQ-domain values, matching the shader's fixed EETF (static
+         * peak shown; the shader tracks the smoothed peak per frame).
+         * Healthy KS is ~0.37-0.85 — a KS near 0 in this line was the
+         * field fingerprint of the old linear-domain bug. */
+        double maxLum = pq_oetf_cpu(target) / pq_oetf_cpu(peak_nits);
+        if (maxLum > 1.0) maxLum = 1.0;
+        double ks = 1.5*maxLum - 0.5;
+        if (ks < 0.0) ks = 0.0; else if (ks > 0.999) ks = 0.999;
+        /* Gamut printed from the UNIFORM, not the container tag: DV P5
+         * forces BT.2020 (its output matrix lands in 2020 RGB) even on
+         * an untagged stream — the tag-based line said BT.709 while the
+         * shader converted 2020→709 (panel-vs-log disagreement caught
+         * by Holden's paused screenshot, 2026-09-05). */
         log_msg("GPU: HDR→SDR tone mapping active (peak=%.0f nits, target=%.0f nits, gamut=%s%s)",
                 peak_nits, target,
-                has_bt2020_primaries ? "BT.2020" : "BT.709",
+                ps->gpu_uniforms.hdr_gamut > 0.5f ? "BT.2020" : "BT.709",
                 is_dolby_vision ? ", Dolby Vision" : "");
-        log_msg("HDR: BT.2390 EETF (target=%.0f nits, KS=%.3f, maxLum=%.4f)",
+        log_msg("HDR: BT.2390 EETF PQ-domain (target=%.0f nits, KS=%.3f, maxLum=%.4f)",
                 target, ks, maxLum);
+        if (ps->gpu_uniforms.out_black_nits >= 0.0f) {
+            float bnits = ps->gpu_uniforms.out_black_nits > 0.0f
+                        ? ps->gpu_uniforms.out_black_nits
+                        : target / 2000.0f;   /* auto only if uniform 0 */
+            log_msg("HDR: BT.2390 black lift ACTIVE (display black=%.3f "
+                    "nits, %s, minLum=%.5f)",
+                    bnits, ps->black_src,
+                    pq_oetf_cpu(bnits) / pq_oetf_cpu(peak_nits));
+        } else {
+            log_msg("HDR: BT.2390 black lift disabled (DSVP_BLACK_NITS=0)");
+        }
     }
 
     static const char *chroma_names[] = {
@@ -2005,7 +2303,42 @@ void gpu_overlay_draw(SDL_GPURenderPass *pass, SDL_GPUCommandBuffer *cmd,
                       PlayerState *ps, Uint32 sc_w, Uint32 sc_h) {
     if (!ps->gpu_overlay_tex || !ps->gpu_pipeline_overlay || !ps->overlay_active)
         return;
-    (void)cmd;  /* uniform push would use cmd, but overlay has none */
+
+    /* OvParams: PQ re-encode flag + encode white (float4-sized).
+     * KWin scales the whole PQ surface by (held sdr-brightness)/203 —
+     * in passthrough the VIDEO rides that scale by design (the
+     * mode-aware hold), but graphics must not: encode overlay white at
+     * (displayed target)*(203/held) so subs and OSD DISPLAY at a
+     * chosen white regardless of the video's boost. The displayed
+     * target is its own dial, DSVP_OVERLAY_NITS (deck 2da890f: 203
+     * read too dim against 1000-scaled video, default 300 — a deck
+     * eye ruling, x64 eye pending; conditions recorded in the doc). */
+    static float s_ov_disp = -1.0f;
+    static int   s_ov_logged = 0;
+    if (s_ov_disp < 0.0f) {
+        s_ov_disp = 300.0f;
+        const char *oe = SDL_getenv("DSVP_OVERLAY_NITS");
+        if (oe && oe[0]) {
+            double ov = SDL_atof(oe);
+            if (ov >= 100.0 && ov <= 1000.0) s_ov_disp = (float)ov;
+            else log_msg("WARN: DSVP_OVERLAY_NITS='%s' ignored (want 100-1000) — using 300", oe);
+        }
+    }
+    /* Honest instrument: this line used to print on the first overlay
+     * draw — the idle screen, in SDR, on a box that cannot do
+     * passthrough at all (field 2026-09-06). It describes the PQ
+     * re-encode, so it prints the first time that re-encode runs. */
+    if (ps->hdr_out_active && !s_ov_logged) {
+        s_ov_logged = 1;
+        log_msg("overlay: graphics white %.0f nits displayed over passthrough (DSVP_OVERLAY_NITS)", s_ov_disp);
+    }
+    float ov_white = 203.0f;
+    if (ps->hdr_out_active) {
+        int held = hdr_sys_held_sdrbr();
+        ov_white = held > 0 ? s_ov_disp * 203.0f / (float)held : s_ov_disp;
+    }
+    float ovp[4] = { ps->hdr_out_active ? 1.0f : 0.0f, ov_white, 0.0f, 0.0f };
+    SDL_PushGPUFragmentUniformData(cmd, 0, ovp, sizeof(ovp));
 
     SDL_BindGPUGraphicsPipeline(pass, ps->gpu_pipeline_overlay);
 
@@ -2323,6 +2656,1661 @@ void fq_flush(FrameQueue *q) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * System-level display HDR — Windows (docs/TODO-X64.md NEXT CYCLE)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * The deck's engage/revert model: desktop HDR stays OFF; when an HDR
+ * file opens we flip the display into HDR, and we ALWAYS put it back
+ * on close/quit/crash. Deck flips KWin via kscreen-doctor; Windows
+ * exposes the same per-target switch through DisplayConfig device
+ * info: SET_HDR_STATE on Win11 24H2+ (advanced color split HDR from
+ * SDR wide-gamut/ACM there), SET_ADVANCED_COLOR_STATE before that.
+ * Every failure path falls back to the tone-mapped SDR output, which
+ * is today's baseline.
+ *
+ * Batch B: full arc. Engage display → HDR10/ST2084 swapchain →
+ * pipeline recreate (formats are swapchain-bound) → hdr_pass shader
+ * path presents PQ as-is. TONE-MAP by default since 2026-08-27
+ * (hdr_out_mode=0; Z opts into passthrough, DSVP_HDR_PASS=1 makes
+ * passthrough the default — Holden: desktop HDR on typical Windows
+ * panels is poor); DSVP_NO_SYS_HDR=1 disables system display control
+ * (deck knob). Ordering diverges from deck deliberately: Windows drivers
+ * may only advertise ST2084 after display HDR engages, so engage
+ * comes first and swapchain support is polled after (the deck's
+ * compositor always advertises, so it checks support up front). */
+#ifdef _WIN32
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX      /* windows.h min/max macros vs. our identifiers */
+#endif
+#include <windows.h>
+#include <wchar.h>
+#include <signal.h>     /* SIGABRT → revert (review DM9) */
+
+/* Win11 24H2 (SDK 26100) DisplayConfig additions, defined locally so
+ * any mingw-w64 header vintage compiles (upstream guards them behind
+ * NTDDI_WIN11_GA; Kodi ships the same shim). Layouts verified against
+ * mingw-w64 master wingdi.h, 2026-08. The ABI is what matters:
+ * Windows dispatches on header.type + header.size, and pre-24H2
+ * systems answer unknown types with an error — that error IS the
+ * version probe. */
+#define DSVP_DCDI_GET_ADVANCED_COLOR_INFO_2 ((DISPLAYCONFIG_DEVICE_INFO_TYPE)15)
+#define DSVP_DCDI_SET_HDR_STATE             ((DISPLAYCONFIG_DEVICE_INFO_TYPE)16)
+
+typedef struct {
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    union {
+        struct {
+            UINT32 advancedColorSupported       : 1;
+            UINT32 advancedColorActive          : 1;
+            UINT32 reserved1                    : 1;
+            UINT32 advancedColorLimitedByPolicy : 1;
+            UINT32 highDynamicRangeSupported    : 1;
+            UINT32 highDynamicRangeUserEnabled  : 1;
+            UINT32 wideColorSupported           : 1;
+            UINT32 wideColorUserEnabled         : 1;
+            UINT32 reserved                     : 24;
+        };
+        UINT32 value;
+    };
+    DISPLAYCONFIG_COLOR_ENCODING colorEncoding;
+    UINT32 bitsPerColorChannel;
+    UINT32 activeColorMode;      /* 0 = SDR, 1 = WCG, 2 = HDR */
+} DsvpAdvColorInfo2;
+
+typedef struct {
+    DISPLAYCONFIG_DEVICE_INFO_HEADER header;
+    union {
+        struct {
+            UINT32 enableHdr : 1;
+            UINT32 reserved  : 31;
+        };
+        UINT32 value;
+    };
+} DsvpSetHdrState;
+
+/* All state the revert path needs, file-static so the atexit/crash
+ * handlers can restore the display without a PlayerState. */
+static struct {
+    int           valid;      /* target below is resolved              */
+    int           api2;       /* 24H2 SET_HDR_STATE path available     */
+    int           supported;  /* display is HDR-capable                */
+    int           enabled;    /* display HDR was ACTIVE at probe time  */
+    int           user_on;    /* v2: the persistent "Use HDR" toggle   */
+    LUID          adapter;    /* DisplayConfig target of the window's  */
+    UINT32        target;     /*   monitor                             */
+    WCHAR         gdi[32];    /* \\.\DISPLAYn — DEVMODE + path match   */
+    volatile LONG engaged;    /* WE turned HDR on — must revert        */
+    int           handlers;   /* exit/crash handlers installed         */
+    int           have_prior_dm; /* graphics mode captured at engage   */
+    DEVMODEW      prior_dm;   /* the PRE-app mode the revert restores  */
+    LPTOP_LEVEL_EXCEPTION_FILTER prev_filter; /* chained crash filter  */
+} g_winhdr;
+
+/* ── Crash-restore stamp (review DM9 — the Linux contract, ported) ──
+ * Written BEFORE the display write (write-ahead: a timed-out or
+ * crashed write must leave insurance, review C4), cleared only on a
+ * CONFIRMED restore, reconciled at the next launch when the owner pid
+ * is dead. Lives under %LOCALAPPDATA% — per-user, not world-writable.
+ * Content: adapter LUID (hi lo), target id, api2, owner pid. */
+static int winhdr_stamp_path(WCHAR *buf, size_t n) {
+    const WCHAR *base = _wgetenv(L"LOCALAPPDATA");
+    if (!base || !base[0]) { buf[0] = 0; return 0; }
+    _snwprintf(buf, n, L"%s\\dsvp-hdr-restore", base);
+    buf[n - 1] = 0;
+    return 1;
+}
+
+static void winhdr_stamp_write(void) {
+    WCHAR path[MAX_PATH];
+    if (!winhdr_stamp_path(path, MAX_PATH)) return;
+    FILE *f = _wfopen(path, L"w");
+    if (!f) { log_msg("HDR sys: stamp NOT written (open failed)"); return; }
+    fprintf(f, "%ld %lu %lu %d %lu\n",
+            (long)g_winhdr.adapter.HighPart,
+            (unsigned long)g_winhdr.adapter.LowPart,
+            (unsigned long)g_winhdr.target, g_winhdr.api2,
+            (unsigned long)GetCurrentProcessId());
+    fclose(f);
+    log_msg("HDR sys: stamp armed (target %lu, pid %lu)",
+            (unsigned long)g_winhdr.target,
+            (unsigned long)GetCurrentProcessId());
+}
+
+static void winhdr_stamp_clear(void) {
+    WCHAR path[MAX_PATH];
+    if (!winhdr_stamp_path(path, MAX_PATH)) return;
+    if (_wremove(path) == 0)
+        log_msg("HDR sys: stamp cleared (restore confirmed)");
+}
+
+/* Is the stamp's owner still running dsvp? Access denied counts as
+ * ALIVE (review d-D4-9: never reconcile under a live session). */
+static int winhdr_owner_alive(DWORD pid) {
+    if (pid == 0 || pid == GetCurrentProcessId()) return 0;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return GetLastError() == ERROR_ACCESS_DENIED;
+    DWORD code = 0;
+    int alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+    if (alive) {
+        WCHAR img[MAX_PATH]; DWORD n = MAX_PATH;
+        if (QueryFullProcessImageNameW(h, 0, img, &n)) {
+            const WCHAR *b = wcsrchr(img, L'\\');
+            b = b ? b + 1 : img;
+            alive = (_wcsnicmp(b, L"dsvp", 4) == 0);
+        }
+    }
+    CloseHandle(h);
+    return alive;
+}
+
+/* Resolve the window's monitor to a DisplayConfig target: GDI name
+ * from MONITORINFOEXW, then match it against each active path's
+ * source name (Kodi-established pattern). */
+static int winhdr_map_target(HWND hwnd) {
+    g_winhdr.valid = 0;
+
+    MONITORINFOEXW mi;
+    memset(&mi, 0, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!mon || !GetMonitorInfoW(mon, (MONITORINFO *)&mi)) {
+        log_msg("HDR sys: GetMonitorInfoW failed");
+        return 0;
+    }
+
+    UINT32 npath = 0, nmode = 0;
+    DISPLAYCONFIG_PATH_INFO *paths = NULL;
+    DISPLAYCONFIG_MODE_INFO *modes = NULL;
+    LONG rc;
+    int tries = 0;
+    /* Bounded (review d-D3-6): a topology that keeps changing under us
+     * (DisplayLink/KVM re-enumeration, TDR recovery) must not spin the
+     * main thread — four tries, then tone-mapped output. */
+    do {
+        rc = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &npath, &nmode);
+        if (rc != ERROR_SUCCESS) break;
+        free(paths); free(modes);
+        /* npath/nmode of 0 would make malloc(0) look like OOM */
+        paths = malloc((npath ? npath : 1) * sizeof(*paths));
+        modes = malloc((nmode ? nmode : 1) * sizeof(*modes));
+        if (!paths || !modes) { rc = ERROR_NOT_ENOUGH_MEMORY; break; }
+        rc = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                                &npath, paths, &nmode, modes, NULL);
+    } while (rc == ERROR_INSUFFICIENT_BUFFER && ++tries < 4);
+    if (rc == ERROR_INSUFFICIENT_BUFFER)
+        log_msg("HDR sys: QueryDisplayConfig unstable after %d tries — "
+                "tone-mapped output", tries);
+
+    if (rc != ERROR_SUCCESS) {
+        log_msg("HDR sys: QueryDisplayConfig failed (%ld)", rc);
+        free(paths); free(modes);
+        return 0;
+    }
+
+    for (UINT32 i = 0; i < npath; i++) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME src;
+        memset(&src, 0, sizeof(src));
+        src.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        src.header.size      = sizeof(src);
+        src.header.adapterId = paths[i].sourceInfo.adapterId;
+        src.header.id        = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&src.header) == ERROR_SUCCESS &&
+            wcscmp(src.viewGdiDeviceName, mi.szDevice) == 0) {
+            g_winhdr.adapter = paths[i].targetInfo.adapterId;
+            g_winhdr.target  = paths[i].targetInfo.id;
+            wcsncpy(g_winhdr.gdi, mi.szDevice, 31);
+            g_winhdr.gdi[31] = 0;
+            g_winhdr.valid   = 1;
+            break;
+        }
+    }
+    free(paths); free(modes);
+    if (!g_winhdr.valid)
+        log_msg("HDR sys: no DisplayConfig path matches the window's monitor");
+    return g_winhdr.valid;
+}
+
+/* Query HDR capability + current state. Tries the 24H2 v2 info first
+ * (HDR and SDR wide-gamut/ACM are separate concepts there); a failure
+ * is the version probe and drops us to the legacy struct with the
+ * flag decode Kodi established in the field: wideColorEnforced set
+ * means an SDR screen running ACM — "advanced color" there is not
+ * HDR, and toggling it would not get us one. */
+static int winhdr_probe(void) {
+    g_winhdr.api2 = g_winhdr.supported = g_winhdr.enabled = 0;
+    g_winhdr.user_on = 0;
+
+    DsvpAdvColorInfo2 v2;
+    memset(&v2, 0, sizeof(v2));
+    v2.header.type      = DSVP_DCDI_GET_ADVANCED_COLOR_INFO_2;
+    v2.header.size      = sizeof(v2);
+    v2.header.adapterId = g_winhdr.adapter;
+    v2.header.id        = g_winhdr.target;
+    if (DisplayConfigGetDeviceInfo(&v2.header) == ERROR_SUCCESS) {
+        g_winhdr.api2      = 1;
+        g_winhdr.supported = v2.highDynamicRangeSupported ? 1 : 0;
+        /* Two different facts (review DM6): activeColorMode says what the
+         * OS is RUNNING now (the ST2084 signal); highDynamicRangeUserEnabled
+         * is the persistent "Use HDR" toggle — the thing SET_HDR_STATE
+         * writes and the thing our revert must put back. The prior we
+         * restore is the toggle, never the active mode. */
+        g_winhdr.enabled   = (v2.activeColorMode == 2);
+        g_winhdr.user_on   = v2.highDynamicRangeUserEnabled ? 1 : 0;
+        log_msg("HDR sys: advanced-color v2 — hdrSupported=%d hdrUserEnabled=%u "
+                "activeMode=%u bits=%u",
+                g_winhdr.supported, (unsigned)v2.highDynamicRangeUserEnabled,
+                (unsigned)v2.activeColorMode, (unsigned)v2.bitsPerColorChannel);
+        return g_winhdr.supported;
+    }
+
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO v1;
+    memset(&v1, 0, sizeof(v1));
+    v1.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+    v1.header.size      = sizeof(v1);
+    v1.header.adapterId = g_winhdr.adapter;
+    v1.header.id        = g_winhdr.target;
+    if (DisplayConfigGetDeviceInfo(&v1.header) == ERROR_SUCCESS) {
+        g_winhdr.supported = (v1.advancedColorSupported && !v1.wideColorEnforced);
+        g_winhdr.enabled   = (g_winhdr.supported && v1.advancedColorEnabled);
+        g_winhdr.user_on   = g_winhdr.enabled;  /* v1 has one bit for both */
+        log_msg("HDR sys: advanced-color v1 — acSupported=%u acEnabled=%u "
+                "wcEnforced=%u forceDisabled=%u",
+                (unsigned)v1.advancedColorSupported,
+                (unsigned)v1.advancedColorEnabled,
+                (unsigned)v1.wideColorEnforced,
+                (unsigned)v1.advancedColorForceDisabled);
+    } else {
+        log_msg("HDR sys: advanced-color query failed");
+    }
+    return g_winhdr.supported;
+}
+
+/* Re-impose a graphics mode only if the current one differs from it
+ * (review DM8 / d-D3-9): the pre-app mode is captured ONCE at engage
+ * and both directions restore that, never a re-snapshot of the
+ * HDR-era mode. Flags 0 = change now, no registry write, not a
+ * process-owned temporary mode. */
+static void winhdr_restore_mode(const DEVMODEW *want) {
+    DEVMODEW cur;
+    memset(&cur, 0, sizeof(cur));
+    cur.dmSize = sizeof(cur);
+    if (!EnumDisplaySettingsW(g_winhdr.gdi, ENUM_CURRENT_SETTINGS, &cur)) {
+        log_msg("HDR sys: mode restore skipped — cannot read current mode");
+        return;
+    }
+    if (cur.dmPelsWidth == want->dmPelsWidth &&
+        cur.dmPelsHeight == want->dmPelsHeight &&
+        cur.dmDisplayFrequency == want->dmDisplayFrequency) {
+        log_msg("HDR sys: mode unchanged after flip (%ux%u@%uHz) — no restore",
+                (unsigned)cur.dmPelsWidth, (unsigned)cur.dmPelsHeight,
+                (unsigned)cur.dmDisplayFrequency);
+        return;
+    }
+    DEVMODEW dm = *want;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT |
+                  DM_DISPLAYFREQUENCY | DM_DISPLAYFLAGS;
+    LONG mrc = ChangeDisplaySettingsExW(g_winhdr.gdi, &dm, NULL, 0, NULL);
+    log_msg("HDR sys: mode restore %ux%u@%uHz -> %ux%u@%uHz (%s, %ld)",
+            (unsigned)cur.dmPelsWidth, (unsigned)cur.dmPelsHeight,
+            (unsigned)cur.dmDisplayFrequency,
+            (unsigned)want->dmPelsWidth, (unsigned)want->dmPelsHeight,
+            (unsigned)want->dmDisplayFrequency,
+            mrc == DISP_CHANGE_SUCCESSFUL ? "ok" : "FAILED", mrc);
+}
+
+/* Flip display HDR. The flip can bump the graphics mode (refresh
+ * drops on bandwidth-limited links). On ENGAGE the pre-app mode is
+ * captured into g_winhdr and put back after the flip; on REVERT the
+ * same captured mode is restored — Kodi carries the same restore, but
+ * from a fresh snapshot each time, which re-imposed the HDR-era mode
+ * after HDR was already off (review DM8). */
+static int winhdr_set(int on) {
+    if (on) {
+        memset(&g_winhdr.prior_dm, 0, sizeof(g_winhdr.prior_dm));
+        g_winhdr.prior_dm.dmSize = sizeof(g_winhdr.prior_dm);
+        g_winhdr.have_prior_dm = EnumDisplaySettingsW(
+            g_winhdr.gdi, ENUM_CURRENT_SETTINGS, &g_winhdr.prior_dm) ? 1 : 0;
+        if (g_winhdr.have_prior_dm)
+            log_msg("HDR sys: prior graphics mode %ux%u@%uHz captured",
+                    (unsigned)g_winhdr.prior_dm.dmPelsWidth,
+                    (unsigned)g_winhdr.prior_dm.dmPelsHeight,
+                    (unsigned)g_winhdr.prior_dm.dmDisplayFrequency);
+    }
+
+    LONG rc;
+    if (g_winhdr.api2) {
+        DsvpSetHdrState s;
+        memset(&s, 0, sizeof(s));
+        s.header.type      = DSVP_DCDI_SET_HDR_STATE;
+        s.header.size      = sizeof(s);
+        s.header.adapterId = g_winhdr.adapter;
+        s.header.id        = g_winhdr.target;
+        s.enableHdr        = on ? 1 : 0;
+        rc = DisplayConfigSetDeviceInfo(&s.header);
+    } else {
+        DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE s;
+        memset(&s, 0, sizeof(s));
+        s.header.type         = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE;
+        s.header.size         = sizeof(s);
+        s.header.adapterId    = g_winhdr.adapter;
+        s.header.id           = g_winhdr.target;
+        s.enableAdvancedColor = on ? 1 : 0;
+        rc = DisplayConfigSetDeviceInfo(&s.header);
+    }
+    log_msg("HDR sys: display HDR %s via %s (rc=%ld)",
+            on ? "ENABLED" : "restored to OFF",
+            g_winhdr.api2 ? "SET_HDR_STATE" : "SET_ADVANCED_COLOR_STATE", rc);
+    if (rc != ERROR_SUCCESS) return 0;
+
+    if (g_winhdr.have_prior_dm && g_winhdr.prior_dm.dmDisplayFrequency != 0)
+        winhdr_restore_mode(&g_winhdr.prior_dm);
+    return 1;
+}
+
+/* Diagnostic (and batch-C input for subtitle nits): where the OS maps
+ * SDR white while HDR is on — explains "everything looks dim" reports.
+ * Units: 1000 = 80 nits (Windows SDR-content-brightness slider). Our
+ * PQ passthrough is NOT scaled by this — only SDR-in-HDR content is. */
+static void winhdr_log_sdr_white(void) {
+    DISPLAYCONFIG_SDR_WHITE_LEVEL wl;
+    memset(&wl, 0, sizeof(wl));
+    wl.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+    wl.header.size      = sizeof(wl);
+    wl.header.adapterId = g_winhdr.adapter;
+    wl.header.id        = g_winhdr.target;
+    if (DisplayConfigGetDeviceInfo(&wl.header) == ERROR_SUCCESS)
+        log_msg("HDR sys: OS SDR white level = %.0f nits",
+                wl.SDRWhiteLevel * 80.0 / 1000.0);
+}
+
+/* The one revert everything funnels through. Interlocked so the
+ * normal path, atexit, and the crash filter can race safely — the
+ * display is restored exactly once. */
+static void winhdr_revert(void) {
+    if (InterlockedExchange(&g_winhdr.engaged, 0)) {
+        if (winhdr_set(0)) {
+            winhdr_stamp_clear();
+            winhdr_probe();   /* receipt: the post-revert user/active state */
+        } else {
+            log_msg("HDR sys: restore NOT confirmed — stamp kept, next "
+                    "launch reconciles");
+        }
+    }
+}
+
+static void winhdr_atexit(void) { winhdr_revert(); }
+
+/* Termination paths atexit + the exception filter do not cover
+ * (review DM9): console Ctrl+C / window close → ExitProcess, and
+ * abort() → raise(SIGABRT) → _exit. Both revert first, then let the
+ * default action proceed. */
+static BOOL WINAPI winhdr_console_handler(DWORD type) {
+    log_msg("HDR sys: console event %lu — reverting display", (unsigned long)type);
+    winhdr_revert();
+    return FALSE;   /* default handler terminates the process */
+}
+
+static void winhdr_abort_handler(int sig) {
+    winhdr_revert();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* Crash while we hold the display in HDR: put the desktop back, then
+ * let WER/the debugger see the exception. log_msg is lock-free
+ * (plain FILE*), so no deadlock hazard from crash context. Covers
+ * faults; TerminateProcess/power loss cannot be covered — the
+ * desktop's own HDR toggle is the manual recovery. */
+static LONG WINAPI winhdr_crash_filter(EXCEPTION_POINTERS *ep) {
+    winhdr_revert();
+    /* Chain (review d-D3-5): whoever was installed before us (SDL, a
+     * crash reporter) still gets the exception. */
+    if (g_winhdr.prev_filter && g_winhdr.prev_filter != winhdr_crash_filter)
+        return g_winhdr.prev_filter(ep);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void winhdr_install_handlers(void) {
+    if (g_winhdr.handlers) return;
+    g_winhdr.handlers = 1;
+    atexit(winhdr_atexit);
+    g_winhdr.prev_filter = SetUnhandledExceptionFilter(winhdr_crash_filter);
+    SetConsoleCtrlHandler(winhdr_console_handler, TRUE);
+    signal(SIGABRT, winhdr_abort_handler);
+    log_msg("HDR sys: crash filter installed (prev=%p); console + abort "
+            "handlers installed", (void *)g_winhdr.prev_filter);
+}
+
+/* Platform backend: put the window's display into HDR (or confirm
+ * it already is). Returns 1 iff the display is in HDR when we
+ * return. Never touches a display the user already runs in HDR
+ * (engaged stays 0, nothing reverts). */
+static int hdr_sys_engage(PlayerState *ps) {
+    if (g_winhdr.engaged) return 1;
+
+    HWND hwnd = (HWND)SDL_GetPointerProperty(
+                    SDL_GetWindowProperties(ps->window),
+                    SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    if (!hwnd || !winhdr_map_target(hwnd) || !winhdr_probe()) {
+        log_msg("HDR sys: display not HDR-capable — tone-mapped output");
+        return 0;
+    }
+    if (g_winhdr.enabled) {
+        /* The user runs this display in HDR: nothing to write, nothing
+         * to revert. */
+        winhdr_log_sdr_white();
+        return 1;
+    }
+    if (g_winhdr.user_on) {
+        /* "Use HDR" is ON but the OS is not running it right now
+         * (battery optimisation, link retrain, display asleep). Writing
+         * SET(1) would be a no-op and the later revert SET(0) would turn
+         * the user's toggle OFF for good (review DM6). Touch nothing; the
+         * swapchain poll decides whether ST2084 is available. */
+        log_msg("HDR sys: HDR user-enabled but inactive — not writing; "
+                "swapchain poll decides");
+        return 1;
+    }
+    winhdr_install_handlers();
+    /* Arm the revert BEFORE the write (review DM7): the flip plus the
+     * synchronous mode restore can take seconds, and a fault inside
+     * that window must still put the desktop back. Cleared only if the
+     * write itself was refused — then nothing changed. */
+    InterlockedExchange(&g_winhdr.engaged, 1);
+    log_msg("HDR sys: engaging — revert armed (prior: user=%d active=%d)",
+            g_winhdr.user_on, g_winhdr.enabled);
+    winhdr_stamp_write();   /* write-ahead: insurance exists before the write */
+    if (!winhdr_set(1)) {
+        InterlockedExchange(&g_winhdr.engaged, 0);
+        winhdr_stamp_clear();   /* nothing changed — nothing to insure */
+        return 0;
+    }
+    winhdr_log_sdr_white();
+    return 1;
+}
+
+/* Platform backend: restore the display iff we changed it. */
+static void hdr_sys_revert_all(void) {
+    winhdr_revert();
+}
+
+/* KWin-specific concept (reference-luminance hold); Windows scales
+ * nothing behind our PQ surface. No-op keeps the shared apply layer
+ * platform-blind. */
+static void hdr_sys_apply_sdrbr(int pass_active) { (void)pass_active; }
+int hdr_sys_held_sdrbr(void) { return 0; }
+
+/* Windows crash-restore (review DM9): the OS HDR toggle PERSISTS in
+ * Windows' own settings, so a session that died holding it (fail-fast,
+ * TerminateProcess, power loss) leaves the user's desktop in HDR with
+ * "Use HDR" flipped on behind their back. Runs before any probe. */
+void hdr_sys_reconcile_stamp(void) {
+    WCHAR path[MAX_PATH];
+    if (!winhdr_stamp_path(path, MAX_PATH)) return;
+    FILE *f = _wfopen(path, L"r");
+    if (!f) return;   /* no stamp: the common case */
+    long hi = 0; unsigned long lo = 0, target = 0, pid = 0; int api2 = 0;
+    int n = fscanf(f, "%ld %lu %lu %d %lu", &hi, &lo, &target, &api2, &pid);
+    fclose(f);
+    if (n < 5) {
+        log_msg("HDR sys: stamp unparsable (n=%d) — kept, manual check "
+                "of Settings > Display > Use HDR advised", n);
+        return;
+    }
+    if (winhdr_owner_alive((DWORD)pid)) {
+        log_msg("HDR sys: stamp belongs to live dsvp pid %lu — not reconciling", pid);
+        return;
+    }
+    /* The dead session only ever engaged when the user toggle was OFF
+     * (engage refuses otherwise), so the baseline is OFF. Probe first:
+     * if the user already put it back, just drop the stamp. */
+    g_winhdr.adapter.HighPart = hi;
+    g_winhdr.adapter.LowPart  = lo;
+    g_winhdr.target           = (UINT32)target;
+    g_winhdr.api2             = api2;
+    g_winhdr.gdi[0]           = 0;      /* no DEVMODE restore without a name */
+    g_winhdr.have_prior_dm    = 0;
+    winhdr_probe();
+    if (!g_winhdr.user_on && !g_winhdr.enabled) {
+        log_msg("HDR sys: stamp from dead pid %lu — display already back "
+                "to baseline, stamp dropped", pid);
+        winhdr_stamp_clear();
+        return;
+    }
+    log_msg("HDR sys: previous session (pid %lu) died holding the display "
+            "— restoring baseline", pid);
+    if (winhdr_set(0)) {
+        log_msg("HDR sys: reconciled stranded display HDR from dead session (pid %lu)", pid);
+        winhdr_stamp_clear();
+    } else {
+        log_msg("HDR sys: reconcile write FAILED — stamp kept");
+    }
+}
+
+#else /* !_WIN32 — KDE/kscreen-doctor backend (deck lineage) */
+
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>      /* EINTR — bounded external-command waits */
+#include <poll.h>       /* bounded kscreen-doctor output reads */
+#include <fcntl.h>      /* O_WRONLY */
+#include <spawn.h>      /* posix_spawnp — no shell in the display path */
+#include <sys/wait.h>   /* waitpid */
+
+/* ── Bounded external-command execution (deck 2f00c37 port, review
+ * HDR M3+M4) ── Every kscreen-doctor call is a wedge risk: popen/
+ * system block forever if kscreen-doctor hangs (no KScreen service
+ * answering — the deck's field wedge mechanism). 5s covers the
+ * observed ~2s flip; on expiry the child is SIGKILLed and the caller
+ * treats it as failure (fail-open to the tone-mapped baseline).
+ * EINTR retried throughout. argv exec — NO SHELL remains in this
+ * path; the output-name whitelist is defense-in-depth now. */
+#define HDR_CMD_TIMEOUT_SEC 5.0
+/* One engage sequence (detect + set + retry + learn + learn-set) is up
+ * to five bounded calls; each used to carry TWO independent 5 s
+ * deadlines (read, then wait) — ~10 s per call, ~50 s per open on the
+ * main thread in the worst case (review DM13). Now: one deadline per
+ * call shared by read and wait, and one budget per SEQUENCE that every
+ * call inside it is clipped to. The budget is the request's "Z stalls
+ * playback" design item stated as a number; the async/pre-probe
+ * redesign stays open. */
+#define HDR_SEQ_BUDGET_SEC  8.0
+static double s_hdr_budget_deadline = 0.0;   /* 0 = no sequence budget armed */
+static int    s_hdr_budget_hits     = 0;
+
+static double hdr_call_deadline(void) {
+    double d = get_time_sec() + HDR_CMD_TIMEOUT_SEC;
+    if (s_hdr_budget_deadline > 0.0 && s_hdr_budget_deadline < d)
+        d = s_hdr_budget_deadline;
+    return d;
+}
+
+/* The kill after a timeout must not wait forever either (review
+ * d-D4-8, same class as the dialog's C3): WNOHANG for ~500 ms, then
+ * the zombie is left to init. EINTR-correct. */
+static void hdr_reap_after_kill(pid_t pid) {
+    for (int i = 0; i < 50; i++) {
+        int st = 0;
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid || (r < 0 && errno != EINTR)) return;
+        SDL_Delay(10);
+    }
+    log_msg("HDR sys: pid %d did not exit after SIGKILL — left to init", (int)pid);
+}
+
+static int hdr_sys_wait_bounded_until(pid_t pid, double deadline) {
+    for (;;) {
+        int st = 0;
+        pid_t r = waitpid(pid, &st, WNOHANG);
+        if (r == pid) return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+        if (r < 0 && errno != EINTR) return -1;
+        if (get_time_sec() >= deadline) {
+            kill(pid, SIGKILL);
+            hdr_reap_after_kill(pid);
+            log_msg("HDR sys: kscreen-doctor TIMED OUT (%.1fs budget) — "
+                    "killed; the display call may not have landed",
+                    HDR_CMD_TIMEOUT_SEC);
+            if (s_hdr_budget_deadline > 0.0) s_hdr_budget_hits++;
+            return -2;
+        }
+        SDL_Delay(5);
+    }
+}
+static int hdr_sys_wait_bounded(pid_t pid) {
+    return hdr_sys_wait_bounded_until(pid, hdr_call_deadline());
+}
+
+static pid_t hdr_spawn_capture(char *const argv[], int *out_fd) {
+    int pfds[2];
+    if (pipe(pfds) != 0) return -1;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, pfds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO,
+                                     "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&fa, pfds[0]);
+    extern char **environ;
+    pid_t pid;
+    int rc = posix_spawnp(&pid, argv[0], &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(pfds[1]);
+    if (rc != 0) { close(pfds[0]); return -1; }
+    *out_fd = pfds[0];
+    return pid;
+}
+
+/* Read until EOF or the deadline. On a timeout the child is killed and
+ * *timed_out is set — the caller must report a TIMEOUT, not parse the
+ * partial output as complete (review d-D4-5: the old read-timeout was
+ * indistinguishable from a normal exit, so detect's timeout guard was
+ * dead on the dominant hang and a wedged KScreen read as "no
+ * HDR-capable output"). When the buffer fills, the rest is drained and
+ * discarded so a verbose child never blocks on the pipe (d-D4-7). */
+static size_t hdr_read_bounded_until(int fd, pid_t pid, char *buf, size_t cap,
+                                     double deadline, int *timed_out) {
+    size_t got = 0;
+    char scratch[512];
+    if (timed_out) *timed_out = 0;
+    for (;;) {
+        double left = deadline - get_time_sec();
+        if (left <= 0.0) { kill(pid, SIGKILL); if (timed_out) *timed_out = 1; break; }
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int pr = poll(&pfd, 1, (int)(left * 1000.0) + 1);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) { kill(pid, SIGKILL); if (timed_out) *timed_out = 1; break; }
+        size_t room = cap - 1 - got;
+        char *dst = room > 0 ? buf + got : scratch;
+        size_t want = room > 0 ? room : sizeof(scratch);
+        ssize_t n = read(fd, dst, want);
+        if (n < 0) { if (errno == EINTR) continue; break; }
+        if (n == 0) break;
+        if (room > 0) got += (size_t)n;
+    }
+    buf[got] = '\0';
+    return got;
+}
+static size_t hdr_read_bounded(int fd, pid_t pid, char *buf, size_t cap) {
+    return hdr_read_bounded_until(fd, pid, buf, cap, hdr_call_deadline(), NULL);
+}
+
+/* Run kscreen-doctor with up to three property args, synchronously,
+ * bounded, output discarded. Returns the exit code (-1 abnormal,
+ * -2 timeout). Replaces system() — same synchronous ordering
+ * guarantee, no shell, no unbounded hang. */
+static int hdr_run_kscreen(const char *a1, const char *a2, const char *a3) {
+    char *argv[5];
+    int n = 0;
+    argv[n++] = "kscreen-doctor";
+    argv[n++] = (char *)a1;
+    if (a2 && a2[0]) argv[n++] = (char *)a2;
+    if (a3 && a3[0]) argv[n++] = (char *)a3;
+    argv[n] = NULL;
+    int fd = -1;
+    pid_t pid = hdr_spawn_capture(argv, &fd);
+    if (pid < 0) return -1;
+    double deadline = hdr_call_deadline();     /* ONE deadline for read + wait */
+    char drain[512];
+    int timed_out = 0;
+    hdr_read_bounded_until(fd, pid, drain, sizeof(drain), deadline, &timed_out);
+    close(fd);
+    int rc = hdr_sys_wait_bounded_until(pid, deadline);
+    return timed_out ? -2 : rc;
+}
+
+/* x64-Linux system HDR rides KWin's per-output switch via
+ * kscreen-doctor, exactly like the deck (field-proven there;
+ * dellbian is the same Plasma 6 stack). KWin ACCEPTS a PQ surface
+ * without ever switching the DISPLAY into HDR — it tone-maps to SDR
+ * itself — so the engage-first ordering applies here too. Non-KDE
+ * desktops: the probe finds nothing and we stay tone-mapped. */
+
+static struct {
+    char output[32];        /* HDR-capable output name (kscreen)     */
+    int  prior_hdr;         /* output HDR state before we touched it */
+    int  prior_wcg;         /* same for wide-colour-gamut: 1 on,
+                               0 off, -1 unknown/unreported. We write
+                               this property, so we must read it —
+                               -1 means never touch it                */
+    int  prior_sdrbr;       /* KWin "SDR brightness" (reference
+                               luminance, nits) before we touched it;
+                               -1 unknown/unreported = never touch.
+                               KWin scales every HDR frame by
+                               value/203 (deck field 2026-08-25), so
+                               engage holds it at the reference and
+                               revert restores the desktop value      */
+    volatile int engaged;   /* WE flipped it on — must revert        */
+    int  handlers;          /* atexit registered                     */
+    int  held_sdrbr;        /* sdr-brightness we last WROTE (mode-
+                               aware hold, deck caaded5/a56b870 port,
+                               hold LIFTED by Holden 2026-09-06):
+                               passthrough wants ~1000, SDR/tone-map
+                               203; 0 = nothing written, desktop
+                               value stands                          */
+} g_linhdr;
+
+/* ── Crash-restore stamp (deck 5c8554b lineage; ported 2026-08-26 at
+ * Holden's call) ──
+ * kscreen persists HDR/WCG/SDR-brightness across sessions and reboots;
+ * a SIGKILL, SEGV, or driver death while we hold the display strands
+ * the desktop there — atexit covers only clean exits. So: a stamp
+ * written when we flip the display, cleared when we restore, and
+ * reconciled synchronously at the next launch before any probe.
+ * No HOME → no stamp: the old deck fallback of a fixed world-writable
+ * /tmp path was a Knot audit finding (pre-seedable — its contents
+ * reach a popen'd command line — and symlinkable). */
+static int hdr_stamp_path(char *buf, size_t n) {
+    const char *h = getenv("HOME");
+    if (!h || !h[0]) { buf[0] = '\0'; return 0; }
+    snprintf(buf, n, "%s/.dsvp-hdr-restore", h);
+    return 1;
+}
+
+static void hdr_stamp_update(int held) {
+    char path[512];
+    if (!hdr_stamp_path(path, sizeof(path))) return;
+    if (!held) {
+        /* Restore confirmed — drop OUR insurance only (deck c8ba0ad
+         * port, review HDR M7): with two instances the second writer
+         * owns the stamp, and instance A's confirmed restore must not
+         * delete instance B's crash protection. The read side
+         * (reconcile) already pid-checks; this is the unlink side's
+         * mirror. An unparsable stamp is nobody's — unlink it. */
+        FILE *sf = fopen(path, "r");
+        if (!sf) return;
+        char so[64] = "";
+        int sh = 0, sw = -1, spd = 0, ss = -1;
+        int sn = fscanf(sf, "%63s %d %d %d %d", so, &sh, &sw, &spd, &ss);
+        fclose(sf);
+        if (sn < 4 || spd == (int)getpid())
+            unlink(path);
+        else
+            log_msg("HDR sys: stamp now owned by pid %d — left in place",
+                    spd);
+        return;
+    }
+    /* Atomic (review DM11): tmp + fsync + rename. A truncating fopen
+     * left a 0-byte stamp on a power loss between open and write, and
+     * the read side then unlinked the empty file as "nobody's". */
+    char tmp[560];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { log_msg("HDR sys: stamp NOT written (open failed)"); return; }
+    fprintf(f, "%s %d %d %d %d\n", g_linhdr.output,
+            g_linhdr.prior_hdr, g_linhdr.prior_wcg,
+            (int)getpid(), g_linhdr.prior_sdrbr);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (rename(tmp, path) != 0) {
+        log_msg("HDR sys: stamp rename failed (errno %d)", errno);
+        unlink(tmp);
+        return;
+    }
+    log_msg("HDR sys: stamp armed for %s hdr=%d wcg=%d sdr=%d (pid %d)",
+            g_linhdr.output, g_linhdr.prior_hdr, g_linhdr.prior_wcg,
+            g_linhdr.prior_sdrbr, (int)getpid());
+}
+
+/* Is a stamp on disk owned by a DIFFERENT live dsvp? Then that
+ * instance holds the display and this one must ride its state, never
+ * own it (review DM12: a second instance used to overwrite the stamp
+ * with the first's ENGAGED state as the baseline). */
+static int hdr_stamp_owner_alive(int pid);
+static int hdr_stamp_foreign_live(int *owner_pid) {
+    char path[512];
+    if (!hdr_stamp_path(path, sizeof(path))) return 0;
+    FILE *sf = fopen(path, "r");
+    if (!sf) return 0;
+    char so[64] = ""; int sh = 0, sw = -1, spd = 0, ss = -1;
+    int sn = fscanf(sf, "%63s %d %d %d %d", so, &sh, &sw, &spd, &ss);
+    fclose(sf);
+    if (sn < 4 || spd == (int)getpid()) return 0;
+    if (!hdr_stamp_owner_alive(spd)) return 0;
+    if (owner_pid) *owner_pid = spd;
+    return 1;
+}
+
+/* True when the pid recorded in a stamp belongs to a LIVE dsvp
+ * process. Without this, a second concurrent instance reads the
+ * first's stamp as "previous session died", restores the display
+ * baseline under its feet mid-playback, and unlinks its crash
+ * protection. The comm check keeps a recycled pid from counting. */
+static int hdr_stamp_owner_alive(int pid) {
+    if (pid <= 0) return 0;
+    if (kill((pid_t)pid, 0) != 0) {
+        /* EPERM: it exists but is not ours to signal — ALIVE (review
+         * d-D4-9). Never reconcile under a process we cannot see into. */
+        return errno == EPERM;
+    }
+    /* Compare with OUR OWN comm, not the literal "dsvp": a renamed
+     * binary (dsvp-git, a wrapper) used to read as dead, and reconcile
+     * restored the display under a live session (d-D4-9). */
+    char cpath[64], comm[32] = "", self[32] = "";
+    snprintf(cpath, sizeof(cpath), "/proc/%d/comm", pid);
+    FILE *cf = fopen(cpath, "r");
+    if (!cf) return 1;   /* cannot read it — treat as alive, the safe side */
+    if (!fgets(comm, sizeof(comm), cf)) comm[0] = '\0';
+    fclose(cf);
+    comm[strcspn(comm, "\n")] = '\0';
+    FILE *mf = fopen("/proc/self/comm", "r");
+    if (mf) { if (!fgets(self, sizeof(self), mf)) self[0] = '\0'; fclose(mf); }
+    self[strcspn(self, "\n")] = '\0';
+    if (!self[0]) snprintf(self, sizeof(self), "dsvp");
+    return strcmp(comm, self) == 0;
+}
+
+void hdr_sys_reconcile_stamp(void) {
+    char path[512];
+    if (!hdr_stamp_path(path, sizeof(path))) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;   /* no stamp — the common case, guards stay silent */
+    /* Session guard (deck fd06dec port, review HDR C1): DSVP_NO_SYS_HDR
+     * promises zero display ops — DEFER with the stamp preserved; it
+     * is the only record of the stranded desktop state, repairable
+     * only by an unguarded launch. (The deck carries a second guard
+     * for its Game Mode compositor; deliberately NOT here — x64
+     * targets Debian and Windows desktops only, Holden 2026-09-05.) */
+    if (SDL_getenv("DSVP_NO_SYS_HDR")) {
+        fclose(f);
+        log_msg("HDR sys: DSVP_NO_SYS_HDR — stamp reconcile deferred "
+                "(stamp preserved)");
+        return;
+    }
+    char out[64] = "";
+    int phdr = 0, pwcg = -1, spid = 0, psdr = -1;
+    int n = fscanf(f, "%63s %d %d %d %d", out, &phdr, &pwcg, &spid, &psdr);
+    fclose(f);
+    /* Whitelist on the READ side too: out reaches a shell command
+     * line below, and write-side sanitisation does not protect a
+     * stamp file we did not write. */
+    for (const char *c = out; *c; c++) {
+        if (!((*c>='A'&&*c<='Z')||(*c>='a'&&*c<='z')||
+              (*c>='0'&&*c<='9')||*c=='-')) {
+            log_msg("HDR sys: stamp output name rejected — not restoring");
+            unlink(path);
+            return;
+        }
+    }
+    if (n < 3 || !out[0]) {
+        /* Present but unparsable (torn write, foreign content): KEEP
+         * it and say so — deleting the only record of a stranded
+         * desktop is the one thing reconcile must never do (DM11). */
+        log_msg("HDR sys: stamp unparsable (n=%d) — kept; check Display "
+                "settings by hand if the desktop looks stuck in HDR", n);
+        return;
+    }
+    if (n >= 4 && hdr_stamp_owner_alive(spid)) {
+        /* The session that wrote this is still running and still owns
+         * the display — leave both the display and the stamp alone. */
+        log_msg("HDR sys: stamp belongs to live dsvp pid %d — "
+                "not reconciling", spid);
+        return;
+    }
+    if (n >= 3 && out[0]) {
+        /* Mirror hdr_sys_set's restore semantics: hdr back to the
+         * recorded baseline; wcg only if the dead session had turned
+         * it on itself (prior_wcg == 0); sdr-brightness back to the
+         * recorded desktop value. Synchronous — the session that
+         * follows must probe the TRUE baseline. */
+        /* argv exec + bounded (deck 2f00c37 port) — and the stamp
+         * survives an UNCONFIRMED restore (deck b91f15e / review M2):
+         * the old code unlinked unconditionally, deleting the crash
+         * insurance on exactly the restore-failed path. */
+        char hdr_part[64], wcg_part[64] = "", sdr_part[64] = "";
+        snprintf(hdr_part, sizeof(hdr_part), "output.%s.hdr.%s",
+                 out, phdr ? "enable" : "disable");
+        if (pwcg == 0)
+            snprintf(wcg_part, sizeof(wcg_part),
+                     "output.%s.wcg.disable", out);
+        if (n == 5 && psdr > 0)
+            snprintf(sdr_part, sizeof(sdr_part),
+                     "output.%s.sdr-brightness.%d", out, psdr);
+        log_msg("HDR sys: previous session died holding the display — "
+                "restoring baseline on %s (stamp file)", out);
+        int rc = hdr_run_kscreen(hdr_part, wcg_part, sdr_part);
+        if (rc != 0 && (wcg_part[0] || sdr_part[0])) {
+            /* kscreen-doctor parses ALL its arguments before applying
+             * any: one rejected property (a version that lacks
+             * sdr-brightness) blocked the HDR restore forever (review
+             * d-D4-11). Retry the HDR part alone. */
+            log_msg("HDR sys: combined restore rc=%d — retrying hdr part alone", rc);
+            rc = hdr_run_kscreen(hdr_part, "", "");
+        }
+        if (rc != 0) {
+            log_msg("HDR sys: stamp restore NOT confirmed (rc=%d) — "
+                    "stamp kept, will retry next launch", rc);
+            return;
+        }
+        log_msg("HDR sys: reconciled stranded display state on %s", out);
+    }
+    unlink(path);
+}
+
+/* kscreen-doctor colours its output with ANSI escapes even into a
+ * pipe — the deck's first field-test parse failed on exactly that.
+ * Strip CSI sequences in place before any matching. */
+static void strip_ansi(char *s) {
+    char *w = s;
+    for (char *r = s; *r; ) {
+        if (*r == 0x1b && r[1] == '[') {
+            r += 2;
+            while (*r && !(*r >= '@' && *r <= '~')) r++;
+            if (*r) r++;   /* consume the final byte */
+        } else *w++ = *r++;
+    }
+    *w = '\0';
+}
+
+/* Read a kscreen-doctor property line's value.
+ * 1 = enabled, 0 = disabled, -1 = incapable or unrecognised.
+ * ("disabled" contains no "enabled" substring, so the order is safe.) */
+static int hdr_prop_state(const char *s) {
+    if (strstr(s, "incapable")) return -1;
+    if (strstr(s, "enabled"))   return  1;
+    if (strstr(s, "disabled"))  return  0;
+    return -1;
+}
+
+/* Is this the wide-colour-gamut property line? The label has been
+ * spelled several ways across Plasma releases, so match the key part
+ * case-insensitively rather than pinning one string — an unmatched
+ * label leaves WCG at "unknown", which is the safe state (we then
+ * never write it). */
+static int hdr_line_is_wcg(const char *s) {
+    char key[64];
+    size_t i = 0;
+    for (; i < sizeof(key) - 1 && s[i] && s[i] != ':'; i++)
+        key[i] = (s[i] >= 'A' && s[i] <= 'Z') ? (char)(s[i] + 32) : s[i];
+    key[i] = '\0';
+    return strstr(key, "wide color gamut") != NULL
+        || strstr(key, "wide colour gamut") != NULL
+        || strstr(key, "wcg") != NULL;
+}
+
+/* Adopt this output if it is the one we can drive. Called at each
+ * block boundary because the properties we need can appear in any
+ * order within an output's block. */
+static int hdr_sys_adopt(const char *name, int enabled, int hdr, int wcg,
+                         int sdrbr) {
+    if (!enabled || !name[0] || hdr < 0) return 0;
+    /* Sanitize before this ever reaches a shell */
+    for (const char *c = name; *c; c++)
+        if (!((*c>='A'&&*c<='Z')||(*c>='a'&&*c<='z')||
+              (*c>='0'&&*c<='9')||*c=='-')) return 0;
+    snprintf(g_linhdr.output, sizeof(g_linhdr.output), "%s", name);
+    g_linhdr.prior_hdr = hdr;
+    g_linhdr.prior_wcg = wcg;
+    g_linhdr.prior_sdrbr = sdrbr;
+    return 1;
+}
+
+/* Find the connected, enabled output whose HDR capability is real
+ * ("HDR: enabled|disabled" — SDR panels say "incapable"). Records
+ * the output name and the CURRENT state of every property we are
+ * going to write, so revert restores rather than assumes.
+ *
+ * WCG is read here because hdr_sys_set writes it. It used to be
+ * written but never read: revert issued wcg.disable unconditionally,
+ * on the assumption that WCG tracked HDR. On a display where the user
+ * had wide gamut on with HDR off, that silently turned it off and
+ * LEFT it off — kscreen persists output properties, so the change
+ * outlived the process, the session, and reboots. Root-caused on the
+ * deck 2026-08-17 (a week of chasing it as a TV fault, because with
+ * WCG off KWin's SDR fullscreen path froze on that display); this is
+ * the same defect, ported here with the rest of the backend before it
+ * ever shipped. Anything we write, we read first.
+ *
+ * Returns 1 if found. (Deck lineage; the deck's copy of this parser is
+ * host-unit-tested against coloured, plain, WCG-absent, prior-enabled
+ * and incapable-only fixtures from real kscreen-doctor output.) */
+/* Set by hdr_sys_detect when kscreen-doctor ANSWERED and no enabled
+ * output was HDR-capable (as opposed to the probe failing or timing
+ * out). Only that answer is worth remembering — see hdr_sys_engage. */
+static int s_detect_none = 0;
+
+static int hdr_sys_detect(const char *prefer) {
+    s_detect_none = 0;
+    g_linhdr.output[0] = '\0';
+    g_linhdr.prior_hdr = 0;
+    g_linhdr.prior_wcg = -1;
+    g_linhdr.prior_sdrbr = -1;
+    /* prefer = the connector the WINDOW is on (SDL's Wayland display
+     * name is the wl_output name, "DP-1"); the first HDR-capable
+     * output is only the fallback (review d-D4-12 / deck minor 4: with
+     * two HDR monitors the desk monitor was flipped and held while the
+     * TV got KWin's tone-map). */
+    char first_out[32] = ""; int first_hdr = 0, first_wcg = -1, first_sdrbr = -1;
+    int preferred_found = 0;
+
+    /* Bounded probe (deck 2f00c37 port): the plain popen/fgets/pclose
+     * had no ceiling — a hung kscreen-doctor wedged the session. */
+    static char outbuf[65536];
+    int out_fd = -1;
+    char *probe_argv[] = { "kscreen-doctor", "-o", NULL };
+    pid_t probe_pid = hdr_spawn_capture(probe_argv, &out_fd);
+    if (probe_pid < 0) {
+        log_msg("HDR sys: spawn(kscreen-doctor) failed");
+        return 0;
+    }
+    double pdl = hdr_call_deadline();
+    int ptimeout = 0;
+    hdr_read_bounded_until(out_fd, probe_pid, outbuf, sizeof(outbuf), pdl, &ptimeout);
+    close(out_fd);
+    int probe_rc = hdr_sys_wait_bounded_until(probe_pid, pdl);
+    if (ptimeout || probe_rc != 0) {
+        log_msg("HDR sys: probe %s (rc=%d) — display control skipped "
+                "(tone-mapped fallback)", ptimeout ? "timed out" : "failed",
+                probe_rc);
+        return 0;
+    }
+
+    char cur_name[32] = "";
+    int  cur_enabled = 0, cur_hdr = -1, cur_wcg = -1, cur_sdrbr = -1;
+    int  lines_seen = 0, outputs_seen = 0, found = 0;
+    char *saveptr = NULL;
+    for (char *line = strtok_r(outbuf, "\n", &saveptr); line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        lines_seen++;
+        strip_ansi(line);
+        const char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+
+        if (strncmp(s, "Output:", 7) == 0) {
+            /* Block boundary: decide on the block that just ended */
+            if (!preferred_found &&
+                hdr_sys_adopt(cur_name, cur_enabled, cur_hdr, cur_wcg, cur_sdrbr)) {
+                if (prefer && prefer[0] && strcmp(cur_name, prefer) == 0) {
+                    preferred_found = 1; found = 1;
+                } else if (!first_out[0]) {
+                    snprintf(first_out, sizeof(first_out), "%s", g_linhdr.output);
+                    first_hdr = g_linhdr.prior_hdr; first_wcg = g_linhdr.prior_wcg;
+                    first_sdrbr = g_linhdr.prior_sdrbr; found = 1;
+                }
+            }
+            /* "Output: 2 DP-1 <uuid>" — name is the third token */
+            outputs_seen++;
+            cur_name[0] = '\0';
+            cur_enabled = 0;
+            cur_hdr = -1;
+            cur_wcg = -1;
+            cur_sdrbr = -1;
+            char idx[16];
+            if (sscanf(s, "Output: %15s %31s", idx, cur_name) != 2)
+                cur_name[0] = '\0';
+        } else if (strncmp(s, "enabled", 7) == 0 &&
+                   (s[7]=='\n' || s[7]=='\0' || s[7]=='\r' || s[7]==' ')) {
+            cur_enabled = 1;
+        } else if (strncmp(s, "HDR:", 4) == 0) {
+            cur_hdr = hdr_prop_state(s);
+        } else if (hdr_line_is_wcg(s)) {
+            cur_wcg = hdr_prop_state(s);
+        } else if (strncmp(s, "SDR brightness:", 15) == 0) {
+            /* "SDR brightness: 800 nits" — KWin's reference luminance,
+             * an HDR sub-property (only reported while that output's
+             * HDR is enabled; absent leaves -1 = never touch). */
+            int v = -1;
+            if (sscanf(s + 15, " %d", &v) == 1 && v > 0) cur_sdrbr = v;
+        }
+    }
+    if (!preferred_found &&
+        hdr_sys_adopt(cur_name, cur_enabled, cur_hdr, cur_wcg, cur_sdrbr)) {
+        if (prefer && prefer[0] && strcmp(cur_name, prefer) == 0) {
+            preferred_found = 1; found = 1;
+        } else if (!first_out[0]) {
+            snprintf(first_out, sizeof(first_out), "%s", g_linhdr.output);
+            first_hdr = g_linhdr.prior_hdr; first_wcg = g_linhdr.prior_wcg;
+            first_sdrbr = g_linhdr.prior_sdrbr; found = 1;
+        }
+    }
+    if (found && !preferred_found) {
+        /* Fall back to the first capable output, restoring its fields
+         * (adopt may have been called for later, non-preferred blocks). */
+        snprintf(g_linhdr.output, sizeof(g_linhdr.output), "%s", first_out);
+        g_linhdr.prior_hdr = first_hdr; g_linhdr.prior_wcg = first_wcg;
+        g_linhdr.prior_sdrbr = first_sdrbr;
+        if (prefer && prefer[0])
+            log_msg("HDR sys: window display '%s' is not an HDR-capable enabled "
+                    "output — using the first capable one (%s)", prefer, first_out);
+    }
+
+    if (found) {
+        char sb[24] = "unknown";
+        if (g_linhdr.prior_sdrbr > 0)
+            snprintf(sb, sizeof(sb), "%d nits", g_linhdr.prior_sdrbr);
+        log_msg("HDR sys: output %s is HDR-capable — baseline hdr=%s wcg=%s "
+                "sdr-brightness=%s",
+                g_linhdr.output,
+                g_linhdr.prior_hdr ? "enabled" : "disabled",
+                g_linhdr.prior_wcg < 0 ? "unknown"
+                    : (g_linhdr.prior_wcg ? "enabled" : "disabled"),
+                sb);
+        return 1;
+    }
+    log_msg("HDR sys: no HDR-capable enabled output found "
+            "(read %d lines, %d outputs) — tone-mapped output",
+            lines_seen, outputs_seen);
+    s_detect_none = 1;
+    return 0;
+}
+
+/* Flip the output's HDR state, and wide gamut ONLY when we know the
+ * state we found it in. Best-effort: a failure leaves us on the
+ * tone-mapped path, which still works.
+ *
+ * HDR is ours to drive, so on the way out it goes back to what detect
+ * recorded rather than a hardcoded "disable". WCG is written only when
+ * detect actually read it AND found it off — i.e. only when engaging
+ * HDR requires turning it on, and then only to put it back exactly as
+ * found. Unknown (-1) or already-on means we never touch it: kscreen
+ * persists these properties, so a write we can't reverse is a
+ * permanent change to the user's display for a setting they never
+ * asked us to manage.
+ *
+ * This call stays synchronous. The deck went fire-and-forget to stop
+ * kscreen-doctor blocking its main loop for ~2 s, and immediately had
+ * to add a wait back at the engage site because the display must be in
+ * HDR before the PQ swapchain is claimed. x64 stays synchronous via
+ * hdr_run_kscreen (bounded, shell-free — deck 2f00c37 port), so that
+ * ordering holds for free. If this is ever made async, restore the
+ * wait at hdr_sys_engage — see deck c516ed2. */
+
+/* Reference-luminance target while we present (deck 37806c1 lineage).
+ * KWin scales every HDR frame by (SDR brightness)/203 before the wire —
+ * deck field 2026-08-25: a desktop value of 800 nits (the calibrate
+ * wizard's unexplained second slider) overdrove all HDR ~3.9x and
+ * crushed it back under the peak ceiling; 203 makes the compositor's
+ * multiplier exactly 1.0. DSVP_SDR_BRIGHTNESS overrides; 0 opts out. */
+static int hdr_sdr_target(void) {
+    static int target = -2;
+    if (target == -2) {
+        target = 203;
+        const char *e = SDL_getenv("DSVP_SDR_BRIGHTNESS");
+        if (e && e[0]) {
+            char *end = NULL;
+            long lv = strtol(e, &end, 10);
+            int v = (end && *end == '\0') ? (int)lv : -1;   /* junk → out-of-range branch */
+            if (v == 0) {
+                target = 0;
+                log_msg("HDR sys: DSVP_SDR_BRIGHTNESS=0 — reference "
+                        "luminance left to the desktop setting");
+            } else if (v >= 50 && v <= 2000) {
+                target = v;
+                log_msg("HDR sys: reference luminance target %d nits "
+                        "(DSVP_SDR_BRIGHTNESS)", v);
+            } else {
+                log_msg("HDR sys: DSVP_SDR_BRIGHTNESS=%s out of range "
+                        "(50-2000) — using 203", e);
+            }
+        }
+    }
+    return target;
+}
+
+/* True when engaging should also move KWin's SDR-brightness: we could
+ * read the desktop value (read-first rule — unreported means never
+ * touch), a target is configured, and the desktop value differs. */
+/* Playback reference target while PASSTHROUGH is live (deck caaded5
+ * port; hold lifted for x64 by Holden 2026-09-06). Field-convicted on
+ * the deck 2026-08-28: KWin scales the ENTIRE PQ surface — passthrough
+ * frames included — by (SDR brightness)/203, so the "accurate" 203
+ * hold rendered absolute-nits content ~5x too dark through this chain.
+ * Holden's eye ladder settled 1000 nits for passthrough vs 203 for
+ * SDR/tone-map (conditions: KWin peak ceiling 1700, permanent-HDR
+ * desktop, C4 Filmmaker Mode). A Plasma user pressing Z on x64 got the
+ * pre-fix picture until this port. DSVP_PASS_SDR_BRIGHTNESS overrides;
+ * 0 falls back to the uniform hold. DSVP_SDR_BRIGHTNESS=0 (the global
+ * opt-out) still disables every write. */
+static int hdr_pass_sdr_target(void) {
+    static int target = -2;
+    if (target == -2) {
+        target = 1000;
+        const char *e = SDL_getenv("DSVP_PASS_SDR_BRIGHTNESS");
+        if (e && e[0]) {
+            char *end = NULL;
+            long lv = strtol(e, &end, 10);
+            int v = (end && *end == '\0') ? (int)lv : -1;
+            if (v == 0) {
+                target = 0;
+                log_msg("HDR sys: DSVP_PASS_SDR_BRIGHTNESS=0 — "
+                        "passthrough holds the uniform target");
+            } else if (v >= 50 && v <= 2000) {
+                target = v;
+                log_msg("HDR sys: passthrough reference target %d nits "
+                        "(DSVP_PASS_SDR_BRIGHTNESS)", v);
+            } else {
+                log_msg("HDR sys: DSVP_PASS_SDR_BRIGHTNESS=%s out of "
+                        "range (50-2000) — using 1000", e);
+            }
+        }
+    }
+    return target;
+}
+
+/* The reference-luminance value the current output MODE wants held:
+ * passthrough live → the playback target; SDR/tone-map output → the
+ * uniform target. 0 = no hold (opt-out). */
+static int hdr_mode_sdr_target(int pass_active) {
+    int base = hdr_sdr_target();
+    if (base <= 0) return 0;            /* global opt-out is absolute */
+    if (pass_active) {
+        int p = hdr_pass_sdr_target();
+        return p > 0 ? p : base;
+    }
+    return base;
+}
+
+/* True when engaging should also own KWin's SDR-brightness: we could
+ * read the desktop value (read-first rule — unreported means never
+ * touch), a target is configured, and the desktop value differs from
+ * EITHER mode's target (deck a56b870: with the desktop parked at
+ * exactly 203 the single-target test answered "no work", nothing was
+ * owned, and the passthrough write was gated off with it). */
+static int hdr_sdrbr_needed(void) {
+    int t_sdr  = hdr_mode_sdr_target(0);
+    int t_pass = hdr_mode_sdr_target(1);
+    return g_linhdr.prior_sdrbr > 0
+        && ((t_sdr  > 0 && g_linhdr.prior_sdrbr != t_sdr)
+         || (t_pass > 0 && g_linhdr.prior_sdrbr != t_pass));
+}
+
+static int hdr_sys_set(int on) {
+    if (!g_linhdr.output[0]) return -1;
+
+    char hdr_part[64];
+    snprintf(hdr_part, sizeof(hdr_part), "output.%s.hdr.%s",
+             g_linhdr.output,
+             (on || g_linhdr.prior_hdr) ? "enable" : "disable");
+    int write_wcg = (g_linhdr.prior_wcg == 0);
+    char wcg_part[80] = "";
+    if (write_wcg)
+        snprintf(wcg_part, sizeof(wcg_part), "output.%s.wcg.%s",
+                 g_linhdr.output, on ? "enable" : "disable");
+
+    /* Reference luminance rides the same write and the same
+     * restore-as-found contract: engage holds the target, revert puts
+     * the exact desktop value back. hdr_sdrbr_needed carries the
+     * read-first rule, so an unreported value is never written. */
+    char sdr_part[80] = "";
+    int write_sdrbr = hdr_sdrbr_needed();
+    if (write_sdrbr)
+        snprintf(sdr_part, sizeof(sdr_part),
+                 "output.%s.sdr-brightness.%d",
+                 g_linhdr.output,
+                 on ? hdr_sdr_target() : g_linhdr.prior_sdrbr);
+
+    /* Synchronous + bounded + shell-free (deck 2f00c37 port): same
+     * ordering guarantee system() gave (display in HDR before the PQ
+     * swapchain is claimed), no unbounded hang, no shell. */
+    /* WRITE-AHEAD stamp (review C4): the insurance exists BEFORE the
+     * display write. A timed-out write may still have landed (the
+     * D-Bus request outlives the killed client), and the old order —
+     * stamp only on rc == 0 — left the display changed with no record
+     * and a log that promised "next launch reconciles" a stamp that was
+     * never written. Restore clears it only on a CONFIRMED rc == 0. */
+    if (on) hdr_stamp_update(1);
+    int rc = hdr_run_kscreen(hdr_part, wcg_part, sdr_part);
+    if (rc != 0 && (write_wcg || write_sdrbr)) {
+        /* One rejected property blocks the whole call (d-D4-11):
+         * retry the HDR part alone, then the rest, so a version that
+         * lacks sdr-brightness cannot pin the display. */
+        log_msg("HDR sys: combined write rc=%d — retrying hdr part alone", rc);
+        rc = hdr_run_kscreen(hdr_part, "", "");
+        if (rc == 0 && (write_wcg || write_sdrbr))
+            hdr_run_kscreen(write_wcg ? wcg_part : sdr_part,
+                            (write_wcg && write_sdrbr) ? sdr_part : "", "");
+    }
+    if (!on && rc == 0) hdr_stamp_update(0);
+    if (write_sdrbr && rc == 0)
+        g_linhdr.held_sdrbr = on ? hdr_sdr_target() : 0;
+    char sbdesc[40] = "untouched";
+    if (write_sdrbr) {
+        if (on)
+            snprintf(sbdesc, sizeof(sbdesc), "held at %d",
+                     hdr_sdr_target());
+        else
+            snprintf(sbdesc, sizeof(sbdesc), "restored to %d",
+                     g_linhdr.prior_sdrbr);
+    }
+    log_msg("HDR sys: display HDR %s on %s (wcg %s, sdr-brightness %s, "
+            "rc=%d)",
+            on ? "ENABLED" : "restored to baseline",
+            g_linhdr.output,
+            write_wcg ? (on ? "enabled" : "restored to disabled")
+                      : "untouched",
+            sbdesc, rc);
+    return rc;
+}
+
+static void linhdr_revert(void) {
+    if (!g_linhdr.engaged) return;
+    /* `engaged` stays set until the restore is CONFIRMED (review
+     * DM12): clearing it first let the next open re-detect the HELD
+     * state as the baseline, and a clean quit then wrote hdr.enable
+     * and unlinked the stamp. */
+    s_hdr_budget_deadline = get_time_sec() + HDR_SEQ_BUDGET_SEC;
+    int rc = hdr_sys_set(0);
+    if (rc != 0) {
+        /* The restore direction gets a retry (deck b91f15e port,
+         * review M2) — it is the direction restore-as-found actually
+         * protects. */
+        log_msg("HDR sys: restore FAILED (rc=%d) — retrying once", rc);
+        rc = hdr_sys_set(0);
+    }
+    s_hdr_budget_deadline = 0.0;
+    if (rc == 0) {
+        g_linhdr.engaged = 0;
+    } else {
+        log_msg("HDR sys: retry also failed — display may be left in HDR; "
+                "the stamp written at engage stays armed, next launch "
+                "reconciles (engaged kept: no re-detect as baseline)");
+    }
+}
+
+static void linhdr_atexit(void) { linhdr_revert(); }
+
+/* ── Mode-transition write for the reference luminance ONLY (deck
+ * caaded5 port) ── the held value FOLLOWS THE OUTPUT MODE; the
+ * desktop baseline and the crash stamp are untouched, so
+ * restore-as-found still puts the desktop value back on exit. One
+ * bounded call; a failed write logs and plays on — wrong brightness,
+ * never a wedge (fail open). Called from both hdr_output_apply exits. */
+static void hdr_sys_apply_sdrbr(int pass_active) {
+    if (!g_linhdr.engaged || !g_linhdr.output[0]) return;
+    if (g_linhdr.prior_sdrbr <= 0) return;   /* read-first: never write blind */
+    int t = hdr_mode_sdr_target(pass_active);
+    if (t <= 0) return;                        /* opt-out */
+    int cur = g_linhdr.held_sdrbr > 0 ? g_linhdr.held_sdrbr : g_linhdr.prior_sdrbr;
+    if (t == cur) return;
+    char sdr_part[80];
+    snprintf(sdr_part, sizeof(sdr_part), "output.%s.sdr-brightness.%d",
+             g_linhdr.output, t);
+    int rc = hdr_run_kscreen(sdr_part, "", "");
+    if (rc == 0) g_linhdr.held_sdrbr = t;
+    log_msg("HDR sys: sdr-brightness -> %d (%s hold, rc=%d%s)",
+            t, pass_active ? "passthrough" : "tone-map/SDR", rc,
+            rc == 0 ? "" : " — NOT applied, playing on");
+}
+int hdr_sys_held_sdrbr(void) { return g_linhdr.engaged ? g_linhdr.held_sdrbr : 0; }
+
+/* ── Read-after-enable for the reference luminance (deck b0615b9
+ * port, review HDR M8) ── kscreen-doctor only REPORTS sdr-brightness
+ * while the output's HDR is enabled, so an engage from an HDR-off
+ * baseline could never read the value the read-first rule requires
+ * before writing — the 800-nit 3.9x overdrive stayed live for
+ * exactly those sessions. After a CONFIRMED enable, the value read
+ * is KWin's stored per-output setting — the user's own configuration
+ * and therefore the restore-as-found baseline. Learn it, re-stamp,
+ * hold the target. An unreported value is still never written. */
+static void hdr_sys_learn_sdrbr(void) {
+    if (!g_linhdr.engaged) return;
+    if (g_linhdr.prior_sdrbr > 0) return;   /* already known */
+    if (hdr_sdr_target() <= 0) return;       /* DSVP_SDR_BRIGHTNESS=0 */
+    if (!g_linhdr.output[0]) return;
+
+    static char lbuf[65536];
+    int lfd = -1;
+    char *largv[] = { "kscreen-doctor", "-o", NULL };
+    pid_t lpid = hdr_spawn_capture(largv, &lfd);
+    if (lpid < 0) return;
+    hdr_read_bounded(lfd, lpid, lbuf, sizeof(lbuf));
+    close(lfd);
+    if (hdr_sys_wait_bounded(lpid) != 0) return;
+
+    int in_ours = 0, val = -1;
+    char *lsp = NULL;
+    for (char *line = strtok_r(lbuf, "\n", &lsp); line;
+         line = strtok_r(NULL, "\n", &lsp)) {
+        strip_ansi(line);
+        const char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (strncmp(s, "Output:", 7) == 0) {
+            char idx[16], name[32] = "";
+            in_ours = (sscanf(s, "Output: %15s %31s", idx, name) == 2
+                       && strcmp(name, g_linhdr.output) == 0);
+        } else if (in_ours && strncmp(s, "SDR brightness:", 15) == 0) {
+            int v = -1;
+            if (sscanf(s + 15, " %d", &v) == 1 && v > 0) val = v;
+        }
+    }
+    if (val <= 0) return;   /* still unreported — never write */
+
+    g_linhdr.prior_sdrbr = val;
+    if (!hdr_sdrbr_needed()) {
+        log_msg("HDR sys: reference luminance already %d nits — "
+                "no hold needed in either mode (read-after-enable)", val);
+        return;
+    }
+    log_msg("HDR sys: learned desktop reference luminance %d nits "
+            "post-enable — holding %d for playback, %d restores "
+            "(read-after-enable)", val, hdr_sdr_target(), val);
+    hdr_sys_set(1);   /* no-op hdr re-enable; brightness hold + re-stamp ride */
+}
+
+static int hdr_sys_engage(PlayerState *ps) {
+    if (g_linhdr.engaged) return 1;
+    const char *win_disp = NULL;
+    if (ps && ps->window) {
+        SDL_DisplayID did = SDL_GetDisplayForWindow(ps->window);
+        if (did) win_disp = SDL_GetDisplayName(did);
+    }
+    int owner = 0;
+    if (hdr_stamp_foreign_live(&owner)) {
+        /* Another dsvp holds the display: what detect would read now is
+         * ITS held state, not the user's baseline. Ride it, never own
+         * it (DM12). The swapchain poll decides whether ST2084 works. */
+        log_msg("HDR sys: display already owned by live dsvp pid %d — "
+                "riding its state, not engaging", owner);
+        return 1;
+    }
+    /* Detect-negative session memory (field 2026-09-07, dellbian: on a
+     * box with NO HDR-capable output every Z re-ran the bounded
+     * kscreen probe on the main thread and dropped a frame each time —
+     * the d-D3-8 memory in hdr_output_apply only covers a failed
+     * post-engage ST2084 poll, which that box never reaches). Only a
+     * probe that ANSWERED "nothing capable" is remembered, keyed on
+     * the display set (window's display name + display count): a
+     * hot-plugged or moved display re-probes, so an HDR monitor
+     * connected later is not vetoed by a memory taken before it
+     * existed. Probe failures and timeouts are not remembered — they
+     * retry on the next Z, as before. */
+    static int  s_none_remembered = 0;
+    static char s_none_disp[64] = "";
+    static int  s_none_ndisp = -1;
+    int ndisp = 0;
+    {
+        SDL_DisplayID *ids = SDL_GetDisplays(&ndisp);
+        if (ids) SDL_free(ids);
+    }
+    if (s_none_remembered && ndisp == s_none_ndisp &&
+        strcmp(win_disp ? win_disp : "", s_none_disp) == 0) {
+        log_msg("HDR sys: no HDR-capable output earlier this session "
+                "(display '%s', %d display%s) — probe skipped, tone-mapped output",
+                s_none_disp, ndisp, ndisp == 1 ? "" : "s");
+        return 0;
+    }
+    s_hdr_budget_deadline = get_time_sec() + HDR_SEQ_BUDGET_SEC;
+    s_hdr_budget_hits = 0;
+    double seq_t0 = get_time_sec();
+    if (!hdr_sys_detect(win_disp)) {
+        s_hdr_budget_deadline = 0.0;
+        if (s_detect_none) {
+            s_none_remembered = 1;
+            s_none_ndisp = ndisp;
+            snprintf(s_none_disp, sizeof(s_none_disp), "%s", win_disp ? win_disp : "");
+            log_msg("HDR sys: remembering that for this session — the next Z "
+                    "skips the probe unless the display set changes");
+        }
+        return 0;
+    }
+    s_none_remembered = 0;   /* a capable output exists now */
+    if (!g_linhdr.prior_hdr || hdr_sdrbr_needed()) {
+        if (!g_linhdr.handlers) {
+            g_linhdr.handlers = 1;
+            atexit(linhdr_atexit);
+        }
+        int erc = hdr_sys_set(1);
+        g_linhdr.engaged = 1;
+        /* The engage checks its own exit status (deck b91f15e port,
+         * review M5): retry once, then report failure so the caller
+         * stays on the reference tone map instead of handing KWin a
+         * PQ surface over an SDR output. `engaged` stays set — the
+         * revert is a baseline no-op and cleans up the stamp. */
+        if (erc != 0) {
+            log_msg("HDR sys: engage failed (rc=%d) — retrying", erc);
+            erc = hdr_sys_set(1);
+        }
+        if (erc != 0) {
+            log_msg("HDR sys: engage failed twice%s — passthrough "
+                    "vetoed, reference tone map",
+                    s_hdr_budget_hits ? " (sequence budget exhausted)" : "");
+            s_hdr_budget_deadline = 0.0;
+            return 0;
+        }
+        hdr_sys_learn_sdrbr();   /* HDR-off baselines: readable now */
+    }
+    log_msg("HDR sys: engage sequence %.2fs (budget %.0fs, %d timeout%s)",
+            get_time_sec() - seq_t0, HDR_SEQ_BUDGET_SEC,
+            s_hdr_budget_hits, s_hdr_budget_hits == 1 ? "" : "s");
+    s_hdr_budget_deadline = 0.0;
+    /* else: output already in HDR by the user's hand AND its reference
+     * luminance already at target — use it, never own it. An
+     * already-HDR output whose SDR brightness needs holding IS
+     * engaged (deck field 2026-08-25: this is the common config):
+     * the hdr part of that write is a no-op re-enable, and `engaged`
+     * routes the brightness restore-as-found through the normal
+     * revert. */
+    return 1;
+}
+
+static void hdr_sys_revert_all(void) {
+    linhdr_revert();
+}
+
+#endif /* _WIN32 */
+
+/* Reconcile (display HDR, swapchain, shader path) with the current
+ * (mode, content). Called at file open (after gpu_setup_uniforms),
+ * file close, and the Z toggle — deck lineage. Pipelines are format-
+ * bound to the swapchain, so a switch recreates them; the frame
+ * cache texture is swapchain-format-bound too and is dropped
+ * explicitly (x64 keeps it on video-texture lifetime, not pipeline
+ * lifetime — deck difference). Every failure path lands on the
+ * tone-mapped SDR output, which is today's baseline. */
+void hdr_output_apply(PlayerState *ps) {
+    if (!ps->gpu_device || !ps->window) return;
+
+    /* A post-engage ST2084 poll that failed is remembered for the
+     * session (review d-D3-8): without this every HDR open paid the
+     * display flip, the 2.5 s frozen poll and the revert again — and
+     * on a box with no HDR output (dellbian) every Z press did. */
+    static int s_st2084_denied = 0;
+
+    int want = ps->hdr_out_mode == 1 && ps->hdr_pass_content
+            && !SDL_getenv("DSVP_NO_SYS_HDR");
+    if (want && s_st2084_denied) {
+        log_msg("HDR out: ST2084 denied earlier this session — skipping "
+                "display engage, tone-mapped output");
+        want = 0;
+    }
+
+    /* Engage the DISPLAY first: Windows drivers may only advertise
+     * ST2084 once display HDR is on, and KWin tone-maps a PQ surface
+     * to SDR itself unless the output is switched. (No Game Mode
+     * compositor branch here by decision — x64 is Debian + Windows
+     * desktops only, Holden 2026-09-05; the deck keeps its own.) */
+    if (want)
+        want = hdr_sys_engage(ps);
+
+    /* Post-engage support poll. SDL's Vulkan backend re-queries
+     * surface formats live on every call (verified in SDL 3.4
+     * source); field measurement on NVIDIA showed support=1 at ~0 ms,
+     * the poll covers slower drivers. */
+    if (want) {
+        int sup = SDL_WindowSupportsGPUSwapchainComposition(
+                      ps->gpu_device, ps->window,
+                      SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084);
+        int waited = 0;
+        while (!sup && waited < 2500) {
+            SDL_Delay(100);
+            waited += 100;
+            sup = SDL_WindowSupportsGPUSwapchainComposition(
+                      ps->gpu_device, ps->window,
+                      SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084);
+        }
+        if (!sup) {
+            log_msg("HDR out: no ST2084 swapchain support after %d ms — "
+                    "tone-mapped output (remembered for this session)", waited);
+            s_st2084_denied = 1;
+            want = 0;
+        } else if (waited) {
+            log_msg("HDR out: ST2084 support appeared after ~%d ms", waited);
+        }
+    }
+
+    if (want == ps->hdr_out_active) {
+        ps->gpu_uniforms.hdr_pass = want ? 1.0f : 0.0f;
+        if (!want)
+            hdr_sys_revert_all();   /* e.g. engaged but support didn't come */
+        else
+            hdr_sys_apply_sdrbr(1); /* passthrough already live: hold follows the mode */
+        return;
+    }
+
+    /* Swapchain switch + pipeline recreate. The display's own HDR
+     * mode-switch blank overlaps the shader recompile. */
+    SDL_WaitForGPUIdle(ps->gpu_device);
+    if (!SDL_SetGPUSwapchainParameters(ps->gpu_device, ps->window,
+            want ? SDL_GPU_SWAPCHAINCOMPOSITION_HDR10_ST2084
+                 : SDL_GPU_SWAPCHAINCOMPOSITION_SDR,
+            SDL_GPU_PRESENTMODE_VSYNC)) {
+        log_msg("HDR out: swapchain switch failed (%s) — staying %s",
+                SDL_GetError(), ps->hdr_out_active ? "HDR" : "SDR");
+        ps->gpu_uniforms.hdr_pass = ps->hdr_out_active ? 1.0f : 0.0f;
+        if (want)
+            hdr_sys_revert_all();  /* don't hold the display in HDR for SDR */
+        return;
+    }
+
+    gpu_destroy_pipelines(ps);
+    /* Frame cache is swapchain-format-bound: drop it so the next
+     * ensure recreates it in the new format. */
+    if (ps->gpu_tex_cache) {
+        SDL_ReleaseGPUTexture(ps->gpu_device, ps->gpu_tex_cache);
+        ps->gpu_tex_cache = NULL;
+    }
+    ps->cache_w = ps->cache_h = 0;
+    ps->cache_valid = 0;
+
+    if (gpu_create_pipelines(ps) < 0) {
+        /* Limp back to SDR — an SDR-format pipeline set is the known-
+         * good configuration from startup. */
+        log_msg("ERROR: pipeline recreation after HDR switch failed — "
+                "reverting to SDR");
+        int sdr_ok = SDL_SetGPUSwapchainParameters(ps->gpu_device, ps->window,
+            SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_VSYNC);
+        if (!sdr_ok)
+            log_msg("FATAL: SDR swapchain set also failed (%s) — swapchain "
+                    "stays %s", SDL_GetError(), want ? "HDR10" : "as it was");
+        if (gpu_create_pipelines(ps) < 0)
+            log_msg("FATAL: SDR pipeline recreation also failed");
+        /* Record what the swapchain IS, not what we wished (deck minor
+         * 13): forcing active=0 against a live HDR10 swapchain desynced
+         * every later decision. */
+        ps->hdr_out_active = sdr_ok ? 0 : (want ? 1 : ps->hdr_out_active);
+        ps->gpu_uniforms.hdr_pass = ps->hdr_out_active ? 1.0f : 0.0f;
+        if (!ps->hdr_out_active) hdr_sys_revert_all();
+        return;
+    }
+
+    ps->hdr_out_active = want;
+    ps->gpu_uniforms.hdr_pass = want ? 1.0f : 0.0f;
+    log_msg("HDR out: %s", want
+            ? "PASSTHROUGH — HDR10/ST2084 swapchain, display tone-maps"
+            : "SDR — tone-mapped output");
+
+    /* Leaving passthrough: restore the display to its prior state.
+     * Entering it: the reference-luminance hold moves to the
+     * passthrough target (KWin scales the PQ surface by held/203 —
+     * deck 2026-08-28 conviction, ported 2026-09-06). */
+    if (!want)
+        hdr_sys_revert_all();
+    else
+        hdr_sys_apply_sdrbr(1);
+}
+
+/* App-exit revert: covers quitting while an HDR file was playing.
+ * player_close covers the normal file-close path. */
+void hdr_output_shutdown(PlayerState *ps) {
+    (void)ps;
+    hdr_sys_revert_all();
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * Open / Close
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -2478,6 +4466,47 @@ int player_open(PlayerState *ps, const char *filename) {
             avcodec_free_context(&ps->video_codec_ctx);
             avformat_close_input(&ps->fmt_ctx);
             return -1;
+        }
+
+        /* Colour tags: the container is authoritative when it says
+         * something; when it says UNSPECIFIED, the bitstream VUI the
+         * decoder just parsed out of the extradata is the authored
+         * value and every reader downstream (HDR detection, the
+         * YCbCr matrix pick, the 2020-family siting predicate, sws)
+         * reads the stream's codecpar — so the backfill happens here,
+         * once. Field 2026-09-07 (dellbian, FFmpeg 9.0): a PQ clip
+         * whose container carried only the matrix opened with
+         * stream trc=unknown/primaries=unknown while the decoder
+         * reported smpte2084/bt2020 — no HDR line, SDR shader on an
+         * HDR stream. Older muxers write no colour element at all;
+         * this is the real-world shape, not a synthetic-clip quirk. */
+        {
+            AVCodecParameters *cp = vs->codecpar;
+            const AVCodecContext *cc = ps->video_codec_ctx;
+            int filled = 0;
+            if (cp->color_trc == AVCOL_TRC_UNSPECIFIED &&
+                cc->color_trc != AVCOL_TRC_UNSPECIFIED) {
+                cp->color_trc = cc->color_trc; filled |= 1;
+            }
+            if (cp->color_primaries == AVCOL_PRI_UNSPECIFIED &&
+                cc->color_primaries != AVCOL_PRI_UNSPECIFIED) {
+                cp->color_primaries = cc->color_primaries; filled |= 2;
+            }
+            if (cp->color_space == AVCOL_SPC_UNSPECIFIED &&
+                cc->colorspace != AVCOL_SPC_UNSPECIFIED) {
+                cp->color_space = cc->colorspace; filled |= 4;
+            }
+            if (cp->color_range == AVCOL_RANGE_UNSPECIFIED &&
+                cc->color_range != AVCOL_RANGE_UNSPECIFIED) {
+                cp->color_range = cc->color_range; filled |= 8;
+            }
+            if (filled)
+                log_msg("Colour tags: container unspecified — taken from the "
+                        "bitstream VUI:%s%s%s%s",
+                        (filled & 1) ? " transfer"   : "",
+                        (filled & 2) ? " primaries"  : "",
+                        (filled & 4) ? " matrix"     : "",
+                        (filled & 8) ? " range"      : "");
         }
 
         ps->vid_w = ps->video_codec_ctx->width;
@@ -2643,25 +4672,22 @@ int player_open(PlayerState *ps, const char *filename) {
             {
                 AVCodecParameters *par = ps->fmt_ctx->streams[ps->video_stream_idx]->codecpar;
 
-                int src_cs;
-                switch (par->color_space) {
-                case AVCOL_SPC_BT709:
-                    src_cs = SWS_CS_ITU709;
-                    break;
-                case AVCOL_SPC_BT470BG:
-                case AVCOL_SPC_SMPTE170M:
-                    src_cs = SWS_CS_ITU601;
-                    break;
-                default:
-                    /* RGB, unspecified, and exotic tags: mirror the
-                     * shader's decode heuristic (gpu_setup_uniforms) so
-                     * encode and decode matrices cannot diverge —
-                     * AVCOL_SPC_RGB != UNSPECIFIED and used to take the
-                     * 601 arm here while the shader decoded 709. */
-                    src_cs = (ps->vid_h >= 720) ? SWS_CS_ITU709
-                                                : SWS_CS_ITU601;
-                    break;
-                }
+                /* One matrix authority for both sides (deck a4b844d
+                 * port, review PQUALITY P3): pick_ycbcr_matrix is the
+                 * same function gpu_setup_uniforms uses, so whatever
+                 * sws encodes into the planes is exactly what the
+                 * shader decodes out of them — including the
+                 * primaries/PQ fallback and width in the heuristic,
+                 * which the old mirror here lacked, and BT.2020 tags
+                 * now map to SWS_CS_BT2020 instead of falling to the
+                 * heuristic arm. For RGB→YCbCr only the dst table
+                 * governs the encode; src sharing it is harmless. */
+                const char *sws_cs_reason;
+                int pick = pick_ycbcr_matrix(par, ps->vid_w, ps->vid_h,
+                                             &sws_cs_reason);
+                int src_cs = (pick == 2020) ? SWS_CS_BT2020
+                           : (pick == 709)  ? SWS_CS_ITU709
+                                            : SWS_CS_ITU601;
 
                 int dst_cs = src_cs;
 
@@ -2686,8 +4712,10 @@ int player_open(PlayerState *ps, const char *filename) {
                     sws_getCoefficients(dst_cs), dst_range,
                     brightness, contrast, saturation);
 
-                log_msg("swscale: colorspace=%s range=%s->full",
-                    (src_cs == SWS_CS_ITU709) ? "BT.709" : "BT.601",
+                log_msg("swscale: colorspace=%s (%s) range=%s->full",
+                    (src_cs == SWS_CS_BT2020) ? "BT.2020"
+                        : (src_cs == SWS_CS_ITU709) ? "BT.709" : "BT.601",
+                    sws_cs_reason,
                     src_range ? "full" : "limited");
             }
 
@@ -2806,6 +4834,9 @@ int player_open(PlayerState *ps, const char *filename) {
 
         /* ── Set up GPU color uniforms ── */
         gpu_setup_uniforms(ps);
+
+        /* ── System display HDR: engage/probe per content ── */
+        hdr_output_apply(ps);
     }
 
     /* ── Init packet queues ── */
@@ -2835,6 +4866,9 @@ int player_open(PlayerState *ps, const char *filename) {
      * Adapts automatically to any codec's keyframe recovery time. */
     ps->seek_recovering = 1;
     ps->seek_recovering_start = get_time_sec();
+    ps->seekdiag_vid_pending = 0;   /* armed only by real seeks */
+    ps->seekdiag_aud_pending = 0;
+    ps->seekdiag_target_valid = 0;
     ps->video_ready = 0;
 
     /* ── Reset diagnostics ── */
@@ -2902,6 +4936,30 @@ int player_open(PlayerState *ps, const char *filename) {
     }
 
     /* Build media info string */
+    /* Chapters: the container's own segments (MKV chapters, MP4 chapter
+     * tracks); AVChapter start is in the chapter's time_base. Bounded;
+     * titles from the "title" tag, else numbered. */
+    ps->nb_chapters = 0;
+    ps->chapter_nav_idx = -1;
+    for (unsigned ci = 0; ci < ps->fmt_ctx->nb_chapters && ps->nb_chapters < DSVP_MAX_CHAPTERS; ci++) {
+        AVChapter *ch = ps->fmt_ctx->chapters[ci];
+        double st = (double)ch->start * av_q2d(ch->time_base);
+        if (st < 0.0) st = 0.0;
+        int k = ps->nb_chapters;
+        ps->chapter_start[k] = st;
+        AVDictionaryEntry *te = av_dict_get(ch->metadata, "title", NULL, 0);
+        if (te && te->value && te->value[0])
+            snprintf(ps->chapter_title[k], sizeof(ps->chapter_title[k]), "%s", te->value);
+        else
+            snprintf(ps->chapter_title[k], sizeof(ps->chapter_title[k]), "Chapter %d", k + 1);
+        ps->nb_chapters++;
+    }
+    if (ps->nb_chapters > 0)
+        log_msg("Chapters: %d (first '%s' at %.1f s, last '%s' at %.1f s)",
+                ps->nb_chapters, ps->chapter_title[0], ps->chapter_start[0],
+                ps->chapter_title[ps->nb_chapters - 1],
+                ps->chapter_start[ps->nb_chapters - 1]);
+
     player_build_media_info(ps);
 
     return 0;
@@ -2909,8 +4967,13 @@ int player_open(PlayerState *ps, const char *filename) {
 
 /* Close playback: stop threads, free all resources. */
 void player_close(PlayerState *ps) {
+    ps->nb_chapters = 0;   /* per-file; the next open reloads */
     if (!ps->playing && !ps->fmt_ctx) return;
     log_msg("player_close: stopping playback");
+
+    /* Give the desktop back before teardown (deck lineage). */
+    ps->hdr_pass_content = 0;
+    hdr_output_apply(ps);
 
     /* ── Playback diagnostics summary ── */
     if (ps->diag_frames_decoded > 0) {
@@ -3024,6 +5087,9 @@ void player_close(PlayerState *ps) {
     ps->seeking            = 0;
     ps->seek_recovering    = 0;
     ps->seek_recovering_start = 0.0;
+    ps->seekdiag_vid_pending = 0;
+    ps->seekdiag_aud_pending = 0;
+    ps->seekdiag_target_valid = 0;
     ps->audio_pts_floor    = 0.0;
     ps->video_ready        = 0;
     ps->show_debug         = 0;
@@ -3037,10 +5103,8 @@ void player_close(PlayerState *ps) {
     ps->sub_count          = 0;
     ps->sub_selection      = 0;
     ps->sub_active_idx     = -1;
-    ps->sub_valid          = 0;
+    sub_clear_display(ps);   /* cues, bitmaps, text, valid */
     ps->sub_is_bitmap      = 0;
-    ps->sub_bitmap_count   = 0;
-    ps->sub_text[0]        = '\0';
     ps->sub_osd[0]         = '\0';
 
     /* Reset window (skip resize if fullscreen — actual size is monitor) */
@@ -3419,7 +5483,10 @@ int demux_thread_func(void *arg) {
              * recovery seek). The audio callback stays gated via
              * ps->seeking for the whole window. */
             ps->seek_request = 0;
-            log_msg("Demux: seeking to %.3f s", (double)target / AV_TIME_BASE);
+            log_msg("Demux: seeking to %.3f s (flags=%s)",
+                    (double)target / AV_TIME_BASE,
+                    (tflags & AVSEEK_FLAG_BACKWARD) ? "backward"
+                                                    : "default");
 
             /* CRITICAL: Lock the seek mutex. This prevents the main thread
              * from calling avcodec_send_packet/receive_frame on the video
@@ -3484,9 +5551,54 @@ int demux_thread_func(void *arg) {
                 deint_graph_free(ps);
                 if (ps->sub_codec_ctx)
                     avcodec_flush_buffers(ps->sub_codec_ctx);
+                /* Not sub_clear_display(): this runs on the demux thread
+                 * and the main thread may be uploading the bitmap rects —
+                 * freeing them here would race. Drop what is safe to drop;
+                 * the main-thread decode path frees bitmaps on its next
+                 * call. The active cue set (M4) is dropped with the text. */
                 ps->sub_valid = 0;
                 ps->sub_text[0] = '\0';
+                ps->sub_cue_count = 0;
                 log_msg("Demux: all codecs flushed");
+                /* ── Drain flush survivors (deck 8da58aa port) ──
+                 * A frame already COMPLETE inside the decoder can
+                 * survive avcodec_flush_buffers: the deck's raw log
+                 * showed receive_frame returning a fully-decoded
+                 * pre-seek 4K frame in the SAME millisecond as "all
+                 * codecs flushed". Received after the seek, it earns
+                 * the NEW queue serial — the serial gate at the
+                 * recovery clear is structurally blind to it — and on
+                 * the deck it anchored recovery 2284s above a
+                 * backward target (the floor then discarded all
+                 * replay audio: the poisoned-timer death spiral).
+                 * Drain both codecs to EAGAIN here, same mutex hold
+                 * (decode thread locked out, audio callback paused),
+                 * so nothing decoded from pre-seek input remains
+                 * deliverable. Async stragglers are caught by the
+                 * backward-landing veto at the clear (main.c), which
+                 * fails open via the existing 2s recovery timeout. */
+                {
+                    AVFrame *scratch = av_frame_alloc();
+                    if (scratch) {
+                        int dv = 0, da = 0;
+                        if (ps->video_codec_ctx)
+                            while (dv < 16 && avcodec_receive_frame(
+                                       ps->video_codec_ctx, scratch) == 0) {
+                                av_frame_unref(scratch);
+                                dv++;
+                            }
+                        if (ps->audio_codec_ctx)
+                            while (da < 16 && avcodec_receive_frame(
+                                       ps->audio_codec_ctx, scratch) == 0) {
+                                av_frame_unref(scratch);
+                                da++;
+                            }
+                        av_frame_free(&scratch);
+                        if (dv || da)
+                            log_msg("SEEKDIAG: drained flush survivors "
+                                    "(video=%d audio=%d)", dv, da);
+                    }
+                }
             }
             ps->eof = 0;
 
@@ -3511,6 +5623,13 @@ int demux_thread_func(void *arg) {
              * Cleared in main.c when a frame is actually shown. */
             ps->seek_recovering = 1;
             ps->seek_recovering_start = get_time_sec();
+            /* SEEKDIAG one-shots (deck 20325d1 port): first decoded
+             * video/audio PTS post-seek, logged against the target —
+             * where the demuxer actually put each stream is the fact
+             * every recovery theory has to survive. */
+            ps->seekdiag_vid_pending = 1;
+            ps->seekdiag_aud_pending = 1;
+            ps->seekdiag_target_valid = 1;
             /* av_bias is NOT reset here. It models the systematic latency
              * of the audio output path (SDL + device buffering that
              * audio_clock_sync under-counts) — a property of the output
@@ -3527,7 +5646,7 @@ int demux_thread_func(void *arg) {
              * content (4K HEVC HDR keyframe takes ~300–400ms) causes
              * audio_clock to run that far ahead, then snap-forwards
              * and frame drops cascade as video catches up. The deck
-             * branch hit this with VAAPI's DPB rebuild on Steam Deck
+             * branch hit this with VAAPI's DPB rebuild
              * (commit b3177ba in DSVP-deck, Mar 24, 2026); the same
              * mechanism applies to software HEVC decode on lower-spec
              * hosts. Pause+resume must be paired: demux thread pauses
@@ -3678,7 +5797,26 @@ int video_decode_frame(PlayerState *ps) {
      * used to timestamp itself 0.0, jumping the clock to file start for
      * one frame: phantom multi-second A/V drift, a spurious drop, and a
      * poisoned EMA. Leave the clock at the previous frame's value —
-     * off by one frame duration at most, self-correcting. */
+     * off by one frame duration at most, self-correcting. (Post-seek
+     * that previous value is the demux preset = the target — the same
+     * base the deck's 9832c24 fix converges on.) */
+
+    /* SEEKDIAG one-shot (deck 20325d1 port): first genuinely post-seek
+     * frame only — a stale pre-seek frame popped mid-straddle carries
+     * the old serial and must not impersonate the landing. */
+    if (ps->seekdiag_vid_pending
+            && ps->video_frame_serial == ps->video_frame_q.flush_serial) {
+        ps->seekdiag_vid_pending = 0;
+        double tgt = (double)ps->seek_target / AV_TIME_BASE;
+        if (frame_pts != AV_NOPTS_VALUE)
+            log_msg("SEEKDIAG: first video frame post-seek "
+                    "pts=%.3f target=%.3f delta=%+.3f",
+                    ps->video_clock, tgt, ps->video_clock - tgt);
+        else
+            log_msg("SEEKDIAG: first video frame post-seek "
+                    "pts=NOPTS (clock held %.3f) target=%.3f",
+                    ps->video_clock, tgt);
+    }
 
     return 1;
 }
@@ -3867,10 +6005,16 @@ static void gpu_draw_video_quad(SDL_GPURenderPass *pass,
     SDL_PushGPUFragmentUniformData(cmd, 0,
         &ps->gpu_uniforms, sizeof(ps->gpu_uniforms));
 
+    /* Video planes bind NEAREST (deck d2f5351 port, review PQUALITY
+     * P6a): the Lanczos/Catmull kernels do ALL filtering themselves
+     * at explicit texel centers, so nearest is bit-identical to the
+     * old LINEAR binding — and correctness stops depending on every
+     * tap quantizing to a center. x64 has no PQ LUTs, so nothing here
+     * wants LINEAR at all. */
     SDL_GPUTextureSamplerBinding bindings[4] = {
-        { .texture = ps->gpu_tex_y,     .sampler = ps->gpu_sampler },
-        { .texture = ps->gpu_tex_u,     .sampler = ps->gpu_sampler },
-        { .texture = ps->gpu_tex_v,     .sampler = ps->gpu_sampler },
+        { .texture = ps->gpu_tex_y,     .sampler = ps->gpu_sampler_nearest },
+        { .texture = ps->gpu_tex_u,     .sampler = ps->gpu_sampler_nearest },
+        { .texture = ps->gpu_tex_v,     .sampler = ps->gpu_sampler_nearest },
         { .texture = ps->gpu_tex_noise, .sampler = ps->gpu_sampler_nearest },
     };
     SDL_BindGPUFragmentSamplers(pass, 0, bindings, 4);
@@ -4160,6 +6304,44 @@ static const double ictcp_lms_to_bt2020[3][3] = {
     { -0.65612108,  1.78554118, -0.12943749 },
     {  0.01736321, -0.04725154,  1.03004253 },
 };
+
+/* ── DV L1 dynamic brightness → per-scene tone-map peak ──
+ * (deck a4a90b5 port, review PQUALITY P5.) L1 ext blocks carry the
+ * AUTHORED per-scene min/max/avg as 12-bit PQ codes. max_pq → nits
+ * becomes the live peak: dark scenes of high-peak masters get their
+ * own knee, and P8 files with no container metadata stop guessing
+ * 1000 nits. Self-gating on side-data presence so it serves P5 AND
+ * P8. Clamp is [100, 10000] only — L1 is authored like the mastering
+ * block, not computed like MaxCLL. Stale-carries on RPU-less frames
+ * like the reshape curves. Outranks the histogram (authored beats
+ * measured beats static). */
+static void dovi_update_l1_peak(PlayerState *ps, const AVFrame *frame)
+{
+    const AVFrameSideData *sd =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
+    if (!sd) return;
+    const AVDOVIMetadata *dovi = (const AVDOVIMetadata *)sd->data;
+    const AVDOVIDmData *dm = av_dovi_find_level(dovi, 1);
+    if (!dm || dm->l1.max_pq == 0) return;
+
+    float scene = pq_eotf_scalar((float)dm->l1.max_pq / 4095.0f);
+    if (scene < 100.0f)   scene = 100.0f;
+    if (scene > 10000.0f) scene = 10000.0f;
+
+    float prev = ps->dovi_l1_peak_nits;
+    ps->dovi_l1_peak_nits = scene;
+
+    if (prev <= 0.0f) {
+        log_msg("DOVI L1: dynamic tone-map peak engaged — scene max=%.0f "
+                "nits (max_pq=%u, avg_pq=%u)",
+                scene, dm->l1.max_pq, dm->l1.avg_pq);
+        ps->dovi_l1_last_log = get_time_sec();
+    } else if (fabsf(scene - prev) > 0.25f * prev
+               && get_time_sec() - ps->dovi_l1_last_log > 5.0) {
+        log_msg("DOVI L1: scene peak %.0f -> %.0f nits", prev, scene);
+        ps->dovi_l1_last_log = get_time_sec();
+    }
+}
 
 static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
 {
@@ -4494,9 +6676,9 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
     /* Clamp: floor at max(PEAK_MIN_NITS, target_nits), ceiling at static peak.
      *
      * The floor MUST be ≥ target_nits to keep the BT.2390 EETF well-defined.
-     * Below target, maxLum = target/smoothed exceeds 1.0, KS = 1.5*maxLum-0.5
-     * exceeds 1.0, and the tone curve degenerates to a pure linear pass-through
-     * (knee point lands above the normalized range, so no compression occurs).
+     * Below target, PQ(target)/PQ(smoothed) exceeds 1.0, the shader clamps
+     * maxLum to 1.0 with ks -> 0.999, and the tone curve degenerates to a
+     * pure pass-through (knee at the top of the range, no compression).
      * When smoothed crosses this boundary on scene cuts, tone mapping toggles
      * between "engaged" and "disengaged", producing a visible brightness strobe.
      * Flooring at target_nits keeps the curve continuous: low-peak content
@@ -4515,12 +6697,15 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
     /* Feed dynamic peak to the tone mapper */
     ps->gpu_uniforms.hdr_peak_nits = smoothed;
 
-    /* Periodic log (every 120 frames ≈ 5s at 24fps) */
+    /* Periodic log (every 120 frames ≈ 5s at 24fps). PQ-domain values,
+     * matching the shader (2026-08-26 fix): healthy KS is 0.37-0.999;
+     * KS printed near 0 would mean the linear-domain bug is back. */
     if (ps->diag_frames_displayed % 120 == 0) {
         float target = ps->gpu_uniforms.hdr_target_nits;
-        float maxLum = target / smoothed;
-        float ks = 1.5f * maxLum - 0.5f;
-        if (ks < 0.0f) ks = 0.0f;
+        double maxLum = pq_oetf_cpu(target) / pq_oetf_cpu(smoothed);
+        if (maxLum > 1.0) maxLum = 1.0;
+        double ks = 1.5*maxLum - 0.5;
+        if (ks < 0.0) ks = 0.0; else if (ks > 0.999) ks = 0.999;
         log_msg("HDR peak: raw=%.0f nits, smoothed=%.0f nits "
                 "(p%.1f, target=%.0f, static=%.0f, KS=%.3f, maxLum=%.4f)",
                 raw_peak_nits, smoothed, PEAK_PERCENTILE,
@@ -4612,6 +6797,7 @@ void video_display(PlayerState *ps) {
      * Uses original decoded frame (side data not on swscale output). */
     dovi_log_frame_metadata(ps, ps->video_frame);
     dovi_populate_uniforms(ps, ps->video_frame);
+    dovi_update_l1_peak(ps, ps->video_frame);   /* P5 AND P8 */
 
     /* ── HDR dynamic peak detection (CPU scan) ──
      * Scan luma plane to find actual scene peak before uploading.
@@ -4622,8 +6808,16 @@ void video_display(PlayerState *ps) {
     ps->prof_peak_ms = 0.0;
     double t_before_peak = get_time_sec();
 #endif
-    if (ps->gpu_uniforms.is_hlg < 0.5f)
+    if (ps->gpu_uniforms.is_hlg >= 0.5f) {
+        /* HLG: peak pinned at open; histogram's PQ bin decode is
+         * meaningless for HLG's relative signal. */
+    } else if (ps->dovi_l1_peak_nits > 0.0f) {
+        /* DV L1 authored per-scene peak (deck a4a90b5 port):
+         * dynamic metadata outranks the measured histogram. */
+        ps->gpu_uniforms.hdr_peak_nits = ps->dovi_l1_peak_nits;
+    } else {
         hdr_compute_scene_peak(ps, src_frame, bpp == 2 /* upload is 10-bit */);
+    }
 #ifdef DSVP_PROFILE
     ps->prof_peak_ms = (get_time_sec() - t_before_peak) * 1000.0;
 #endif
@@ -4910,8 +7104,32 @@ void video_reblit(PlayerState *ps) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Seek by `incr` seconds relative to current position. */
+/* Absolute seek. backward=1 asks the demuxer for the keyframe AT OR
+ * BEFORE pos (resume, chapter starts: never overshoot the moment);
+ * backward=0 takes the next keyframe (the default flag choice for a
+ * forward step). Same request slot as player_seek. */
+void player_seek_abs(PlayerState *ps, double pos_sec, int backward) {
+    if (!ps->playing) return;
+    if (pos_sec < 0.0) pos_sec = 0.0;
+    ps->seek_target  = (int64_t)(pos_sec * AV_TIME_BASE);
+    ps->seek_flags   = backward ? AVSEEK_FLAG_BACKWARD : 0;
+    ps->seek_request = 1;
+    ps->frame_timer      = get_time_sec();
+    ps->frame_last_delay = 0.04;
+}
+
+/* Index of the chapter containing pos, -1 when the file has none. */
+int player_chapter_index(const PlayerState *ps, double pos_sec) {
+    if (ps->nb_chapters <= 0) return -1;
+    int idx = 0;
+    for (int i = 0; i < ps->nb_chapters; i++)
+        if (ps->chapter_start[i] <= pos_sec + 1e-3) idx = i;
+    return idx;
+}
+
 void player_seek(PlayerState *ps, double incr) {
     if (!ps->playing) return;
+    ps->chapter_nav_idx = -1;   /* a free seek ends the chapter pre-roll rule */
 
     /* Audio-only files never update video_clock — seek relative to
      * the audio playback position instead. */
@@ -4972,6 +7190,15 @@ void player_build_media_info(PlayerState *ps) {
     int min = ((int)duration % 3600) / 60;
     int sec = (int)duration % 60;
     INFO_APPEND("Duration: %02d:%02d:%02d\n", hrs, min, sec);
+    if (ps->nb_chapters > 0) {
+        INFO_APPEND("Chapters: %d (PgUp/PgDn)\n", ps->nb_chapters);
+        for (int ci = 0; ci < ps->nb_chapters && ci < 24; ci++) {
+            int cs = (int)ps->chapter_start[ci];
+            INFO_APPEND("  %2d  %d:%02d:%02d  %s\n", ci + 1,
+                        cs / 3600, (cs / 60) % 60, cs % 60, ps->chapter_title[ci]);
+        }
+        if (ps->nb_chapters > 24) INFO_APPEND("  … %d more\n", ps->nb_chapters - 24);
+    }
 
     if (ps->fmt_ctx->bit_rate > 0) {
         INFO_APPEND("Bitrate: %"PRId64" kb/s\n",
@@ -5093,30 +7320,33 @@ void player_build_debug_info(PlayerState *ps) {
     int   off = 0;
 
     INFO_APPEND("=== DEBUG ===\n");
-    INFO_APPEND("Renderer: SDL_GPU\n");
+    INFO_APPEND("Build:       %s\n", DSVP_GIT_COMMIT);
+    INFO_APPEND("Output:      %dx%d (%s)\n",
+        ps->sc_w, ps->sc_h,
+        ps->fullscreen ? "borderless" : "windowed");
 
-    /* Real-time FPS + resolution (video streams only) */
+    /* Output = the physical-pixel area the scaler actually fills
+     * (display_rect is in logical window coords; convert to
+     * swapchain pixels, matching the viewport math in video_display). */
+    int out_w = ps->display_rect.w;
+    int out_h = ps->display_rect.h;
+    if (ps->win_w > 0 && ps->sc_w > 0)
+        out_w = (int)((double)ps->display_rect.w * ps->sc_w / ps->win_w + 0.5);
+    if (ps->win_h > 0 && ps->sc_h > 0)
+        out_h = (int)((double)ps->display_rect.h * ps->sc_h / ps->win_h + 0.5);
+
+    /* Real-time FPS + scaler resolution (video streams only) */
     if (ps->video_stream_idx >= 0) {
         if (ps->paused)
             INFO_APPEND("FPS:         paused\n");
         else
             INFO_APPEND("FPS:         %.2f (render %.0f)\n",
                 ps->fps_content, ps->fps_render);
-
-        /* Output = the physical-pixel area the scaler actually fills
-         * (display_rect is in logical window coords; convert) */
-        int out_w = ps->display_rect.w;
-        int out_h = ps->display_rect.h;
-        if (ps->win_w > 0 && ps->sc_w > 0)
-            out_w = (int)((double)ps->display_rect.w * ps->sc_w / ps->win_w + 0.5);
-        if (ps->win_h > 0 && ps->sc_h > 0)
-            out_h = (int)((double)ps->display_rect.h * ps->sc_h / ps->win_h + 0.5);
-        INFO_APPEND("Resolution:  %dx%d -> %dx%d (swapchain %dx%d)\n",
-            ps->vid_w, ps->vid_h, out_w, out_h, ps->sc_w, ps->sc_h);
+        INFO_APPEND("Resolution:  %dx%d -> %dx%d\n",
+            ps->vid_w, ps->vid_h, out_w, out_h);
     }
 
-    INFO_APPEND("A/V Bias:    %.1f ms\n",
-        ps->av_bias * 1000.0);
+    INFO_APPEND("Renderer: SDL_GPU\n");
     INFO_APPEND("Video Queue: %d pkts (%d KB)\n",
         ps->video_pq.nb_packets, ps->video_pq.size / 1024);
     INFO_APPEND("Audio Queue: %d pkts (%d KB)\n",
@@ -5124,8 +7354,10 @@ void player_build_debug_info(PlayerState *ps) {
     INFO_APPEND("Volume:      %.0f%%\n", ps->volume * 100.0);
 
     if (ps->video_codec_ctx) {
-        INFO_APPEND("Decoder Threads: %d\n",
-            ps->video_codec_ctx->thread_count);
+        const char *pfn = av_get_pix_fmt_name(ps->video_codec_ctx->pix_fmt);
+        INFO_APPEND("Decode: software %s %s, %d threads\n",
+            avcodec_get_name(ps->video_codec_ctx->codec_id),
+            pfn ? pfn : "?", ps->video_codec_ctx->thread_count);
 
         int is_yuv420p = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P);
         int is_10bit = (ps->video_codec_ctx->pix_fmt == AV_PIX_FMT_YUV420P10LE);
@@ -5145,8 +7377,31 @@ void player_build_debug_info(PlayerState *ps) {
                 "SWS: format convert%s (SWS_LANCZOS + ED dither)\n",
                 ps->sws_out_10bit ? " to 10-bit" : "");
         }
-        INFO_APPEND(
-            "GPU: Lanczos-2 luma, Catmull-Rom chroma, blue noise dither\n");
+
+        /* Report the kernel as it actually runs. x64 has ONE luma
+         * variant (Lanczos-2, 4x4 at df<=1) whose footprint dilates on
+         * downscale — the shader measures df from screen-space
+         * derivatives per axis and caps it at 4; this reproduces that
+         * from the same source/viewport sizes (exact under
+         * letterboxing, which is where the old static line was
+         * silent about the extra taps). */
+        {
+            double dfx = 1.0, dfy = 1.0;
+            if (out_w > 0) dfx = (double)ps->vid_w / out_w;
+            if (out_h > 0) dfy = (double)ps->vid_h / out_h;
+            if (dfx < 1.0) dfx = 1.0;
+            if (dfy < 1.0) dfy = 1.0;
+            int capped = (dfx > 4.0 || dfy > 4.0);
+            if (dfx > 4.0) dfx = 4.0;
+            if (dfy > 4.0) dfy = 4.0;
+            if (dfx > 1.0 || dfy > 1.0)
+                INFO_APPEND("Sampler: Lanczos-2 luma dilated x%.2f/%.2f%s, "
+                            "Catmull-Rom chroma\n",
+                    dfx, dfy, capped ? " (cap 4)" : "");
+            else
+                INFO_APPEND("Sampler: Lanczos-2 luma 4x4, Catmull-Rom chroma\n");
+            INFO_APPEND("Dither:  blue noise 64x64\n");
+        }
 
         {
             static const char *chroma_names[] = {
@@ -5185,6 +7440,94 @@ void player_build_debug_info(PlayerState *ps) {
     double pos = (ps->video_stream_idx >= 0)
         ? ps->video_clock : ps->audio_clock_sync;
     INFO_APPEND("Position:    %.1f / %.1f s\n", pos, duration);
+
+    /* HDR — the live tone-map contract: the same numbers the engage
+     * log and the periodic "HDR peak:" line print, so a screenshot
+     * of the panel and a grep of the log never disagree. */
+    if (ps->gpu_uniforms.is_hdr > 0.0f) {
+        const GPUUniforms *u = &ps->gpu_uniforms;
+        INFO_APPEND("\n--- HDR ---\n");
+        /* On DV the "static" peak is the RPU's source_max_pq, rewritten
+         * per frame — label it for what it is. */
+        INFO_APPEND("Signal:  %s, %s, %s %.0f nits\n",
+            u->is_dovi > 0.0f ? "Dolby Vision (reshape active)"
+          : u->is_hlg  > 0.0f ? "HLG" : "PQ (HDR10)",
+            u->hdr_gamut > 0.5f ? "BT.2020" : "BT.709",
+            u->is_dovi > 0.0f ? "RPU max" : "static peak",
+            ps->hdr_static_peak);
+        INFO_APPEND("Mode:    %s [Z]\n",
+            ps->hdr_out_active ? "PASSTHROUGH (display tone-maps)"
+                               : "tone-map to SDR");
+        if (!ps->hdr_out_active) {
+            /* Which peak drives the curve THIS frame (priority order
+             * of the writers in video_display): DV L1 authored scene
+             * peak outranks the histogram, which outranks static. */
+            const char *psrc = ps->dovi_l1_peak_nits > 0.0f ? "DV L1 authored scene"
+                             : ps->hdr_smoothed_peak > 0.0f ? "histogram p99.875 smoothed"
+                                                            : "static metadata";
+            float peak   = u->hdr_peak_nits;
+            float target = u->hdr_target_nits;
+            INFO_APPEND("Peak:    %.0f nits (%s)\n", peak, psrc);
+            INFO_APPEND("Target:  %.0f nits [T]  midtone %.2f [G]\n",
+                target, u->hdr_midtone_gain);
+            if (peak > 0.0f && target > 0.0f) {
+                /* PQ-domain, identical to the log's formula. KS near 0
+                 * here = the linear-domain bug is back. */
+                double maxLum = pq_oetf_cpu(target) / pq_oetf_cpu(peak);
+                if (maxLum > 1.0) maxLum = 1.0;
+                double ks = 1.5 * maxLum - 0.5;
+                if (ks < 0.0) ks = 0.0; else if (ks > 0.999) ks = 0.999;
+                INFO_APPEND("EETF:    BT.2390 PQ-domain  KS=%.3f  maxLum=%.4f\n",
+                    ks, maxLum);
+            }
+            if (u->out_black_nits > 0.0f)
+                INFO_APPEND("Black:   lift to %.3f nits (%s)\n",
+                    u->out_black_nits, ps->black_src ? ps->black_src : "?");
+            else if (u->out_black_nits == 0.0f)
+                INFO_APPEND("Black:   lift auto target/2000\n");
+            else
+                INFO_APPEND("Black:   lift off\n");
+            {
+                static const char *dbg_names[] = {
+                    "off", "1 (target+100 compare)",
+                    "2 (PQ bypass, raw)", "3 (luminance viz)"
+                };
+                int dm = (int)u->hdr_debug;
+                INFO_APPEND("Debug:   %s [H]\n",
+                    (dm >= 0 && dm <= 3) ? dbg_names[dm] : "?");
+            }
+            if (u->out_gamma > 0.0f)
+                INFO_APPEND("Transfer: gamma %.1f out\n", u->out_gamma);
+            else
+                INFO_APPEND("Transfer: sRGB piecewise out\n");
+        } else {
+            INFO_APPEND("Dials:   T/G/H inactive — the display owns the curve\n");
+        }
+#ifdef _WIN32
+        if (g_winhdr.engaged)
+            INFO_APPEND("Display: Windows HDR engaged by DSVP (restores on exit)\n");
+        else if (ps->hdr_out_active)
+            INFO_APPEND("Display: Windows HDR already on (user's setting)\n");
+        else
+            INFO_APPEND("Display: untouched\n");
+#else
+        if (g_linhdr.engaged) {
+            int t = hdr_sdr_target();
+            if (g_linhdr.prior_sdrbr > 0 && t > 0 && g_linhdr.prior_sdrbr != t)
+                INFO_APPEND("Display: KWin HDR held on %s, sdr-brightness %d "
+                            "(restores %d)\n",
+                    g_linhdr.output, t, g_linhdr.prior_sdrbr);
+            else
+                INFO_APPEND("Display: KWin HDR held on %s, sdr-brightness untouched\n",
+                    g_linhdr.output);
+        } else if (ps->hdr_out_active) {
+            INFO_APPEND("Display: HDR already on %s (user's setting)\n",
+                g_linhdr.output[0] ? g_linhdr.output : "output");
+        } else {
+            INFO_APPEND("Display: untouched\n");
+        }
+#endif
+    }
 
     /* Audio status */
     INFO_APPEND("\n--- Audio ---\n");
@@ -5278,7 +7621,12 @@ void player_build_debug_info(PlayerState *ps) {
     INFO_APPEND("\n--- Diagnostics ---\n");
     INFO_APPEND("Decoded:     %d\n", ps->diag_frames_decoded);
     INFO_APPEND("Displayed:   %d\n", ps->diag_frames_displayed);
-    INFO_APPEND("Dropped:     %d\n", ps->diag_frames_dropped);
+    /* Same formula as the close-out summary (dropped/decoded) — the
+     * panel and the log must never disagree about the same number. */
+    INFO_APPEND("Dropped:     %d (%.2f%%)\n", ps->diag_frames_dropped,
+        ps->diag_frames_decoded > 0
+            ? 100.0 * ps->diag_frames_dropped / ps->diag_frames_decoded
+            : 0.0);
     INFO_APPEND("Multi-ticks: %d\n", ps->diag_multi_decodes);
     INFO_APPEND("Stall snaps: %d\n", ps->diag_timer_snaps);
     INFO_APPEND("Peak drift:  %.1f ms\n",

@@ -57,13 +57,34 @@ static int exe_relative_log_path(char *out, size_t out_size) {
 
 void log_init(void) {
     char path[4352];
-    if (exe_relative_log_path(path, sizeof(path)))
+    const char *sink = "none";
+    int have_path = exe_relative_log_path(path, sizeof(path));
+    if (have_path) {
+#ifdef _WIN32
+        /* Open with the WIDE path (review DM26): the narrow fopen read
+         * the UTF-8 path in the ANSI code page, so a non-ASCII profile
+         * or folder failed every launch and fell into the CWD fallback
+         * silently. */
+        wchar_t wpath[4352];
+        if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 4352) > 0)
+            g_logfile = _wfopen(wpath, L"w");
+#else
         g_logfile = fopen(path, "w");
-    if (!g_logfile)
+#endif
+        if (g_logfile) sink = "exe-dir";
+    }
+    if (!g_logfile) {
         g_logfile = fopen("dsvp.log", "w");  /* unwritable install dir */
+        if (g_logfile) { sink = "cwd-fallback"; snprintf(path, sizeof(path), "dsvp.log"); }
+    }
+    /* Say where the evidence went, on stderr too, before anything else
+     * (review DM25): a GUI-subsystem build discards stderr, so the file
+     * line is the only one a user can find. */
+    fprintf(stderr, "dsvp: log sink=%s path=%s\n", sink, g_logfile ? path : "(none)");
     if (g_logfile) {
         /* Disable buffering — every write goes to disk immediately */
         setvbuf(g_logfile, NULL, _IONBF, 0);
+        log_msg("log: sink=%s path=%s", sink, path);
         log_msg("=== DSVP %s started ===", DSVP_VERSION);
     }
 }

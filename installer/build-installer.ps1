@@ -7,10 +7,11 @@
 #   - MSYS2 MinGW64 toolchain (gcc, mingw32-make, pkg-config)
 #   - NSIS:  pacman -S mingw-w64-x86_64-nsis
 #
-# Output: DSVP-0.3.0-beta-setup.exe in repo root
+# Output: DSVP-<version>-setup.exe in repo root (version from src/dsvp.h)
 
 param(
-    [switch]$SkipBuild    # skip compilation, use existing DSVP-portable/
+    [switch]$SkipBuild,   # skip compilation, use existing DSVP-portable/
+    [switch]$AllowDirty   # passed to package.ps1: package a non-release stamp (test only)
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,7 +42,7 @@ Write-Host "`n=== DSVP Installer Builder v${version} ===" -ForegroundColor Cyan
 
 if (-not $SkipBuild) {
     Write-Host "`n[1/2] Building portable package..." -ForegroundColor Yellow
-    & .\package.ps1
+    if ($AllowDirty) { & .\package.ps1 -AllowDirty } else { & .\package.ps1 }
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: package.ps1 failed." -ForegroundColor Red
         exit 1
@@ -52,6 +53,11 @@ if (-not $SkipBuild) {
         Write-Host "ERROR: DSVP-portable\dsvp.exe not found. Run without -SkipBuild." -ForegroundColor Red
         exit 1
     }
+    if (-not (Test-Path "DSVP-portable\dsvp.stamp")) {
+        Write-Host "ERROR: DSVP-portable\dsvp.stamp not found - the bundle predates the provenance gate. Run without -SkipBuild." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "      Bundle stamp: $((Get-Content 'DSVP-portable\dsvp.stamp' -First 1).Trim())" -ForegroundColor White
 }
 
 # ── Step 2: Compile NSIS installer ────────────────────────────

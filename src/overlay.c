@@ -505,6 +505,24 @@ static void draw_seekbar(uint8_t *buf, int bw, int bh, PlayerState *ps) {
             fill_rect(buf, bw, bh, track_x, track_y, fill_w, track_h,
                       200, 200, 200, 240);
 
+            /* Chapter ticks (end-user request 2026-09-07): one thin mark
+             * per chapter start, a little taller than the track, under
+             * the playhead so the dot stays on top. Chapter 1 starts at
+             * zero and gets none; ticks closer than one pixel merge. */
+            if (ps->nb_chapters > 1) {
+                int tick_w = 1 * sc;
+                int tick_h = track_h + 4 * sc;
+                int tick_y = track_y - 2 * sc;
+                int last_x = -1000;
+                for (int ci = 1; ci < ps->nb_chapters; ci++) {
+                    if (ps->chapter_start[ci] <= 0.0 || ps->chapter_start[ci] >= duration) continue;
+                    int tx = track_x + (int)(track_w * (ps->chapter_start[ci] / duration));
+                    if (tx - last_x < 2 * sc) continue;
+                    last_x = tx;
+                    fill_rect(buf, bw, bh, tx, tick_y, tick_w, tick_h, 250, 210, 120, 255);
+                }
+            }
+
             /* Playhead dot */
             int dot_sz = 8 * sc;
             int dot_x = track_x + fill_w - dot_sz / 2;
@@ -771,6 +789,12 @@ static void draw_subtitles(uint8_t *buf, int bw, int bh, PlayerState *ps) {
 static uint8_t *s_pixels  = NULL;
 static int       s_pix_w  = 0;
 static int       s_pix_h  = 0;
+/* Debug panel pacing (deck lineage): the counters underneath
+ * integrate every tick in main.c; only the DISPLAY is paced at 10Hz,
+ * and a solo panel whose text did not change is not re-rastered. */
+static double    s_debug_built_at = 0.0;
+static char      s_debug_prev[4096] = {0};
+static int       s_solo_streak = 0;  /* last drawn frame was solo-debug */
 
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -782,6 +806,7 @@ static int       s_pix_h  = 0;
  */
 
 void overlay_render_idle(PlayerState *ps) {
+    s_solo_streak = 0;   /* idle raster overwrote the shared texture */
     /* Use physical pixel dimensions when available */
     int w = (ps->sc_w > 0) ? ps->sc_w : ps->win_w;
     int h = (ps->sc_h > 0) ? ps->sc_h : ps->win_h;
@@ -856,6 +881,7 @@ void overlay_render_idle(PlayerState *ps) {
         { "S",     "Cycle subtitles" },
         { "A",     "Cycle audio tracks" },
         { "Left/Right", "Seek 5s" },
+        { "PgUp/PgDn",  "Prev / Next chapter" },
         { "Up/Down",    "Volume" },
         { "B/N",        "Prev / Next file" },
         { "Q",     "Close / Quit" },
@@ -883,6 +909,24 @@ void overlay_render_idle(PlayerState *ps) {
         /* Description in dim color */
         draw_text(s_pixels, w, h, block_x + col_gap, y,
                   keys[i][1], key_scale, 130, 130, 140);
+    }
+
+    /* Resume row (end-user request 2026-09-07): only when there is a
+     * remembered file. The name is the basename, trimmed so the row
+     * never wraps; the position reads like a clock. */
+    if (ps->resume_path[0]) {
+        int y = key_y + num_keys * line_h + line_h / 2;
+        const char *nm = ps->resume_path;
+        for (const char *c = ps->resume_path; *c; c++)
+            if (*c == '/' || *c == '\\') nm = c + 1;
+        char shown[48];
+        snprintf(shown, sizeof(shown), "%.40s%s", nm, strlen(nm) > 40 ? "…" : "");
+        int at = (int)ps->resume_pos;
+        char desc[96];
+        snprintf(desc, sizeof(desc), "Resume %s at %d:%02d:%02d",
+                 shown, at / 3600, (at / 60) % 60, at % 60);
+        draw_text(s_pixels, w, h, block_x, y, "R", key_scale, 180, 200, 240);
+        draw_text(s_pixels, w, h, block_x + col_gap, y, desc, key_scale, 200, 200, 210);
     }
 
     ps->overlay_force_full = 0;   /* full-height upload defines the
@@ -945,12 +989,47 @@ void overlay_render(PlayerState *ps) {
     if (!need_seekbar && !need_debug && !need_info &&
         !need_pause && !need_osd && !need_sub) {
         ps->overlay_active = 0;
+        s_solo_streak = 0;
         return;
+    }
+
+    /* Debug text refresh at 10Hz — the counters underneath integrate
+     * every tick in main.c; only the DISPLAY is paced. debug_dirty
+     * means the visible text actually changed since the last raster. */
+    int debug_dirty = 0;
+    if (need_debug) {
+        if (now - s_debug_built_at >= 0.1 || s_debug_built_at <= 0.0) {
+            player_build_debug_info(ps);
+            s_debug_built_at = now;
+            if (strcmp(ps->debug_info, s_debug_prev) != 0) {
+                snprintf(s_debug_prev, sizeof(s_debug_prev), "%s",
+                         ps->debug_info);
+                debug_dirty = 1;
+            }
+        }
+    } else {
+        s_debug_built_at = 0.0;   /* rebuild immediately on next toggle */
+        s_debug_prev[0]  = '\0';
     }
 
     /* ── Ensure GPU overlay texture matches window size ── */
     if (gpu_overlay_ensure(ps, w, h) < 0) {
         ps->overlay_active = 0;
+        s_solo_streak = 0;
+        return;
+    }
+
+    /* Solo-debug fast path: panel is the only overlay, its text is
+     * unchanged, the texture is not fresh (overlay_force_full clear),
+     * and the previous drawn frame was also solo-debug — the texture
+     * already shows exactly this frame. Skip the clear/raster/upload
+     * (a full-height 4K RGBA raster + upload per frame otherwise —
+     * the instrument was a perturbation on SW-decode boxes). */
+    int solo_debug = need_debug && !need_seekbar && !need_info &&
+                     !need_pause && !need_osd && !need_sub;
+    if (solo_debug && s_solo_streak && !debug_dirty &&
+        !ps->overlay_force_full && s_pix_w == w && s_pix_h == h) {
+        ps->overlay_active = 1;
         return;
     }
 
@@ -998,7 +1077,8 @@ void overlay_render(PlayerState *ps) {
     }
 
     if (need_debug) {
-        player_build_debug_info(ps);  /* refresh live data */
+        /* Text was refreshed (at 10Hz) before the fast-path check —
+         * do NOT rebuild here, or the strcmp gate never sees "same". */
         draw_text_panel(s_pixels, w, h, ps->debug_info,
                         10 * s_ui_scale, 40 * s_ui_scale, 2 * s_ui_scale);
     }
@@ -1036,6 +1116,9 @@ void overlay_render(PlayerState *ps) {
     }
     gpu_overlay_upload(ps, s_pixels, w, h, up_y0, up_y1);
     ps->overlay_active = 1;
+    /* Arm the solo-debug fast path only after a full draw whose
+     * contents were exactly the solo panel. */
+    s_solo_streak = solo_debug;
 }
 
 

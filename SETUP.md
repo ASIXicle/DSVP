@@ -207,7 +207,12 @@ ldd build/dsvp | grep -E 'SDL3|avcodec'
 
 `./package.sh` and `./installer/package-deb.sh` bundle exactly what ldd
 shows, so the release artifacts inherit the upgraded libraries
-automatically.
+automatically. Packaging needs `patchelf` (`sudo apt install patchelf`):
+the shipped binary's RUNPATH is rewritten to `$ORIGIN/lib:$ORIGIN`, because
+the local prefix's `.pc` files bake `/home/<you>/...` into the link line and
+that path must never leave the machine. The packager refuses a bundle whose
+RUNPATH still names a home directory, and refuses `unknown`/`+dirty`/debug
+stamps unless `--allow-dirty` is passed.
 
 On Windows, `pacman -Syu` in MSYS2 tracks SDL3/FFmpeg point releases —
 run it before a release build.

@@ -10,7 +10,13 @@
 #   -o OUTDIR    Path for logs (default: tests/logs)
 #   -f FILTER    Only run clips matching glob (e.g. "hdr10_*" or "fps_*")
 #   -s           Include seek tests (sends seeks during playback)
+#   -m PCT       Max dropped-frame percent for PASS (default 5; env DSVP_SUITE_MAX_DROP_PCT)
 #   --dry-run    Show what would run without executing
+#
+# Exit status: 0 only if every clip PASSED. A clip with no Playback
+# Summary, a drop rate over the threshold, or ERROR/assert lines in its
+# log is a FAIL (review M20/M22: the old runner awarded PASS on the mere
+# presence of "Playback Summary" and always exited 0).
 #
 # Run from repo root:  bash tests/run_suite.sh
 # ─────────────────────────────────────────────────────────────────────
@@ -24,6 +30,7 @@ LOGDIR="tests/logs"
 FILTER="*"
 DO_SEEK=0
 DRY_RUN=0
+MAX_DROP_PCT="${DSVP_SUITE_MAX_DROP_PCT:-5}"
 
 # ── Parse args ───────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -34,6 +41,7 @@ while [[ $# -gt 0 ]]; do
         -o) LOGDIR="$2"; shift 2 ;;
         -f) FILTER="$2"; shift 2 ;;
         -s) DO_SEEK=1; shift ;;
+        -m) MAX_DROP_PCT="$2"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -63,6 +71,7 @@ fi
 
 # ── Find clips ───────────────────────────────────────────────────────
 shopt -s nullglob
+# shellcheck disable=SC2206  # $FILTER is a glob by design (-f "hdr10_*")
 CLIPS=( "$CLIPDIR"/$FILTER )
 shopt -u nullglob
 
@@ -106,11 +115,22 @@ kill_dsvp() {
     wait "$pid" 2>/dev/null || true
 }
 
-# DSVP writes log to dsvp.log in the working directory
-DSVP_LOG="dsvp.log"
+# DSVP writes dsvp.log NEXT TO THE EXECUTABLE (log.c resolves the exe
+# dir; field 2026-09-07: the runner looked in the CWD and scored every
+# clip 'no log file produced' while the player logged a full summary
+# to build/dsvp.log). The CWD copy is the player's fallback for an
+# unwritable exe dir, so it is checked second.
+DSVP_LOG="$(dirname "$BINARY")/dsvp.log"
+DSVP_LOG_CWD="dsvp.log"
+echo " Log:       $DSVP_LOG (fallback $DSVP_LOG_CWD)"
+
+# The suite must not overwrite the developer's resume record with a
+# synthetic clip (every kill_dsvp is a SIGTERM = a resume save).
+export DSVP_NO_RESUME=1
 
 pass=0
 fail=0
+nosum=0
 
 echo "Run started: $(date)" > "$SUMMARY"
 echo "" >> "$SUMMARY"
@@ -123,8 +143,8 @@ for clip in "${CLIPS[@]}"; do
 
     echo -n "  TEST  $name ... "
 
-    # Clear any existing log
-    rm -f "$DSVP_LOG"
+    # Clear any existing log (both places the player can put it)
+    rm -f "$DSVP_LOG" "$DSVP_LOG_CWD"
 
     # Launch DSVP in background
     "$BINARY" "$clip" &
@@ -146,21 +166,35 @@ for clip in "${CLIPS[@]}"; do
     # Small delay for log flush
     sleep 0.5
 
-    # Capture log
-    if [[ -f "$DSVP_LOG" ]]; then
-        cp "$DSVP_LOG" "$logfile"
+    # Capture log (exe-dir first, then the player's CWD fallback)
+    got_log=""
+    if [[ -f "$DSVP_LOG" ]]; then got_log="$DSVP_LOG"
+    elif [[ -f "$DSVP_LOG_CWD" ]]; then got_log="$DSVP_LOG_CWD"; fi
+    if [[ -n "$got_log" ]]; then
+        cp "$got_log" "$logfile"
 
-        # Quick pass/fail check — look for playback summary
+        # Pass criterion: a summary exists, drops are under the threshold,
+        # and the log carries no ERROR/assert line.
         if grep -q "Playback Summary" "$logfile"; then
             drops=$(grep "Frames dropped:" "$logfile" | tail -1 | sed 's/.*Frames dropped: *//' | sed 's/ .*//')
-            pct=$(grep "Frames dropped:" "$logfile" | tail -1 | sed 's/.*(\([0-9.]*%\)).*/\1/')
+            pct=$(grep "Frames dropped:" "$logfile" | tail -1 | sed 's/.*(\([0-9.]*\)%).*/\1/')
             bias=$(grep "A.V bias:" "$logfile" | tail -1 | sed 's|.*A/V bias: *||' | sed 's| *$||')
-            echo "OK  (drops: $drops [$pct], bias: $bias)"
-            echo "PASS  $name  drops=$drops ($pct)  bias=$bias" >> "$SUMMARY"
-            pass=$((pass + 1))
+            errs=$(grep -ciE "ERROR|FATAL|segfault|assert" "$logfile" || true)
+            over=$(awk -v p="${pct:-0}" -v m="$MAX_DROP_PCT" 'BEGIN { print (p+0 > m+0) ? 1 : 0 }')
+            if [[ "$over" -eq 0 && "${errs:-0}" -eq 0 ]]; then
+                echo "OK  (drops: $drops [${pct}%], bias: $bias)"
+                echo "PASS  $name  drops=$drops (${pct}%)  bias=$bias" >> "$SUMMARY"
+                pass=$((pass + 1))
+            else
+                echo "FAIL  (drops: $drops [${pct}% > ${MAX_DROP_PCT}%] errors: ${errs:-0})"
+                echo "FAIL  $name  drops=$drops (${pct}%, max ${MAX_DROP_PCT}%)  errors=${errs:-0}  bias=$bias" >> "$SUMMARY"
+                fail=$((fail + 1))
+            fi
         else
-            echo "WARN  (no playback summary — clip may not have started)"
-            echo "WARN  $name  (no playback summary)" >> "$SUMMARY"
+            echo "FAIL  (no playback summary — clip did not start or did not finish)"
+            echo "FAIL  $name  (no playback summary)" >> "$SUMMARY"
+            fail=$((fail + 1))
+            nosum=$((nosum + 1))
         fi
     else
         echo "FAIL  (no log file produced)"
@@ -172,11 +206,12 @@ done
 # ── Summary ──────────────────────────────────────────────────────────
 echo ""
 echo "═══════════════════════════════════════════════════════════════"
-echo " Results: $pass passed, $fail failed out of ${#CLIPS[@]} clips"
+echo " Results: $pass passed, $fail failed ($nosum no-summary) out of ${#CLIPS[@]} clips (max drop ${MAX_DROP_PCT}%)"
 echo " Logs:    $LOGDIR/"
 echo " Summary: $SUMMARY"
 echo "═══════════════════════════════════════════════════════════════"
 echo ""
-echo "Results: $pass passed, $fail failed / ${#CLIPS[@]} total" >> "$SUMMARY"
+echo "Results: $pass passed, $fail failed ($nosum no-summary) / ${#CLIPS[@]} total" >> "$SUMMARY"
 echo ""
 echo "Next: parse results with  bash tests/parse_results.sh $LOGDIR/*_${TIMESTAMP}.log"
+exit $(( fail > 0 ? 1 : 0 ))

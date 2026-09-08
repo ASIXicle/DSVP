@@ -8,6 +8,9 @@
 #
 # Options:
 #   --skip-build    Skip compilation, use existing DSVP-portable/
+#   --allow-dirty   Package an unknown/+dirty/debug stamp (test builds only)
+#
+# Needs: dpkg-deb, objdump (binutils), patchelf (via package.sh); lintian optional.
 #
 # Output: dsvp_<version>_amd64.deb in repo root
 #
@@ -31,10 +34,15 @@ PKG_NAME="dsvp"
 PKG_DIR="${PKG_NAME}_${DEB_VERSION}_${ARCH}"
 PORTABLE_DIR="DSVP-portable"
 SKIP_BUILD=0
+ALLOW_DIRTY=0
 
-if [ "$1" = "--skip-build" ]; then
-    SKIP_BUILD=1
-fi
+for arg in "$@"; do
+    case "$arg" in
+        --skip-build) SKIP_BUILD=1 ;;
+        --allow-dirty) ALLOW_DIRTY=1 ;;
+        *) echo "Unknown option: $arg"; exit 1 ;;
+    esac
+done
 
 echo "=== DSVP Debian Package Builder v${VERSION} ==="
 
@@ -54,7 +62,7 @@ fi
 if [ "$SKIP_BUILD" -eq 0 ]; then
     echo ""
     echo "[1/3] Building portable package..."
-    ./package.sh
+    if [ "$ALLOW_DIRTY" -eq 1 ]; then ./package.sh --allow-dirty; else ./package.sh; fi
 else
     echo ""
     echo "[1/3] Skipping build (using existing ${PORTABLE_DIR}/)"
@@ -72,12 +80,25 @@ if [ ! -d "${PORTABLE_DIR}/lib" ]; then
     exit 1
 fi
 
+# Provenance gate on the portable's stamp (review M9): a .deb is a
+# public artifact — never from an unknown, dirty or debug binary.
+STAMP=$(cat "${PORTABLE_DIR}/dsvp.stamp" 2>/dev/null || echo "missing")
+echo "      Binary stamp: ${STAMP}"
+case "$STAMP" in
+    *release) ;;
+    *) if [ "$ALLOW_DIRTY" -eq 1 ]; then echo "      WARNING: stamp '${STAMP}' is not a clean release build — packaging anyway (--allow-dirty)";
+       else echo "ERROR: refusing to build a .deb from stamp '${STAMP}' (pass --allow-dirty for a test build)"; exit 1; fi ;;
+esac
+case "$STAMP" in
+    unknown*|missing|*+dirty*) if [ "$ALLOW_DIRTY" -ne 1 ]; then echo "ERROR: refusing to build a .deb from stamp '${STAMP}'"; exit 1; fi ;;
+esac
+
 # ── Clean and create package tree ─────────────────────────────
 
 echo "[2/3] Assembling .deb package tree..."
 rm -rf "$PKG_DIR"
 mkdir -p "${PKG_DIR}/DEBIAN"
-mkdir -p "${PKG_DIR}/usr/lib/${PKG_NAME}"
+mkdir -p "${PKG_DIR}/usr/lib/${PKG_NAME}/lib"
 mkdir -p "${PKG_DIR}/usr/bin"
 mkdir -p "${PKG_DIR}/usr/share/applications"
 mkdir -p "${PKG_DIR}/usr/share/metainfo"
@@ -90,19 +111,32 @@ echo "      Copying binary and libraries..."
 cp "${PORTABLE_DIR}/dsvp" "${PKG_DIR}/usr/lib/${PKG_NAME}/dsvp"
 chmod 755 "${PKG_DIR}/usr/lib/${PKG_NAME}/dsvp"
 
-# Copy all bundled shared libraries
-cp -a "${PORTABLE_DIR}/lib/"* "${PKG_DIR}/usr/lib/${PKG_NAME}/"
+# Bundled shared libraries go under lib/ — the binary's RUNPATH is
+# $ORIGIN/lib:$ORIGIN, so /usr/lib/dsvp/lib resolves with no environment.
+cp -a "${PORTABLE_DIR}/lib/"* "${PKG_DIR}/usr/lib/${PKG_NAME}/lib/"
 
-LIB_COUNT=$(find "${PKG_DIR}/usr/lib/${PKG_NAME}" -name "*.so*" | wc -l)
+LIB_COUNT=$(find "${PKG_DIR}/usr/lib/${PKG_NAME}/lib" -name "*.so*" -type f | wc -l)
 echo "      Copied binary + ${LIB_COUNT} libraries"
+
+# Debian hygiene (lintian E-class, 2026-09-06): shared libraries are
+# not executable, and the package ships stripped objects — the portable
+# bundle keeps its symbols, the .deb does not need them.
+find "${PKG_DIR}/usr/lib/${PKG_NAME}/lib" -type f -name '*.so*' -exec chmod 644 {} \;
+if command -v strip >/dev/null 2>&1; then
+    strip --strip-unneeded "${PKG_DIR}/usr/lib/${PKG_NAME}/dsvp" 2>/dev/null || true
+    find "${PKG_DIR}/usr/lib/${PKG_NAME}/lib" -type f -name '*.so*' -exec strip --strip-unneeded {} \; 2>/dev/null || true
+    echo "      Stripped binary + libraries"
+fi
 
 # ── Create launcher script ────────────────────────────────────
 
 echo "      Creating launcher..."
 cat > "${PKG_DIR}/usr/bin/${PKG_NAME}" << 'LAUNCHER'
 #!/bin/bash
-# DSVP launcher — sets library path for bundled shared libs
-export LD_LIBRARY_PATH="/usr/lib/dsvp:$LD_LIBRARY_PATH"
+# DSVP launcher. No LD_LIBRARY_PATH (review M11): the binary's RUNPATH
+# finds /usr/lib/dsvp/lib, and an exported path with an empty element
+# made the loader search the current directory for system libraries
+# and leaked the bundle's libs into the file-dialog child.
 exec /usr/lib/dsvp/dsvp "$@"
 LAUNCHER
 chmod 755 "${PKG_DIR}/usr/bin/${PKG_NAME}"
@@ -164,6 +198,12 @@ License: GPL-3.0+
  On Debian systems, the full text of the GNU General Public
  License version 3 can be found in /usr/share/common-licenses/GPL-3.
 COPYRIGHT
+
+# ── Debian changelog (lintian: no-changelog) ─────────────────
+# One entry per build; the release notes live in GitHub Releases.
+printf '%s (%s) unstable; urgency=medium\n\n  * Build of DSVP %s (%s).\n\n -- Holden <asixicle@users.noreply.github.com>  %s\n' \
+    "$PKG_NAME" "$DEB_VERSION" "$VERSION" "${STAMP%% *}" "$(date -R)" \
+    | gzip -9n > "${PKG_DIR}/usr/share/doc/${PKG_NAME}/changelog.gz"
 
 # ── Create AppStream metainfo (Discover/GNOME Software) ─────
 # This is the file that software centers actually read for the
@@ -255,6 +295,25 @@ METAINFO
 # Calculate installed size in KB
 INSTALLED_SIZE=$(du -sk "${PKG_DIR}" | cut -f1)
 
+# Depends computed from the binaries, not hand-written (review M13):
+# the glibc floor is the highest GLIBC_x.y symbol version the binary
+# and the bundled libraries reference; libstdc++6/libgcc-s1 are needed
+# by the C++ shadercross/dxc/spirv-cross libs (deliberately not
+# bundled). SDL dlopen()s its video/audio backends, which never appear
+# in ldd — Recommends, so a headless install stays installable.
+GLIBC_FLOOR=$( (objdump -T "${PKG_DIR}/usr/lib/${PKG_NAME}/dsvp"; \
+                find "${PKG_DIR}/usr/lib/${PKG_NAME}/lib" -type f -name '*.so*' -exec objdump -T {} \; ) 2>/dev/null \
+              | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -t. -k1,1n -k2,2n -u | tail -1)
+[ -n "$GLIBC_FLOOR" ] || GLIBC_FLOOR="2.36"
+NEEDS_CXX=""
+if find "${PKG_DIR}/usr/lib/${PKG_NAME}/lib" -type f -name '*.so*' -exec objdump -p {} \; 2>/dev/null | grep -q 'NEEDED.*libstdc++'; then
+    NEEDS_CXX=", libstdc++6, libgcc-s1"
+fi
+# The host-owned display stack (package.sh leaves it out of the bundle
+# by policy) is a hard dependency: it is DT_NEEDED by SDL/FFmpeg.
+DEPENDS="libc6 (>= ${GLIBC_FLOOR})${NEEDS_CXX}, libx11-6, libx11-xcb1, libxcb1, libxcb-dri3-0, libxext6, libxfixes3, libxau6, libxdmcp6, libdrm2, fonts-dejavu-core"
+echo "      Depends: ${DEPENDS}  [glibc floor from the binary + bundled libs]"
+
 cat > "${PKG_DIR}/DEBIAN/control" << CONTROL
 Package: ${PKG_NAME}
 Version: ${DEB_VERSION}
@@ -262,8 +321,8 @@ Section: video
 Priority: optional
 Architecture: ${ARCH}
 Installed-Size: ${INSTALLED_SIZE}
-Depends: libc6 (>= 2.17), zlib1g, fonts-dejavu-core
-Recommends: fonts-noto-cjk
+Depends: ${DEPENDS}
+Recommends: fonts-noto-cjk, libwayland-client0, libxkbcommon0, libvulkan1, libgl1, libgbm1, libpipewire-0.3-0 | libpulse0 | libasound2
 Maintainer: Holden <asixicle@users.noreply.github.com>
 Homepage: https://github.com/ASIXicle/DSVP
 Description: Dead Simple Video Player — reference-quality playback
@@ -278,6 +337,7 @@ CONTROL
 
 cat > "${PKG_DIR}/DEBIAN/postinst" << 'POSTINST'
 #!/bin/bash
+set -e
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q /usr/share/applications 2>/dev/null || true
 fi
@@ -291,6 +351,7 @@ chmod 755 "${PKG_DIR}/DEBIAN/postinst"
 
 cat > "${PKG_DIR}/DEBIAN/postrm" << 'POSTRM'
 #!/bin/bash
+set -e
 if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database -q /usr/share/applications 2>/dev/null || true
 fi
@@ -305,6 +366,12 @@ chmod 755 "${PKG_DIR}/DEBIAN/postrm"
 echo "[3/3] Building .deb..."
 DEB_FILE="${PKG_NAME}_${DEB_VERSION}_${ARCH}.deb"
 dpkg-deb --root-owner-group --build "$PKG_DIR" "$DEB_FILE"
+
+# ── Lint (informational; lintian is optional) ────────────────
+if command -v lintian >/dev/null 2>&1; then
+    echo "      lintian:"
+    lintian --tag-display-limit 0 "$DEB_FILE" 2>&1 | sed 's/^/        /' || true
+fi
 
 # ── Cleanup and summary ──────────────────────────────────────
 

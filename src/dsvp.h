@@ -40,7 +40,7 @@
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.3.2-beta"
+#define DSVP_VERSION        "0.3.7-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -53,6 +53,9 @@
 #define MAX_AUDIO_STREAMS   16      /* max audio tracks to catalog      */
 #define SUB_TEXT_SIZE       4096    /* max subtitle text buffer         */
 #define MAX_SUB_BITMAPS     4       /* max bitmap rects per subtitle    */
+#define SUB_MAX_ACTIVE_CUES 8       /* concurrent text cues (review M4)  */
+#define SUB_CUE_TEXT_SIZE   1024    /* one text cue                      */
+typedef struct { char text[SUB_CUE_TEXT_SIZE]; double start, end; } SubCue;
 
 /* Default window size when no video is loaded */
 #define DEFAULT_WIN_W       960
@@ -139,6 +142,13 @@ typedef struct FrameQueue {
  * Layout must match the HLSL cbuffer exactly (std140-ish packing).
  */
 
+/* Build stamp: the Makefile always passes -DDSVP_GIT_COMMIT; this
+ * fallback only covers a bare compiler invocation. Shown in the log
+ * banner (main.c) and the debug overlay (player.c). */
+#ifndef DSVP_GIT_COMMIT
+#define DSVP_GIT_COMMIT "unknown"
+#endif
+
 typedef struct GPUUniforms {
     float colorMatrix[16];  /* 4×4 YUV→RGB matrix (row-major)   64 bytes */
     float rangeY[2];        /* { offset, scale } for Y plane      8 bytes */
@@ -178,7 +188,17 @@ typedef struct GPUUniforms {
     float dovi_mmr_meta[4];   /* [ct_order, cp_order, ct_const, cp_const] */
     float dovi_mmr_ct[6][4];  /* 21 coeffs, [order*7+term] packed  96 bytes */
     float dovi_mmr_cp[6][4];  /*                                   96 bytes */
-} GPUUniforms;              /*                                  992 bytes */
+    /* ── appended (offsets above unchanged) ── */
+    float hdr_pass;           /* 1.0 = HDR10/PQ passthrough swapchain    */
+    /* BT.2390 black-level lift (deck 4614882 port). <0 = off
+     * (DSVP_BLACK_NITS=0); 0 = auto target/2000 (unreached on x64 —
+     * the CPU default is FIXED 0.01 nits, Holden's WIN11 IPS ladder
+     * pick 2026-08-27; deck keeps auto); >0 = fixed nits.
+     * Takes a pad slot — offsets and total size unchanged. Run
+     * tools/check-uniforms.py after ANY edit here. */
+    float out_black_nits;
+    float _pad_hdrp[2];       /* float4 register pad                     */
+} GPUUniforms;              /*                                 1008 bytes */
 
 /* ── Player State ───────────────────────────────────────────────────
  *
@@ -265,7 +285,8 @@ typedef struct PlayerState {
     SDL_GPUDevice              *gpu_device;
     SDL_GPUGraphicsPipeline    *gpu_pipeline_yuv;   /* planar YUV420P   */
     SDL_GPUGraphicsPipeline    *gpu_pipeline_blit;  /* frame cache → swapchain copy */
-    SDL_GPUSampler             *gpu_sampler;         /* linear filtering */
+    /* (linear gpu_sampler deleted — deck d2f5351 port: kernels filter,
+     * everything binds gpu_sampler_nearest; x64 has no PQ LUTs) */
     SDL_GPUSampler             *gpu_sampler_nearest; /* nearest for overlay */
 
     /* ── SDL_GPU handles (lifetime: per-file, created/destroyed in player_open/close) ── */
@@ -298,6 +319,20 @@ typedef struct PlayerState {
     float                       hdr_static_peak;      /* metadata peak (fallback ceiling) */
     int                         hdr_target_idx;       /* index into SDR target nit table  */
     int                         dovi_metadata_logged; /* 1 = logged DV RPU for this file  */
+    float                       dovi_l1_peak_nits;    /* DV L1 authored scene peak (nits);
+                                                         0 = no L1 seen this file. Drives
+                                                         the tone map ahead of histogram/
+                                                         static (deck a4a90b5 port) */
+    double                      dovi_l1_last_log;     /* L1 scene-change log throttle */
+    const char                 *black_src;            /* black-lift source label for
+                                                         the engage log (default/env) */
+    int                         hdr_pass_content;     /* current file's signal is HDR
+                                                         (PQ/HLG/DV) — drives system
+                                                         display-HDR engage (deck lineage) */
+    int                         hdr_out_mode;         /* 0 = off (tone-map), 1 = auto.
+                                                         Z toggles at runtime */
+    int                         hdr_out_active;       /* swapchain is currently
+                                                         HDR10/ST2084 */
 
     /* ── Overlay GPU handles (lifetime: application, resized as needed) ── */
     SDL_GPUGraphicsPipeline    *gpu_pipeline_overlay; /* RGBA + alpha blend */
@@ -324,6 +359,14 @@ typedef struct PlayerState {
     int                 seek_flags;
     int                 seek_recovering;  /* 1 = waiting for first displayed frame post-seek */
     double              seek_recovering_start; /* wall-clock when seek_recovering=1 was set (timeout fallback) */
+    /* SEEKDIAG one-shots (deck 20325d1 port): the recovery contract's
+     * live inputs, logged per seek. The deck's seek-recovery week
+     * convicted three races with these; vocabulary kept identical
+     * across repos so the same greps work. */
+    int                 seekdiag_vid_pending; /* 1 = log first post-seek video frame PTS */
+    int                 seekdiag_aud_pending; /* 1 = log first post-seek audio frame PTS */
+    int                 seekdiag_target_valid; /* 1 = seek_target is from a real seek this file
+                                                  (gates target/landed in the recovery log) */
 
     /* ── Threads ── */
     SDL_Thread         *demux_thread;
@@ -378,6 +421,13 @@ typedef struct PlayerState {
     AVCodecContext     *sub_codec_ctx;
     PacketQueue         sub_pqs[MAX_SUB_STREAMS]; /* one queue per stream */
 
+    /* Active TEXT cues (review M4): several can be on screen at once —
+     * two speakers, a sign over dialogue — each with its own window.
+     * sub_text below is the JOINED render string rebuilt whenever the
+     * set changes; sub_start_pts/sub_end_pts span the set. */
+    SubCue              sub_cues[SUB_MAX_ACTIVE_CUES];
+    int                 sub_cue_count;
+
     /* Current subtitle display */
     char                sub_text[SUB_TEXT_SIZE];
     double              sub_start_pts;      /* show from this PTS           */
@@ -398,6 +448,26 @@ typedef struct PlayerState {
 
     /* ── Media info cache ── */
     char                filepath[1024];
+    /* Resume-last-file (end-user request 2026-09-07): the ONE file
+     * DSVP remembers, and where in it. Loaded at startup from
+     * dsvp.resume (next to the executable when writable, else the
+     * per-user state dir); shown on the idle screen; R opens it.
+     * DSVP_NO_RESUME=1 → never read, never written. */
+    char                resume_path[1024];
+    double              resume_pos;
+
+    /* Chapters (end-user request 2026-09-07: "segment support" = MKV
+     * chapters). Read from the container at open; PgUp/PgDn step them,
+     * the OSD names them, the media info lists them. */
+#define DSVP_MAX_CHAPTERS 256
+    int                 nb_chapters;
+    double              chapter_start[DSVP_MAX_CHAPTERS];   /* seconds */
+    char                chapter_title[DSVP_MAX_CHAPTERS][64];
+    int                 chapter_nav_idx;  /* chapter last jumped to, -1 none:
+                                             a backward seek lands BEFORE the
+                                             chapter start, so for the pre-roll
+                                             we are already "in" that chapter
+                                             (field 2026-09-07: PgDn was stuck) */
     char                media_info[8192]; /* formatted info string      */
     char                debug_info[4096]; /* formatted debug string     */
 
@@ -475,6 +545,8 @@ int   video_decode_frame(PlayerState *ps);
 void  video_display(PlayerState *ps);
 void  video_reblit(PlayerState *ps);
 void  player_seek(PlayerState *ps, double incr);
+void  player_seek_abs(PlayerState *ps, double pos_sec, int backward); /* absolute; backward = land on the keyframe at/before pos */
+int   player_chapter_index(const PlayerState *ps, double pos_sec);   /* -1 when no chapters */
 void  player_build_media_info(PlayerState *ps);
 void  player_build_debug_info(PlayerState *ps);
 void  player_update_display_rect(PlayerState *ps);
@@ -483,6 +555,13 @@ void  player_update_display_rect(PlayerState *ps);
 
 int   gpu_create_pipelines(PlayerState *ps);
 void  gpu_destroy_pipelines(PlayerState *ps);
+void  hdr_sys_reconcile_stamp(void);
+int   hdr_sys_held_sdrbr(void);             /* KWin reference-luminance we hold (0 = none; Windows always 0) */         /* crash-restore: reconcile a dead
+                                                session's display stamp at launch,
+                                                BEFORE any probe (no-op on Windows) */
+void  hdr_output_apply(PlayerState *ps);     /* engage/revert system display HDR
+                                                per content (Windows; deck lineage) */
+void  hdr_output_shutdown(PlayerState *ps);  /* app-exit revert */
 
 /* ── Overlay GPU (player.c) ──────────────────────────────────────── */
 
@@ -516,6 +595,7 @@ int   sub_open_codec(PlayerState *ps, int stream_idx);
 void  sub_close_codec(PlayerState *ps);
 void  sub_cycle(PlayerState *ps);
 void  sub_decode_pending(PlayerState *ps);
+void  sub_clear_display(PlayerState *ps);   /* drop cues + bitmaps + text (seek, close) */
 int   sub_init_font(void);
 void  sub_close_font(void);
 TTF_Font *sub_get_font(void);
