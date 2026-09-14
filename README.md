@@ -35,6 +35,7 @@ https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=ms
 - **Supports everything FFmpeg supports** — H.264, HEVC, AV1, VP9, VC-1, MKV, MP4, and hundreds more; interlaced content deinterlaces automatically (bwdif, engaged only when frames are flagged interlaced — `DSVP_DEINT=0|1` overrides)
 - **Multi-threaded decoding** — adaptive thread count per codec (HEVC up to 12, H.264 up to 8, others up to 16), capped to logical CPU count
 - **Full subtitle support** — text (SRT, ASS/SSA), bitmap (PGS, VobSub), CJK fallback fonts, golden yellow with black outline, cycle tracks with `S`
+- **ASS/SSA typesetting** — ASS tracks render through libass: the author's styles and fonts (embedded font attachments included), positioning, rotation, `\move`/`\t` animation, karaoke. A sign translation lands on the sign. `DSVP_NO_LIBASS=1` falls back to plain text in the house style.
 - **Folder navigation** — `B`/`N` keys to jump between media files in the current folder, with clickable prev/next buttons
 - **Portable or installed** — Windows installer and Debian `.deb` package, or extract-and-run portable tarballs with all dependencies bundled
 - **Secure** — no networking, enforced: file opening runs under an FFmpeg protocol whitelist (`file` only), so even URL arguments cannot touch the network
@@ -71,6 +72,7 @@ https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=ms
 - **FFmpeg 8.1+** shared development libraries (9.0 recommended — see SETUP.md)
 - **SDL3** development libraries
 - **SDL3_ttf** development libraries
+- **libass** development libraries (optional — without it ASS tracks render as plain text)
 - **SDL3_shadercross 3.0.0** (bundled — not available via package managers)
 - **zlib** (for PGS subtitle decompression)
 - **GNU Make**
@@ -82,7 +84,7 @@ https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=ms
 
 **2. Install dependencies** (from MSYS2 MinGW 64-bit shell):
 ```bash
-pacman -S mingw-w64-x86_64-sdl3 mingw-w64-x86_64-sdl3-ttf mingw-w64-x86_64-pkg-config
+pacman -S mingw-w64-x86_64-sdl3 mingw-w64-x86_64-sdl3-ttf mingw-w64-x86_64-libass mingw-w64-x86_64-pkg-config
 ```
 
 FFmpeg 8.1+ shared libraries are also needed via MSYS2:
@@ -105,6 +107,8 @@ mingw32-make
 
 The binary lands in `build/dsvp.exe` with all required DLLs auto-copied.
 
+Check the `subs:` line the Makefile prints: `subs:  libass <version>` means ASS/SSA typesetting is built in; `subs:  libass NOT FOUND` means ASS tracks will render as plain text with their override tags stripped.
+
 **6. Package for distribution:**
 ```powershell
 .\installer\build-installer.ps1
@@ -123,7 +127,7 @@ Produces `DSVP-<version>-setup.exe` in the repo root.
 **1. Install system packages:**
 ```bash
 sudo apt install gcc make pkg-config \
-    libsdl3-dev libsdl3-ttf-dev \
+    libsdl3-dev libsdl3-ttf-dev libass-dev \
     zlib1g-dev fonts-dejavu-core fonts-noto-cjk zenity
 ```
 
@@ -151,6 +155,8 @@ make
 
 Binary: `build/dsvp`
 
+Check the `subs:` line the Makefile prints: `subs:  libass <version>` means ASS/SSA typesetting is built in; `subs:  libass NOT FOUND` means ASS tracks will render as plain text with their override tags stripped.
+
 **4. Package for distribution:**
 ```bash
 sudo apt install patchelf   # once — rewrites the shipped binary's RUNPATH
@@ -159,9 +165,13 @@ sudo apt install patchelf   # once — rewrites the shipped binary's RUNPATH
 `package.sh` refuses to package an `unknown`, `+dirty` or debug build (pass `--allow-dirty` for a test bundle), prints where every bundled library came from, sets each one's RUNPATH to `$ORIGIN` and the binary's to `$ORIGIN/lib:$ORIGIN`, and re-checks the assembled bundle with `LD_LIBRARY_PATH` unset. The X11/DRM/GL/Vulkan/Wayland stack stays on the host by design.
 
 > **Resume:** DSVP remembers the last file you watched and where you were, in a three-line
-> `dsvp.resume` next to the executable (or in `%LOCALAPPDATA%\DSVP` / `$XDG_STATE_HOME/dsvp`
-> when that directory is not writable). Press **R** on the idle screen to pick up there. That
-> file is the only thing DSVP remembers; set `DSVP_NO_RESUME=1` and it is never read or written.
+> `dsvp.resume` next to the executable when that directory is writable — so a portable copy
+> keeps its own history, and never reads or deletes the record belonging to an installed copy
+> on the same machine. An installed build cannot write beside itself, so it uses
+> `%LOCALAPPDATA%\DSVP` / `$XDG_STATE_HOME/dsvp` instead. One of the two is chosen per launch
+> and used for reading, writing and clearing alike; the log names which. Press **R** on the
+> idle screen to pick up there. That file is the only thing DSVP remembers; set
+> `DSVP_NO_RESUME=1` and it is never read or written.
 
 **5. Build .deb installer** (optional):
 ```bash
@@ -190,7 +200,7 @@ DSVP/
     main.c       ← SDL init, event loop, frame pacing, hotkey handling
     player.c     ← Demux thread, video decode/display, GPU pipelines, HLSL shaders, seeking, media info
     audio.c      ← Audio decode, resample, SDL3 audio stream, A/V clock, track cycling
-    subtitle.c   ← Subtitle detection, decode, SDL3_ttf rendering, CJK fallback fonts
+    subtitle.c   ← Subtitle detection, decode, SDL3_ttf rendering, CJK fallback fonts, libass typesetting
     bitstream.c  ← HDMI sink EDID probe for audio passthrough (Phase 3 scaffolding)
     overlay.c    ← GPU-composited overlays: bitmap font, seek bar, debug/info panels, OSD, subtitles
     log.c        ← Crash-safe unbuffered file logger

@@ -2116,7 +2116,9 @@ static void gpu_setup_uniforms(PlayerState *ps) {
          * an untagged stream — the tag-based line said BT.709 while the
          * shader converted 2020→709 (panel-vs-log disagreement caught
          * by Holden's paused screenshot, 2026-09-05). */
-        log_msg("GPU: HDR→SDR tone mapping active (peak=%.0f nits, target=%.0f nits, gamut=%s%s)",
+        /* m-S2-f: hdr_output_apply has not run yet — in Z/passthrough
+         * mode the shader never runs this curve. Say what is ARMED. */
+        log_msg("HDR: SDR tone-map curve armed (peak=%.0f nits, target=%.0f nits, gamut=%s%s) — output mode decided by hdr_output_apply",
                 peak_nits, target,
                 ps->gpu_uniforms.hdr_gamut > 0.5f ? "BT.2020" : "BT.709",
                 is_dolby_vision ? ", Dolby Vision" : "");
@@ -4860,6 +4862,9 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->audio_clock_sync = 0.0;
     ps->av_bias = 0.0;
     ps->av_bias_samples = 0;
+    ps->av_hold = 0;
+    ps->av_hold_frames = 0;
+    ps->av_trace_left = 0;
     ps->video_clock      = 0.0;
 
     /* Suppress frame drops until the first frame is displayed.
@@ -5037,6 +5042,7 @@ void player_close(PlayerState *ps) {
 
     /* Close subtitles */
     sub_close_codec(ps);
+    sub_ass_close_file(ps);   /* per-file libass library + renderer (embedded fonts) */
 
     /* Flush queues */
     pq_destroy(&ps->video_pq);
@@ -5477,6 +5483,12 @@ int demux_thread_func(void *arg) {
         if (ps->seek_request) {
             int64_t target = ps->seek_target;
             int     tflags = ps->seek_flags;
+            /* m-S1-c: the recovery gate and every SEEKDIAG line read
+             * THIS value, not the live seek_target — a second request
+             * issued during service overwrote the live one and the
+             * 2026-08-29 double-seek printed seek#1's landing against
+             * seek#2's target ('delta=-640', field 2026-09-07). */
+            ps->seekdiag_target = target;
             /* Re-arm IMMEDIATELY: clearing only after the full
              * seek+flush swallowed any second seek issued during
              * service (double-tap on slow media; audio_cycle's
@@ -5513,7 +5525,7 @@ int demux_thread_func(void *arg) {
                  * unreached target, cleared EOF, flushed the SDL audio
                  * queue, and armed seek-recovery: an audible gap and a
                  * transient sync scramble for a seek that never happened. */
-                log_msg("ERROR: Seek failed: %s — state unchanged",
+                log_msg("ERROR: Seek failed: %s — position unchanged (the frame timer was reset at request)",
                         av_err2str(ret));
                 ps->seeking = 0;
                 /* Resume under the mutex: audio_cycle and the
@@ -5807,7 +5819,7 @@ int video_decode_frame(PlayerState *ps) {
     if (ps->seekdiag_vid_pending
             && ps->video_frame_serial == ps->video_frame_q.flush_serial) {
         ps->seekdiag_vid_pending = 0;
-        double tgt = (double)ps->seek_target / AV_TIME_BASE;
+        double tgt = (double)ps->seekdiag_target / AV_TIME_BASE;
         if (frame_pts != AV_NOPTS_VALUE)
             log_msg("SEEKDIAG: first video frame post-seek "
                     "pts=%.3f target=%.3f delta=%+.3f",
@@ -6702,14 +6714,21 @@ static void hdr_compute_scene_peak(PlayerState *ps, const AVFrame *frame,
      * KS printed near 0 would mean the linear-domain bug is back. */
     if (ps->diag_frames_displayed % 120 == 0) {
         float target = ps->gpu_uniforms.hdr_target_nits;
-        double maxLum = pq_oetf_cpu(target) / pq_oetf_cpu(smoothed);
+        /* m-S2-e: debug mode 1 runs the shader at target+100 — the
+         * printed KS/maxLum must be the ones the shader uses. */
+        int dbg1 = ps->gpu_uniforms.hdr_debug > 0.5f && ps->gpu_uniforms.hdr_debug < 1.5f;
+        float eff_target = dbg1 ? target + 100.0f : target;
+        double maxLum = pq_oetf_cpu(eff_target) / pq_oetf_cpu(smoothed);
         if (maxLum > 1.0) maxLum = 1.0;
         double ks = 1.5*maxLum - 0.5;
         if (ks < 0.0) ks = 0.0; else if (ks > 0.999) ks = 0.999;
+        char tgt_s[48];
+        if (dbg1) snprintf(tgt_s, sizeof(tgt_s), "%.0f (+100 debug = %.0f)", target, eff_target);
+        else      snprintf(tgt_s, sizeof(tgt_s), "%.0f", target);
         log_msg("HDR peak: raw=%.0f nits, smoothed=%.0f nits "
-                "(p%.1f, target=%.0f, static=%.0f, KS=%.3f, maxLum=%.4f)",
+                "(p%.1f, target=%s, static=%.0f, KS=%.3f, maxLum=%.4f)",
                 raw_peak_nits, smoothed, PEAK_PERCENTILE,
-                target, ps->hdr_static_peak, ks, maxLum);
+                tgt_s, ps->hdr_static_peak, ks, maxLum);
     }
 }
 
@@ -7462,18 +7481,29 @@ void player_build_debug_info(PlayerState *ps) {
             /* Which peak drives the curve THIS frame (priority order
              * of the writers in video_display): DV L1 authored scene
              * peak outranks the histogram, which outranks static. */
+            /* m-S2-d: on DV the histogram never runs — the bypass in
+             * hdr_compute_scene_peak copies the RPU static peak into
+             * hdr_smoothed_peak, so "histogram" was the wrong writer. */
             const char *psrc = ps->dovi_l1_peak_nits > 0.0f ? "DV L1 authored scene"
+                             : u->is_dovi > 0.5f              ? "RPU source_max_pq"
                              : ps->hdr_smoothed_peak > 0.0f ? "histogram p99.875 smoothed"
                                                             : "static metadata";
             float peak   = u->hdr_peak_nits;
             float target = u->hdr_target_nits;
+            /* m-S2-e: debug mode 1 runs the shader at target+100. */
+            int dbg1 = u->hdr_debug > 0.5f && u->hdr_debug < 1.5f;
+            float eff_target = dbg1 ? target + 100.0f : target;
             INFO_APPEND("Peak:    %.0f nits (%s)\n", peak, psrc);
-            INFO_APPEND("Target:  %.0f nits [T]  midtone %.2f [G]\n",
-                target, u->hdr_midtone_gain);
+            if (dbg1)
+                INFO_APPEND("Target:  %.0f nits [T] (+100 debug = %.0f)  midtone %.2f [G]\n",
+                    target, eff_target, u->hdr_midtone_gain);
+            else
+                INFO_APPEND("Target:  %.0f nits [T]  midtone %.2f [G]\n",
+                    target, u->hdr_midtone_gain);
             if (peak > 0.0f && target > 0.0f) {
                 /* PQ-domain, identical to the log's formula. KS near 0
                  * here = the linear-domain bug is back. */
-                double maxLum = pq_oetf_cpu(target) / pq_oetf_cpu(peak);
+                double maxLum = pq_oetf_cpu(eff_target) / pq_oetf_cpu(peak);
                 if (maxLum > 1.0) maxLum = 1.0;
                 double ks = 1.5 * maxLum - 0.5;
                 if (ks < 0.0) ks = 0.0; else if (ks > 0.999) ks = 0.999;
@@ -7493,8 +7523,13 @@ void player_build_debug_info(PlayerState *ps) {
                     "2 (PQ bypass, raw)", "3 (luminance viz)"
                 };
                 int dm = (int)u->hdr_debug;
-                INFO_APPEND("Debug:   %s [H]\n",
-                    (dm >= 0 && dm <= 3) ? dbg_names[dm] : "?");
+                /* m-S2-j: modes 2 and 3 live in the HDR10/HLG branch
+                 * of the shader; the DV branch consults hdr_debug only
+                 * for mode 1's +100. On DV the panel must not claim a
+                 * bypass or a luminance view the picture is not showing. */
+                INFO_APPEND("Debug:   %s [H]%s\n",
+                    (dm >= 0 && dm <= 3) ? dbg_names[dm] : "?",
+                    (u->is_dovi > 0.5f && dm >= 2) ? "  — n/a on DV (no effect)" : "");
             }
             if (u->out_gamma > 0.0f)
                 INFO_APPEND("Transfer: gamma %.1f out\n", u->out_gamma);
@@ -7598,8 +7633,12 @@ void player_build_debug_info(PlayerState *ps) {
         }
     }
 
-    /* Bitstream sink capabilities (if probed) */
-    if (ps->bitstream_caps.probed) {
+    /* Bitstream sink capabilities (if probed). m-S7-d: the Windows stub
+     * used to set probed=1 and this block then read "probed, supports
+     * nothing" — say what is true instead. */
+    if (ps->bitstream_caps.platform_unsupported) {
+        INFO_APPEND("\n--- Bitstream Sink ---\nnot probed on this platform\n");
+    } else if (ps->bitstream_caps.probed) {
         INFO_APPEND("\n--- Bitstream Sink ---\n");
         INFO_APPEND(
             "AC3=%d EAC3=%d TrueHD=%d DTS=%d DTS-HD=%d HBR=%d ch=%d\n",

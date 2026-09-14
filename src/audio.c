@@ -252,8 +252,14 @@ void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
         double buffered_sec = (double)(internal_pending + stream_pending)
                             / (ps->audio_spec.freq * bytes_per_sample);
 
+        /* AUDCLK instrument: the correction's live inputs, pre-clamp
+         * (review DM19/DM20). Main prints them at the DIAG cadence. */
+        ps->aud_diag_buffered = buffered_sec;
+        ps->aud_diag_internal = internal_pending;
+        ps->aud_diag_stream   = stream_pending;
+
         /* Cap at 100ms — prevents FLAC/large-buffer runaway */
-        if (buffered_sec > 0.1) buffered_sec = 0.1;
+        if (buffered_sec > 0.1) { buffered_sec = 0.1; ps->aud_diag_clamped++; }
 
         /* Aligned 64-bit write — atomic on x86-64 and ARMv8. Not guaranteed portable. */
         ps->audio_clock_sync = ps->audio_clock - buffered_sec;
@@ -280,6 +286,7 @@ int audio_open(PlayerState *ps) {
                   || ps->bitstream_caps.support_dts
                   || ps->bitstream_caps.support_dtshd;
     if (ps->audio_mode != AUDIO_MODE_PCM
+            && !ps->bitstream_caps.platform_unsupported   /* m-S7-d: the stub said so once */
             && (!ps->bitstream_caps.probed || !caps_found)) {
         if (bitstream_probe(&ps->bitstream_caps) == 0) {
             /* Check if the current audio codec can pass through */
@@ -310,6 +317,27 @@ int audio_open(PlayerState *ps) {
     }
 
     ps->audio_spec = spec;
+    ps->aud_diag_buffered = 0.0;
+    ps->aud_diag_internal = ps->aud_diag_stream = ps->aud_diag_clamped = 0;
+
+    /* The device the stream landed on and its period (review DM20: the
+     * in-flight device period is not in the clock correction yet —
+     * this line is the instrument that shows how much it is, and
+     * whether the endpoint or its period changes across a display
+     * mode switch; field 2026-09-09 Win11 batch 14(a) residual). */
+    {
+        SDL_AudioDeviceID dev = SDL_GetAudioStreamDevice(ps->audio_stream);
+        SDL_AudioSpec dspec;
+        int dframes = 0;
+        if (dev && SDL_GetAudioDeviceFormat(dev, &dspec, &dframes) && dspec.freq > 0) {
+            const char *dname = SDL_GetAudioDeviceName(dev);
+            log_msg("Audio: device '%s' period %d frames (%.1f ms) at %d Hz, %d ch",
+                    dname ? dname : "?", dframes,
+                    dframes * 1000.0 / dspec.freq, dspec.freq, dspec.channels);
+        } else {
+            log_msg("Audio: device period unknown (%s)", SDL_GetError());
+        }
+    }
 
     /* Free any existing buffer first — the sample-rate-change reopen in
      * audio_cycle() previously leaked one allocation per reopen. */

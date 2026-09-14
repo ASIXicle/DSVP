@@ -18,6 +18,8 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <string.h>
 #endif
 
 /* ===================================================================
@@ -148,12 +150,20 @@ static int parse_cea_extension(const uint8_t *block, BitstreamCaps *caps)
 int bitstream_probe(BitstreamCaps *caps)
 {
     memset(caps, 0, sizeof(*caps));
-    caps->probed = 1;                        /* mark as probed either way */
 
 #ifndef __linux__
-    log_msg("Bitstream: EDID probe not implemented on this platform");
+    /* m-S7-d: nothing was probed — say so instead of "probed, supports
+     * nothing", and say it once (audio_open stops asking on this flag). */
+    caps->probed = 0;
+    caps->platform_unsupported = 1;
+    static int s_logged = 0;
+    if (!s_logged) {
+        s_logged = 1;
+        log_msg("Bitstream: EDID probe not implemented on this platform — sink caps unknown");
+    }
     return -1;
 #else
+    caps->probed = 1;                        /* mark as probed either way */
     DIR *drm = opendir("/sys/class/drm");
     if (!drm) {
         log_msg("Bitstream: cannot open /sys/class/drm");
@@ -192,13 +202,39 @@ int bitstream_probe(BitstreamCaps *caps)
         snprintf(path, sizeof(path), "/sys/class/drm/%s/edid", ent->d_name);
 
         int fd = open(path, O_RDONLY);
-        if (fd < 0) continue;
+        if (fd < 0) {
+            /* m-S7-b: a connected connector whose EDID we cannot read
+             * used to vanish from the log. */
+            log_msg("Bitstream: %s connected but EDID not readable (open: %s)",
+                    ent->d_name, strerror(errno));
+            continue;
+        }
 
         uint8_t edid[1024];  /* base (128) + up to 7 extensions (896) */
-        ssize_t len = read(fd, edid, sizeof(edid));
+        /* m-S7-b: read to EOF or buffer end; sysfs can return short
+         * reads and EINTR is a retry, not an answer. */
+        ssize_t len = 0;
+        int rerr = 0;
+        for (;;) {
+            ssize_t r = read(fd, edid + len, sizeof(edid) - (size_t)len);
+            if (r < 0 && errno == EINTR) continue;
+            if (r < 0) { rerr = errno; break; }
+            if (r == 0) break;
+            len += r;
+            if ((size_t)len >= sizeof(edid)) break;
+        }
         close(fd);
 
-        if (len < 128) continue;
+        if (rerr) {
+            log_msg("Bitstream: %s connected but EDID read failed after %zd bytes (%s)",
+                    ent->d_name, len, strerror(rerr));
+            continue;
+        }
+        if (len < 128) {
+            log_msg("Bitstream: %s connected but EDID is %zd bytes (need 128) — skipped",
+                    ent->d_name, len);
+            continue;
+        }
 
         /* -- Validate base EDID header -- */
         static const uint8_t hdr[] = {0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x00};
@@ -207,15 +243,23 @@ int bitstream_probe(BitstreamCaps *caps)
             continue;
         }
 
+        /* m-S7-b: the header CLAIMS a count; we parse what actually
+         * arrived (the 1024-byte buffer holds 7 extensions; bigger EDIDs
+         * are truncated by the read). Print both. */
         int ext_count = edid[126];
-        log_msg("Bitstream: %s connected, EDID %zd bytes, %d extension(s)",
-                ent->d_name, len, ext_count);
+        int ext_avail = (int)((len - 128) / 128);
+        int ext_parse = ext_count < ext_avail ? ext_count : ext_avail;
+        if (ext_parse < ext_count)
+            log_msg("Bitstream: %s connected, EDID %zd bytes, %d extension(s) declared, "
+                    "%d read (rest beyond the %zu-byte read)",
+                    ent->d_name, len, ext_count, ext_parse, sizeof(edid));
+        else
+            log_msg("Bitstream: %s connected, EDID %zd bytes, %d extension(s)",
+                    ent->d_name, len, ext_count);
 
         /* -- Parse each extension block -- */
-        for (int i = 0; i < ext_count; i++) {
+        for (int i = 0; i < ext_parse; i++) {
             int offset = (i + 1) * 128;
-            if (offset + 128 > len) break;
-
             parse_cea_extension(&edid[offset], caps);
         }
 
@@ -229,6 +273,11 @@ int bitstream_probe(BitstreamCaps *caps)
         if (caps->max_channels > 0) {
             found = 1;
         } else {
+            /* m-S7-g: this connector's VSDB/HBR lines already printed
+             * above — a reader saw "HBR capable" and then HBR=0 with
+             * no explanation. Say why it was discarded. */
+            log_msg("Bitstream: %s has no audio SADs — its VSDB lines above "
+                    "do not count; scanning on", ent->d_name);
             int keep_probed = caps->probed;
             memset(caps, 0, sizeof(*caps));
             caps->probed = keep_probed;

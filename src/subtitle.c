@@ -7,6 +7,9 @@
  *   - Opening/closing subtitle codecs
  *   - Decoding text subtitles (SRT, ASS/SSA)
  *   - Rendering with SDL_ttf: golden yellow (#FFDF00) + black outline
+ *   - ASS/SSA typesetting through libass when built with it: the
+ *     author's styles, fonts (embedded attachments included),
+ *     positioning and animation, composited by overlay.c
  *   - Track cycling with 'S' key (including "Off" option)
  */
 
@@ -625,6 +628,291 @@ void sub_clear_display(PlayerState *ps) {
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * libass — ASS/SSA typesetting (2026-09 cycle)
+ *
+ * FOR: put on screen what the subtitle author typeset — a sign
+ * translation over the sign, an SFX over the kanji, in the author's
+ * font — instead of the stripped plain text at the bottom.
+ *
+ * Lifecycle: ASS_Library + ASS_Renderer per FILE, created lazily the
+ * first time an ASS/SSA track is opened (the file's font attachments
+ * are handed to the library then, and ass_set_fonts builds the font
+ * provider — fontconfig on Linux, DirectWrite on Windows). ASS_Track
+ * per OPENED stream: the codec's extradata is the script header
+ * (styles, PlayRes), every packet is one Matroska-form event fed by
+ * ass_process_chunk with its PTS/duration in ms. Rendering happens in
+ * overlay.c through sub_ass_render() at the frame's output size.
+ *
+ * Threads: every libass call here runs on the MAIN thread — the drain
+ * (under seek_mutex), the overlay draw, the S-cycle open/close and
+ * player_close. The demux thread's seek handler never touches libass;
+ * it flushes the packet queue and the AVCodecContext only. No
+ * ass_flush_events on seek: events are timestamped and libass drops
+ * duplicates by ReadOrder, so a backward seek re-feeding the queue is
+ * harmless and a forward seek simply has a gap that the demuxer
+ * refills. Memory is bounded by the file's event count.
+ *
+ * Off switches: NO_LIBASS=1 at build time; DSVP_NO_LIBASS=1 at run
+ * time (falsification: same binary, the pre-libass stripped path).
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#ifdef DSVP_HAVE_LIBASS
+
+#define SUB_ASS_MSG_CAP  32   /* libass errors/warnings logged per file */
+#define SUB_ASS_INFO_CAP 24   /* libass info lines (font selections) per file */
+
+/* libass levels: 0 fatal, 1 error, 2 warning, 4 info (the font-provider
+ * banner and every "fontselect: (family) -> file" pick — field receipts
+ * for WHICH font drew a sign), 5+ verbose. Two caps so a chatty info
+ * stream can never eat the warning budget (host harness 2026-09-08). */
+static int s_ass_info_count = 0;
+
+static void sub_ass_msg_cb(int level, const char *fmt, va_list va, void *data) {
+    PlayerState *ps = (PlayerState *)data;
+    char buf[512];
+    vsnprintf(buf, sizeof(buf), fmt, va);
+    if (level >= 5) {                   /* verbose: debug builds only */
+        sub_vlog("libass[%d]: %s", level, buf);
+        return;
+    }
+    if (level >= 3) {                   /* info */
+        if (s_ass_info_count >= SUB_ASS_INFO_CAP) return;
+        if (++s_ass_info_count == SUB_ASS_INFO_CAP) {
+            log_msg("libass: further info lines suppressed for this file (%d logged)",
+                    SUB_ASS_INFO_CAP);
+            return;
+        }
+        log_msg("libass: %s", buf);
+        return;
+    }
+    if (!ps || ps->ass_msg_count >= SUB_ASS_MSG_CAP) return;
+    if (++ps->ass_msg_count == SUB_ASS_MSG_CAP) {
+        log_msg("libass: further warnings suppressed for this file (%d logged)",
+                SUB_ASS_MSG_CAP);
+        return;
+    }
+    log_msg("libass %s: %s", level <= 1 ? "ERROR" : "warning", buf);
+}
+
+static const char *sub_ass_provider_name(ASS_DefaultFontProvider p) {
+    switch (p) {
+        case ASS_FONTPROVIDER_NONE:        return "none";
+        case ASS_FONTPROVIDER_AUTODETECT:  return "autodetect";
+        case ASS_FONTPROVIDER_CORETEXT:    return "CoreText";
+        case ASS_FONTPROVIDER_FONTCONFIG:  return "fontconfig";
+        case ASS_FONTPROVIDER_DIRECTWRITE: return "DirectWrite";
+        default:                           return "unknown";
+    }
+}
+
+/* Is this attachment stream a font? Matroska attachments carry a
+ * mimetype; FFmpeg also types the common ones (TTF/OTF). */
+static int sub_ass_attachment_is_font(const AVStream *st) {
+    const AVCodecParameters *cp = st->codecpar;
+    if (cp->codec_type != AVMEDIA_TYPE_ATTACHMENT) return 0;
+    if (!cp->extradata || cp->extradata_size <= 0) return 0;
+    if (cp->codec_id == AV_CODEC_ID_TTF || cp->codec_id == AV_CODEC_ID_OTF) return 1;
+    const AVDictionaryEntry *mime = av_dict_get(st->metadata, "mimetype", NULL, 0);
+    if (!mime || !mime->value) return 0;
+    const char *m = mime->value;
+    return strncmp(m, "font/", 5) == 0 ||
+           strstr(m, "truetype") != NULL ||
+           strstr(m, "opentype") != NULL ||
+           strstr(m, "font-sfnt") != NULL ||
+           strstr(m, "x-font") != NULL;
+}
+
+/* Per-file library + renderer. Idempotent. */
+static int sub_ass_file_init(PlayerState *ps) {
+    if (ps->ass_lib && ps->ass_rend) return 0;
+    double t0 = get_time_sec();
+
+    ps->ass_msg_count      = 0;
+    s_ass_info_count       = 0;
+    ps->ass_fonts_embedded = 0;
+    ps->ass_frame_w = ps->ass_frame_h = 0;
+    ps->ass_stor_w  = ps->ass_stor_h  = 0;
+
+    ps->ass_lib = ass_library_init();
+    if (!ps->ass_lib) {
+        log_msg("Subs: libass library init failed");
+        return -1;
+    }
+    ass_set_message_cb(ps->ass_lib, sub_ass_msg_cb, ps);
+    ass_set_extract_fonts(ps->ass_lib, 1);   /* [Fonts] sections inside the script too */
+
+    /* Embedded fonts: the container's font attachments. libass copies
+     * the data. A typeset release ships its fonts this way; without
+     * them the provider substitutes and the sign no longer matches. */
+    if (ps->fmt_ctx) {
+        for (unsigned i = 0; i < ps->fmt_ctx->nb_streams; i++) {
+            AVStream *st = ps->fmt_ctx->streams[i];
+            if (!sub_ass_attachment_is_font(st)) continue;
+            const AVDictionaryEntry *fn = av_dict_get(st->metadata, "filename", NULL, 0);
+            ass_add_font(ps->ass_lib, (fn && fn->value) ? fn->value : "embedded",
+                         (const char *)st->codecpar->extradata,
+                         st->codecpar->extradata_size);
+            ps->ass_fonts_embedded++;
+        }
+    }
+
+    ps->ass_rend = ass_renderer_init(ps->ass_lib);
+    if (!ps->ass_rend) {
+        log_msg("Subs: libass renderer init failed");
+        ass_library_done(ps->ass_lib);
+        ps->ass_lib = NULL;
+        return -1;
+    }
+    /* Provider: AUTODETECT = CoreText > DirectWrite > fontconfig, first
+     * available. default_font is the belt-and-braces file used when the
+     * provider has nothing (same finder as the SDL_ttf path). Hinting
+     * NONE per the libass header: any hinting fights smooth scaling,
+     * i.e. animations and precise positioning — the point of this. */
+    const char *dflt = find_system_font();
+    ass_set_fonts(ps->ass_rend, dflt, "sans-serif",
+                  ASS_FONTPROVIDER_AUTODETECT, NULL, 1);
+    ass_set_hinting(ps->ass_rend, ASS_HINTING_NONE);
+    ass_set_shaper(ps->ass_rend, ASS_SHAPING_COMPLEX);
+
+    /* The list always opens with NONE and AUTODETECT; the real providers
+     * follow (harness receipt: list[0] read "none" on a fontconfig box). */
+    const char *prov = "none";
+    {
+        ASS_DefaultFontProvider *list = NULL;
+        size_t n = 0;
+        ass_get_available_font_providers(ps->ass_lib, &list, &n);
+        if (list && n != (size_t)-1) {
+            for (size_t i = 0; i < n; i++) {
+                if (list[i] > ASS_FONTPROVIDER_AUTODETECT) { prov = sub_ass_provider_name(list[i]); break; }
+            }
+        }
+        free(list);
+    }
+    log_msg("Subs: libass 0x%08x ready in %.0f ms — font provider %s, "
+            "%d embedded font(s), default font %s",
+            ass_library_version(), (get_time_sec() - t0) * 1000.0,
+            prov, ps->ass_fonts_embedded, dflt ? dflt : "none");
+    return 0;
+}
+
+static void sub_ass_track_close(PlayerState *ps) {
+    if (ps->ass_track) {
+        ass_free_track(ps->ass_track);
+        ps->ass_track = NULL;
+    }
+    ps->sub_ass_active = 0;
+}
+
+/* Open a libass track for the codec just opened in sub_open_codec.
+ * The codec context stays open too: it owns the extradata and the
+ * seek handler flushes it; packets bypass avcodec_decode_subtitle2
+ * (for AV_CODEC_ID_ASS the decoder's rect->ass IS the packet). */
+static int sub_ass_track_open(PlayerState *ps) {
+    if (sub_ass_file_init(ps) < 0) return -1;
+    sub_ass_track_close(ps);
+    ps->ass_track = ass_new_track(ps->ass_lib);
+    if (!ps->ass_track) {
+        log_msg("Subs: libass track allocation failed");
+        return -1;
+    }
+    AVCodecContext *cc = ps->sub_codec_ctx;
+    if (cc && cc->extradata && cc->extradata_size > 0)
+        ass_process_codec_private(ps->ass_track, (const char *)cc->extradata,
+                                  cc->extradata_size);
+    else
+        log_msg("Subs: ASS track carries no script header — libass defaults apply");
+    ps->ass_nopts_logged = 0;
+    ps->sub_ass_active   = 1;
+    /* libass allocates its own style slot 0 before the script's styles
+     * (an empty track already has n_styles == 1), so the authored count
+     * is n_styles - 1 — the number the script's author wrote. */
+    const char *clk_env = SDL_getenv("DSVP_ASS_AUDIO_CLOCK");
+    const char *clk = (ps->video_stream_idx < 0) ? "audio (no video stream)"
+                    : (clk_env && clk_env[0] == '1') ? "audio (DSVP_ASS_AUDIO_CLOCK)"
+                    : "frame PTS";
+    log_msg("Subs: ASS via libass — %s script, PlayRes %dx%d, %d authored style(s), "
+            "YCbCr header %d, fonts: %d embedded, render clock: %s",
+            ps->ass_track->track_type == TRACK_TYPE_SSA ? "SSA" : "ASS",
+            ps->ass_track->PlayResX, ps->ass_track->PlayResY,
+            ps->ass_track->n_styles > 0 ? ps->ass_track->n_styles - 1 : 0,
+            (int)ps->ass_track->YCbCrMatrix, ps->ass_fonts_embedded, clk);
+    return 0;
+}
+
+/* Feed every queued event to libass. Not due-gated like the SDL_ttf
+ * cues: libass owns timing, and an event fed early renders at its
+ * own time (\move and \t need the whole event up front). */
+static void sub_ass_drain(PlayerState *ps, PacketQueue *spq, const AVStream *st) {
+    double tb = av_q2d(st->time_base);
+    for (;;) {
+        AVPacket pkt;
+        if (pq_get(spq, &pkt, 0) <= 0) break;
+        if (pkt.pts == AV_NOPTS_VALUE || pkt.duration <= 0 || pkt.size <= 0 || !pkt.data) {
+            if (!ps->ass_nopts_logged) {
+                ps->ass_nopts_logged = 1;
+                log_msg("Subs: ASS event without PTS/duration dropped (once per file: pts=%s dur=%lld size=%d)",
+                        pkt.pts == AV_NOPTS_VALUE ? "none" : "set",
+                        (long long)pkt.duration, pkt.size);
+            }
+            av_packet_unref(&pkt);
+            continue;
+        }
+        long long t_ms = (long long)llround((double)pkt.pts * tb * 1000.0);
+        long long d_ms = (long long)llround((double)pkt.duration * tb * 1000.0);
+        if (d_ms <= 0) d_ms = 1;
+        ass_process_chunk(ps->ass_track, (const char *)pkt.data, pkt.size, t_ms, d_ms);
+        av_packet_unref(&pkt);
+    }
+    /* The overlay gates on sub_valid + the PTS window; libass owns the
+     * timing, so the window is the whole file. The seek handler drops
+     * sub_valid on the demux thread; this re-arms it every drain. */
+    ps->sub_is_bitmap = 0;
+    ps->sub_start_pts = -1.0e9;
+    ps->sub_end_pts   =  1.0e12;
+    ps->sub_valid     = 1;
+}
+
+/* Render the active ASS track for one frame. frame = the video's
+ * output rectangle in physical pixels; images come back positioned
+ * inside it. Storage = the source picture, so PlayRes/blur/\org map
+ * with the right pixel aspect (libass derives it from the pair). */
+ASS_Image *sub_ass_render(PlayerState *ps, int frame_w, int frame_h,
+                          double now_sec, int *changed) {
+    if (!ps->sub_ass_active || !ps->ass_rend || !ps->ass_track) return NULL;
+    if (frame_w <= 0 || frame_h <= 0) return NULL;
+    if (ps->vid_w > 0 && ps->vid_h > 0 &&
+        (ps->vid_w != ps->ass_stor_w || ps->vid_h != ps->ass_stor_h)) {
+        ass_set_storage_size(ps->ass_rend, ps->vid_w, ps->vid_h);
+        ps->ass_stor_w = ps->vid_w;
+        ps->ass_stor_h = ps->vid_h;
+    }
+    if (frame_w != ps->ass_frame_w || frame_h != ps->ass_frame_h) {
+        ass_set_frame_size(ps->ass_rend, frame_w, frame_h);
+        ps->ass_frame_w = frame_w;
+        ps->ass_frame_h = frame_h;
+    }
+    long long now_ms = (long long)llround(now_sec * 1000.0);
+    if (now_ms < 0) now_ms = 0;
+    return ass_render_frame(ps->ass_rend, ps->ass_track, now_ms, changed);
+}
+
+void sub_ass_close_file(PlayerState *ps) {
+    sub_ass_track_close(ps);
+    if (ps->ass_rend) { ass_renderer_done(ps->ass_rend); ps->ass_rend = NULL; }
+    if (ps->ass_lib)  { ass_library_done(ps->ass_lib);   ps->ass_lib  = NULL; }
+    ps->ass_frame_w = ps->ass_frame_h = 0;
+    ps->ass_stor_w  = ps->ass_stor_h  = 0;
+}
+
+#else  /* !DSVP_HAVE_LIBASS */
+
+static void sub_ass_track_close(PlayerState *ps) { ps->sub_ass_active = 0; }
+void sub_ass_close_file(PlayerState *ps) { ps->sub_ass_active = 0; }
+
+#endif /* DSVP_HAVE_LIBASS */
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * Stream Discovery
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -746,10 +1034,26 @@ int sub_open_codec(PlayerState *ps, int stream_idx) {
     } else {
         log_msg("Subtitle extradata: none");
     }
+
+    /* ASS/SSA → libass when built with it and not switched off; every
+     * other outcome names itself so a log never leaves the path in doubt. */
+    enum AVCodecID cid = st->codecpar->codec_id;
+    if (cid == AV_CODEC_ID_ASS || cid == AV_CODEC_ID_SSA) {
+#ifdef DSVP_HAVE_LIBASS
+        if (SDL_getenv("DSVP_NO_LIBASS"))
+            log_msg("Subs: libass disabled (DSVP_NO_LIBASS) — ASS override tags stripped, house style");
+        else if (sub_ass_track_open(ps) < 0)
+            log_msg("Subs: libass track open failed — ASS override tags stripped, house style");
+#else
+        log_msg("Subs: this build has no libass — ASS override tags stripped, house style "
+                "(build with libass-dev / mingw-w64-x86_64-libass)");
+#endif
+    }
     return 0;
 }
 
 void sub_close_codec(PlayerState *ps) {
+    sub_ass_track_close(ps);   /* before the codec: the track was built from its extradata */
     if (ps->sub_codec_ctx) {
         avcodec_free_context(&ps->sub_codec_ctx);
     }
@@ -1229,6 +1533,16 @@ static void sub_decode_pending_impl(PlayerState *ps) {
 
     const int text_track = sub_track_is_text(ps);
     const int is_pgs = ps->sub_codec_ctx->codec_id == AV_CODEC_ID_HDMV_PGS_SUBTITLE;
+
+    /* ── ASS via libass: feed everything queued; libass owns timing ── */
+    if (ps->sub_ass_active) {
+#ifdef DSVP_HAVE_LIBASS
+        if (ps->sub_is_bitmap && ps->sub_bitmap_count) sub_clear_bitmaps(ps); /* track switched */
+        ps->sub_cue_count = 0;
+        sub_ass_drain(ps, spq, st);
+#endif
+        return;
+    }
 
     /* ── TEXT (M4): expire, then pop every DUE cue into the set ── */
     if (text_track) {

@@ -34,6 +34,23 @@ ifeq ($(OS),Windows_NT)
   BASE_LDFLAGS += -lshell32 -lcomdlg32
 endif
 
+# ── libass: ASS/SSA typesetting (2026-09 cycle) ──
+# Auto-detected; absent → the pre-libass path (override tags stripped,
+# house style) so the build never fails for want of it. NO_LIBASS=1
+# forces that path at build time; DSVP_NO_LIBASS=1 at run time is the
+# falsification switch (same binary, pre-change behaviour exactly).
+# Debian: libass-dev. MSYS2: mingw-w64-x86_64-libass (DirectWrite +
+# fontconfig providers; libass-9.dll rides the packager's DLL walk).
+ifneq ($(NO_LIBASS),)
+  LIBASS_STATE := libass OFF (NO_LIBASS=1) — ASS override tags stripped
+else ifeq ($(shell pkg-config --exists libass 2>/dev/null && echo yes),yes)
+  BASE_CFLAGS  += -DDSVP_HAVE_LIBASS $(shell pkg-config --cflags libass)
+  BASE_LDFLAGS += $(shell pkg-config --libs libass)
+  LIBASS_STATE := libass $(shell pkg-config --modversion libass)
+else
+  LIBASS_STATE := libass NOT FOUND (no libass.pc on PKG_CONFIG_PATH) — ASS override tags stripped; apt install libass-dev / pacman -S mingw-w64-x86_64-libass
+endif
+
 # ── SDL3_shadercross (bundled on Windows, pkg-config on Linux) ──
 ifeq ($(OS),Windows_NT)
   SC_ROOT    = deps/SDL3_shadercross-3.0.0-windows-mingw-x64
@@ -131,6 +148,7 @@ $(TARGET): $(OBJS) $(RC_OBJ)
 	$(CC) -o $@ $^ $(LDFLAGS)
 	@echo '$(STAMP_TEXT)' > $(BUILDDIR)/dsvp.stamp
 	@echo "stamp: $(STAMP_TEXT)"
+	@echo "subs:  $(LIBASS_STATE)"
 ifeq ($(OS),Windows_NT)
 	cp $(SDL3_BIN)/SDL3.dll $(BUILDDIR)/
 	cp $(SDL3_BIN)/SDL3_ttf.dll $(BUILDDIR)/

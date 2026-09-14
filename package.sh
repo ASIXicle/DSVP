@@ -122,6 +122,23 @@ if [ "$(uname)" = "Linux" ]; then
     # them (the .deb declares them; field 2026-09-06).
     SYSTEM_LIBS="linux-vdso|ld-linux|libc\.so|libm\.so|libpthread|libdl|librt\.so|libgcc_s|libstdc\+\+"
     SYSTEM_LIBS="${SYSTEM_LIBS}|libX11|libxcb|libXau|libXdmcp|libXext|libXfixes|libXrandr|libXcursor|libXi\.so|libXinerama|libXss|libdrm\.so|libgbm|libGL|libEGL|libvulkan|libwayland|libxkbcommon|libdecor"
+    # fontconfig is host-owned too (libass's font provider): its cache
+    # format and /etc/fonts configuration belong to the host's copy, and
+    # every desktop ships libfontconfig1 (the .deb declares it). libass
+    # itself and its text stack (fribidi, harfbuzz, freetype, unibreak)
+    # ride the walk like any other library.
+    # ...and so is EXPAT, which only enters the closure through that
+    # host-owned fontconfig. Field 2026-09-14, first package.sh run on
+    # dellbian since libass landed: the walk bundled libexpat (it is in
+    # the flattened closure) but the host's libfontconfig is what loads
+    # it, and that copy has no $ORIGIN RUNPATH — so ldd resolved
+    # /lib/x86_64-linux-gnu/libexpat.so.1 and the post-check failed on a
+    # bundle that would in fact have run fine. Host-owning a library
+    # means host-owning its dependencies: bundling half of fontconfig's
+    # closure produces a copy that can never be the one that loads. Any
+    # machine with libfontconfig1 has libexpat1 (fontconfig Depends on
+    # it), so this adds no burden to the tarball or the .deb.
+    SYSTEM_LIBS="${SYSTEM_LIBS}|libfontconfig|libexpat"
 
     # The libdirs the binary was LINKED against (pkg-config). Any SDL or
     # FFmpeg library that ldd resolves OUTSIDE these directories is the

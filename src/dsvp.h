@@ -34,13 +34,16 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #include <SDL3_ttf/SDL_ttf.h>
+#ifdef DSVP_HAVE_LIBASS
+#include <ass/ass.h>            /* ASS/SSA typesetting renderer (optional, Makefile-detected) */
+#endif
 
 /* SDL3 shadercross — runtime HLSL→SPIRV→native compilation */
 #include <SDL3_shadercross/SDL_shadercross.h>
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.3.7-beta"
+#define DSVP_VERSION        "0.3.8-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -87,6 +90,8 @@ typedef struct BitstreamCaps {
     int  hbr_capable;      /* HDMI supports High Bit Rate (TrueHD req) */
     int  max_channels;     /* max channel count reported by sink       */
     int  probed;           /* 1 = caps have been queried this session   */
+    int  platform_unsupported; /* 1 = no probe exists here (Windows); the
+                                  panel says so and audio_open stops asking */
 } BitstreamCaps;
 
 /* ── Packet Queue ───────────────────────────────────────────────────
@@ -280,6 +285,14 @@ typedef struct PlayerState {
     SDL_Window         *window;
     SDL_AudioStream    *audio_stream;    /* SDL3: owns the device        */
     SDL_AudioSpec       audio_spec;       /* actual device spec           */
+    /* AUDCLK instrument (review DM19/DM20 inputs, log-only): the
+     * callback's last clock-correction inputs, read by main at the
+     * DIAG cadence. Written on the audio thread; aligned scalars,
+     * same tolerance as audio_clock_sync.                          */
+    double              aud_diag_buffered; /* pre-clamp buffered seconds  */
+    int                 aud_diag_internal; /* bytes decoded, not pushed   */
+    int                 aud_diag_stream;   /* bytes queued in SDL stream  */
+    int                 aud_diag_clamped;  /* snapshots that hit the cap  */
 
     /* ── SDL_GPU handles (lifetime: application) ── */
     SDL_GPUDevice              *gpu_device;
@@ -349,6 +362,12 @@ typedef struct PlayerState {
     double              audio_clock_sync; /* latency-corrected snapshot for main thread A/V sync */
     double              av_bias;          /* adaptive A/V offset (EMA of av_diff) */
     int                 av_bias_samples;  /* warmup counter (apply after 60)     */
+    int                 av_hold;          /* 1 = estimator frozen across a display
+                                           toggle stall (Z) until the lag clears */
+    int                 av_hold_frames;   /* frames evaluated under the hold; 120 =
+                                           fail-open release                     */
+    int                 av_trace_left;    /* AVTRACE lines still to print after a
+                                           hold release (per-frame instrument)   */
     double              audio_pts_floor;  /* post-seek: discard audio frames with PTS below this */
     double              video_clock;      /* current video PTS in secs  */
     double              frame_timer;      /* when we last showed a frame*/
@@ -365,6 +384,9 @@ typedef struct PlayerState {
      * across repos so the same greps work. */
     int                 seekdiag_vid_pending; /* 1 = log first post-seek video frame PTS */
     int                 seekdiag_aud_pending; /* 1 = log first post-seek audio frame PTS */
+    int64_t             seekdiag_target;  /* the target the demuxer actually SERVICED
+                                           (m-S1-c: seek_target is live — a second
+                                           request overwrites it mid-recovery)    */
     int                 seekdiag_target_valid; /* 1 = seek_target is from a real seek this file
                                                   (gates target/landed in the recovery log) */
 
@@ -441,6 +463,24 @@ typedef struct PlayerState {
     int                 sub_bitmap_h[MAX_SUB_BITMAPS];
     SDL_Rect            sub_bitmap_rects[MAX_SUB_BITMAPS];
     int                 sub_bitmap_count;
+
+    /* ASS/SSA typesetting via libass (2026-09 cycle — the end user's
+     * JoJo sign/SFX ask). Library + renderer live per FILE (embedded
+     * fonts are per file), the track per OPENED ASS stream. Every
+     * libass call is MAIN THREAD only (decode drain, overlay draw,
+     * S-cycle, close). Built without libass, or DSVP_NO_LIBASS=1 →
+     * the pre-libass path (tags stripped, house style). */
+#ifdef DSVP_HAVE_LIBASS
+    ASS_Library        *ass_lib;
+    ASS_Renderer       *ass_rend;
+    ASS_Track          *ass_track;
+#endif
+    int                 sub_ass_active;     /* 1 = active track renders via libass */
+    int                 ass_frame_w, ass_frame_h; /* last frame size given to libass */
+    int                 ass_stor_w, ass_stor_h;   /* last storage size given to libass */
+    int                 ass_fonts_embedded; /* attachments handed to libass this file */
+    int                 ass_msg_count;      /* libass warnings logged this file (capped) */
+    int                 ass_nopts_logged;   /* once-per-file: event without PTS/duration */
 
     /* Track change OSD */
     char                sub_osd[256];       /* "Subtitles: English" etc.    */
@@ -596,6 +636,11 @@ void  sub_close_codec(PlayerState *ps);
 void  sub_cycle(PlayerState *ps);
 void  sub_decode_pending(PlayerState *ps);
 void  sub_clear_display(PlayerState *ps);   /* drop cues + bitmaps + text (seek, close) */
+void  sub_ass_close_file(PlayerState *ps);  /* per-file libass library + renderer (player_close) */
+#ifdef DSVP_HAVE_LIBASS
+ASS_Image *sub_ass_render(PlayerState *ps, int frame_w, int frame_h,
+                          double now_sec, int *changed);
+#endif
 int   sub_init_font(void);
 void  sub_close_font(void);
 TTF_Font *sub_get_font(void);

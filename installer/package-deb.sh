@@ -311,7 +311,9 @@ if find "${PKG_DIR}/usr/lib/${PKG_NAME}/lib" -type f -name '*.so*' -exec objdump
 fi
 # The host-owned display stack (package.sh leaves it out of the bundle
 # by policy) is a hard dependency: it is DT_NEEDED by SDL/FFmpeg.
-DEPENDS="libc6 (>= ${GLIBC_FLOOR})${NEEDS_CXX}, libx11-6, libx11-xcb1, libxcb1, libxcb-dri3-0, libxext6, libxfixes3, libxau6, libxdmcp6, libdrm2, fonts-dejavu-core"
+# libfontconfig1: host-owned by package.sh (libass's font provider reads
+# the host's /etc/fonts and caches through it).
+DEPENDS="libc6 (>= ${GLIBC_FLOOR})${NEEDS_CXX}, libx11-6, libx11-xcb1, libxcb1, libxcb-dri3-0, libxext6, libxfixes3, libxau6, libxdmcp6, libdrm2, libfontconfig1, fonts-dejavu-core"
 echo "      Depends: ${DEPENDS}  [glibc floor from the binary + bundled libs]"
 
 cat > "${PKG_DIR}/DEBIAN/control" << CONTROL

@@ -16,10 +16,10 @@ Open the **MSYS2 MinGW 64-bit** shell (not MSYS2 MSYS) and run:
 
 ```bash
 pacman -Syu
-pacman -S mingw-w64-x86_64-sdl3 mingw-w64-x86_64-sdl3-ttf mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-pkg-config
+pacman -S mingw-w64-x86_64-sdl3 mingw-w64-x86_64-sdl3-ttf mingw-w64-x86_64-libass mingw-w64-x86_64-ffmpeg mingw-w64-x86_64-pkg-config
 ```
 
-This installs SDL3, SDL3_ttf, FFmpeg (8.1+), and pkg-config under `/c/msys64/mingw64/`.
+This installs SDL3, SDL3_ttf, libass (ASS/SSA typesetting; optional — the build says `subs: libass NOT FOUND` and strips ASS tags without it), FFmpeg (8.1+), and pkg-config under `/c/msys64/mingw64/`.
 
 ### Step 3: Install GCC (if you don't have it)
 
@@ -225,10 +225,14 @@ run it before a release build.
 
 ```bash
 sudo apt install gcc make pkg-config \
-    libsdl3-dev libsdl3-ttf-dev \
+    libsdl3-dev libsdl3-ttf-dev libass-dev \
     zlib1g-dev fonts-dejavu-core fonts-noto-cjk zenity
 ```
 
+`libass-dev` provides ASS/SSA typesetting — the author's styles, fonts and
+positioning. It is optional and detected at build time: without it the build
+says `subs:  libass NOT FOUND` and ASS tracks fall back to plain text with
+their override tags stripped. Check that line before packaging a release.
 `fonts-noto-cjk` provides CJK subtitle fallback. `zenity` provides the file-open dialog.
 
 ### Step 2: FFmpeg 8.1+

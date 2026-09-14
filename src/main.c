@@ -493,8 +493,11 @@ static void toggle_fullscreen(PlayerState *ps, SDL_Window *window) {
  * One file, three lines: a tag, the position in seconds, the path.
  * It lives next to the executable like the log and the shader cache
  * (the portable ethos) when that directory is writable; installed
- * builds (Program Files, /usr/lib/dsvp) fall back to the per-user
- * state dir (%LOCALAPPDATA%\DSVP, $XDG_STATE_HOME/dsvp). Nothing else
+ * builds (Program Files, /usr/lib/dsvp), which cannot write beside
+ * themselves, use the per-user state dir (%LOCALAPPDATA%\DSVP,
+ * $XDG_STATE_HOME/dsvp) instead. ONE of the two is chosen per launch
+ * (resume_which) and read, write and clear all obey that choice —
+ * see the ruling there. Nothing else
  * is recorded, nothing leaves the machine, and DSVP_NO_RESUME=1 makes
  * this code read and write nothing. Saved every 10 s while playing
  * and at every close, so a crash still resumes near the spot; cleared
@@ -588,12 +591,99 @@ static int resume_location(int which, char *out, size_t n) {
 #endif
 }
 
+/* ── A/V bias hold across a display toggle (batch 14, field 2026-09-07
+ * Win11) ──
+ * Z stalls the main thread for the whole of hdr_output_apply (display
+ * flip + swapchain switch + pipeline recompile, ~385 ms measured) while
+ * audio keeps playing. The bias EMA then LEARNED the stall: -2 → -104 ms
+ * in nine frames, and the catch-up stopped at av_diff ≈ bias — lip sync
+ * off by the stall until a seek. The estimator models output-path
+ * latency; a stall the player caused is not that. So: freeze it across
+ * the toggle, let the catch-up work the lag off against the frozen
+ * bias, and resume learning at the first clean frame. Armed on the
+ * MEASURED stall, whatever caused it: a veto that returned fast arms
+ * nothing, a veto that paid the bounded kscreen probe (dellbian, ~one
+ * frame) arms a hold that clears on the next frame — the engage line
+ * carries the number and cannot lie. DSVP_AV_NO_HOLD=1 restores the
+ * pre-change behaviour exactly. */
+static void av_hold_after_stall(PlayerState *ps, double stall) {
+    if (!ps->playing || ps->audio_stream_idx < 0) return;
+    if (stall < 0.050) return;   /* no stall — nothing to protect from */
+    if (ps->av_hold) {
+        /* A second toggle while the first hold is still working its lag
+         * off (field 2026-09-09: Z-Z 250 ms apart): the hold simply
+         * spans both — but the log must say so, or the second toggle
+         * looks unprotected. Frame budget restarts from here. */
+        ps->av_hold_frames = 0;
+        log_msg("A/V: bias hold extended — %.0f ms stall while held (bias %.1f ms)",
+                stall * 1000.0, ps->av_bias * 1000.0);
+        return;
+    }
+    if (SDL_getenv("DSVP_AV_NO_HOLD")) {
+        log_msg("A/V: bias hold disabled (DSVP_AV_NO_HOLD) — the estimator "
+                "will learn the %.0f ms toggle stall", stall * 1000.0);
+        return;
+    }
+    ps->av_hold = 1;
+    ps->av_hold_frames = 0;
+    log_msg("A/V: bias held across display toggle (%.0f ms stall, bias was %.1f ms)",
+            stall * 1000.0, ps->av_bias * 1000.0);
+}
+
+/* Which place the record lives in, decided ONCE per launch. 0 = beside
+ * the executable, 1 = the per-user state dir.
+ *
+ * Holden's ruling 2026-09-13: "Portable should remain isolated, that's
+ * why it's a portable build." So the decision is made once and read,
+ * write and clear all obey it: a portable bundle whose own directory is
+ * writable never reads, overwrites or deletes the host's per-user
+ * record, and an installed build uses the per-user dir for all three.
+ *
+ * Before this, load fell through 0 -> 1 whenever 0 held no record while
+ * write stopped at the first WRITABLE place — asymmetric, and it showed
+ * twice: a fresh portable with no record of its own silently offered the
+ * INSTALLED build's last file (field 2026-09-13, Win11, first 0.3.8-beta
+ * portable run: 'Resume: last file at 727.4 s ... C:\\Users\\...\\AppData\\
+ * Local\\DSVP'), and a portable that played a file to the end deleted the
+ * installed build's record from under it (resume_clear removed both).
+ *
+ * The probe writes and removes the same dsvp.resume.tmp the write path
+ * already uses, beside an executable we are already logging next to: no
+ * new kind of file, and nothing left behind.
+ * DSVP_RESUME_LEGACY_PATHS=1 restores the old fall-through exactly. */
+static int resume_legacy_paths(void) {
+    return SDL_getenv("DSVP_RESUME_LEGACY_PATHS") != NULL;
+}
+
+static int resume_which(void) {
+    static int cached = -1;
+    char path[1100], tmp[1110];
+    if (cached >= 0) return cached;
+    cached = 1;                              /* per-user unless proven otherwise */
+    if (resume_location(0, path, sizeof(path)) == 0) {
+        snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+        FILE *f = resume_fopen(tmp, RESUME_MODE_W);
+        if (f) { fclose(f); resume_remove(tmp); cached = 0; }
+    }
+    return cached;
+}
+
 static void resume_load(PlayerState *ps) {
     ps->resume_path[0] = '\0';
     ps->resume_pos = 0.0;
     if (!resume_enabled()) { log_msg("Resume: disabled (DSVP_NO_RESUME)"); return; }
+    const int legacy = resume_legacy_paths();
+    const int only   = legacy ? -1 : resume_which();
+    if (legacy)
+        log_msg("Resume: legacy path fall-through (DSVP_RESUME_LEGACY_PATHS) "
+                "— both places tried, as before 0.3.8-beta");
+    else
+        log_msg("Resume: record location = %s", only == 0
+                ? "beside the executable (portable — the per-user record is not read)"
+                : "per-user state dir (the executable's directory is not writable)");
     for (int which = 0; which < 2; which++) {
         char path[1100];
+        if (!legacy && which != only) continue;
         if (resume_location(which, path, sizeof(path)) != 0) continue;
         FILE *f = resume_fopen(path, RESUME_MODE_R);
         if (!f) continue;
@@ -624,12 +714,15 @@ static void resume_load(PlayerState *ps) {
 
 static void resume_write(PlayerState *ps, const char *file, double pos) {
     if (!resume_enabled()) return;
+    const int legacy = resume_legacy_paths();
+    const int only   = legacy ? -1 : resume_which();
     for (int which = 0; which < 2; which++) {
         char path[1100], tmp[1110];
+        if (!legacy && which != only) continue;
         if (resume_location(which, path, sizeof(path)) != 0) continue;
         snprintf(tmp, sizeof(tmp), "%s.tmp", path);
         FILE *f = resume_fopen(tmp, RESUME_MODE_W);
-        if (!f) continue;                    /* not writable here — next place */
+        if (!f) continue;                    /* not writable — next place, legacy only */
         fprintf(f, "DSVP-RESUME 1\n%.3f\n%s\n", pos, file);
         fclose(f);
         if (resume_replace(tmp, path) != 0) {
@@ -656,13 +749,21 @@ static void resume_save(PlayerState *ps) {
     resume_write(ps, ps->filepath, pos);
 }
 
-/* The file played to its end: nothing to come back to. */
+/* The file played to its end: nothing to come back to. The caller
+ * must NOT resume_save() after this — the file is still open at that
+ * point, and a save would put the record straight back (field 2026-09-09:
+ * every file that played to the end came back as 'Resume: last file at
+ * <duration>'). */
 static void resume_clear(PlayerState *ps) {
     ps->resume_path[0] = '\0';
     ps->resume_pos = 0.0;
     if (!resume_enabled()) return;
+    log_msg("Resume: record cleared — %s played to the end", ps->filepath);
+    const int legacy = resume_legacy_paths();
+    const int only   = legacy ? -1 : resume_which();
     for (int which = 0; which < 2; which++) {
         char path[1100];
+        if (!legacy && which != only) continue;
         if (resume_location(which, path, sizeof(path)) == 0) resume_remove(path);
     }
 }
@@ -1290,7 +1391,6 @@ int main(int argc, char *argv[]) {
                 case SDLK_Q:
                     if (ps.playing) {
                         resume_save(&ps);
-                        resume_save(&ps);
                         player_close(&ps);
                         ps.quit = 0; /* don't exit, return to idle */
                     } else {
@@ -1483,7 +1583,9 @@ int main(int argc, char *argv[]) {
                 case SDLK_Z:
                     if (ps.playing && ps.gpu_uniforms.is_hdr > 0.0f) {
                         ps.hdr_out_mode = ps.hdr_out_mode ? 0 : 1;
+                        double t_apply = get_time_sec();
                         hdr_output_apply(&ps);
+                        double apply_stall = get_time_sec() - t_apply;
                         if (ps.hdr_out_mode && !ps.hdr_out_active) {
                             /* Vetoed (no ST2084, engage failed): drop the
                              * mode back so the NEXT Z retries instead of
@@ -1499,8 +1601,10 @@ int main(int argc, char *argv[]) {
                                      ? "passthrough (display tone-maps)"
                                      : "tone-map (SDR)");
                         ps.aud_osd_until = get_time_sec() + 2.0;
-                        log_msg("HDR out: Z toggle — mode=%d active=%d",
-                                ps.hdr_out_mode, ps.hdr_out_active);
+                        log_msg("HDR out: Z toggle — mode=%d active=%d (%.0f ms)",
+                                ps.hdr_out_mode, ps.hdr_out_active,
+                                apply_stall * 1000.0);
+                        av_hold_after_stall(&ps, apply_stall);
                     }
                     break;
 
@@ -1850,6 +1954,7 @@ int main(int argc, char *argv[]) {
                     double av_diff = 0.0;
                     double av_diff_c = 0.0;
                     int one_to_one = 0;
+                    int catch_up   = 0;   /* !one_to_one, or the bias hold is on */
 
                     /* Audio can end before video (silent credits, truncated
                      * audio track). When the audio pipeline is starved —
@@ -1869,12 +1974,77 @@ int main(int argc, char *argv[]) {
                     if (audio_live) {
                         av_diff = ps.video_clock - ps.audio_clock_sync;
 
+                        /* Bias hold (Z toggle stall, see av_hold_after_stall):
+                         * the estimator stays frozen until the lag is worked
+                         * off — the first frame within one frame period of
+                         * the held bias releases it. A 120-frame budget
+                         * releases it regardless: a hold that could never
+                         * clear would stop learning for the file (fail open). */
+                        if (ps.av_hold) {
+                            double held = ps.av_bias;
+                            if (held < -0.200) held = -0.200;
+                            if (held >  0.200) held =  0.200;
+                            double band = fmax(0.020, pts_delay);
+                            double resid = av_diff - held;   /* < 0: video behind */
+                            ps.av_hold_frames++;
+                            int release = 0;
+                            if (fabs(resid) < band) {
+                                release = 1;
+                                log_msg("A/V: bias hold released after %d frame(s) — "
+                                        "A/V %.1f ms, bias %.1f ms (learning resumes)",
+                                        ps.av_hold_frames, av_diff * 1000.0,
+                                        ps.av_bias * 1000.0);
+                            } else if (ps.av_hold_frames >= 120) {
+                                release = 1;
+                                log_msg("A/V: bias hold expired after %d frames — "
+                                        "A/V %.1f ms still %.1f ms off the bias; "
+                                        "learning resumes (fail open)",
+                                        ps.av_hold_frames, av_diff * 1000.0,
+                                        resid * 1000.0);
+                            }
+                            if (release) {
+                                ps.av_hold = 0;
+                                ps.av_trace_left = 90;
+                                /* Align the frame timer ONCE (the ledger's "snap
+                                 * the frame timer once", field 2026-09-09 run 2:
+                                 * the catch-up runs with delay=0 and never
+                                 * advances frame_timer, so at release it sits
+                                 * 50-70 ms behind wall time and the next frames
+                                 * present early — video overshoots ahead and
+                                 * the estimator learns THAT as bias, +25..+33).
+                                 * frame_timer = now + resid makes the next frame
+                                 * due exactly |resid| earlier (video behind) or
+                                 * later (ahead): one shot, then pts_delay cadence
+                                 * from wall time. DSVP_AV_NO_SNAP=1 leaves the
+                                 * timer where the catch-up left it (this batch's
+                                 * pre-change behaviour). */
+                                static int s_no_snap = -1;
+                                if (s_no_snap < 0)
+                                    s_no_snap = SDL_getenv("DSVP_AV_NO_SNAP") ? 1 : 0;
+                                double behind = (now - ps.frame_timer) * 1000.0;
+                                if (!s_no_snap) {
+                                    double adj = resid;
+                                    if (adj < -pts_delay) adj = -pts_delay;
+                                    if (adj >  pts_delay) adj =  pts_delay;
+                                    ps.frame_timer = now + adj;
+                                    log_msg("A/V: frame timer aligned at release "
+                                            "(was %.0f ms behind wall; next frame %+.1f ms)",
+                                            behind, adj * 1000.0);
+                                } else {
+                                    log_msg("A/V: frame timer NOT aligned (DSVP_AV_NO_SNAP) "
+                                            "— left %.0f ms behind wall", behind);
+                                }
+                            }
+                        }
+
                         /* Adaptive bias correction: EMA of av_diff
                          * absorbs systematic OS audio pipeline latency.
                          * Only the catch-up (negative) branch uses the
                          * corrected value — the slow-down (positive)
-                         * branch uses raw av_diff to avoid overcorrection. */
-                        if (!ps.seek_recovering) {
+                         * branch uses raw av_diff to avoid overcorrection.
+                         * Not while a seek recovers, not while the bias is
+                         * held across a display toggle. */
+                        if (!ps.seek_recovering && !ps.av_hold) {
                             ps.av_bias = ps.av_bias * 0.95 + av_diff * 0.05;
                             ps.av_bias_samples++;
                         }
@@ -1902,8 +2072,17 @@ int main(int argc, char *argv[]) {
                         one_to_one = (pts_delay > 0.001
                                       && pts_delay < 0.020);
 
+                        /* Under the bias hold the catch-up runs even at 1:1:
+                         * VSync pacing has no way to work a stall lag off
+                         * (drops are disabled there by design, and the
+                         * micro-correction only ever nudges by 2% of the
+                         * bias — which is exactly what the hold keeps from
+                         * absorbing the stall). The toggle already blanked
+                         * the display; a short catch-up burst after it is
+                         * the honest cost. */
+                        catch_up = !one_to_one || ps.av_hold;
                         double threshold = fmax(pts_delay, 0.01);
-                        if (!one_to_one) {
+                        if (catch_up) {
                             if (av_diff > threshold) {
                                 delay = pts_delay + av_diff;
                             } else if (av_diff_c < -threshold) {
@@ -1961,7 +2140,7 @@ int main(int argc, char *argv[]) {
                      * trigger spurious drops. Modern containers have
                      * near-zero av_diff at startup so this gate is a
                      * no-op for them. */
-                    if (!one_to_one && audio_live
+                    if (catch_up && audio_live
                             && !ps.seek_recovering
                             && ps.av_bias_samples >= 60) {
                         double drop_diff = av_diff_c;
@@ -1972,6 +2151,23 @@ int main(int argc, char *argv[]) {
                                     "(A/V drift: %.1fms)",
                                     ps.video_clock, av_diff * 1000.0);
                         }
+                    }
+
+                    /* AVTRACE: the controller's live inputs per evaluated
+                     * frame, armed by the bias hold and for 90 frames after
+                     * its release (instrument for the batch 14(a) residual —
+                     * the 10 s DIAG snapshots cannot show post-release
+                     * dynamics). h=hold av=raw c=bias-corrected b=bias
+                     * d=delay chosen ft=frame_timer-now D=dropped. */
+                    if (audio_live && (ps.av_hold || ps.av_trace_left > 0)) {
+                        if (!ps.av_hold) ps.av_trace_left--;
+                        log_msg("AVTRACE f=%d h=%d av=%.1f c=%.1f b=%.1f d=%.1f "
+                                "ft=%+.0f 1:1=%d %s",
+                                ps.diag_frames_decoded, ps.av_hold,
+                                av_diff * 1000.0, av_diff_c * 1000.0,
+                                ps.av_bias * 1000.0, delay * 1000.0,
+                                (ps.frame_timer - now) * 1000.0, one_to_one,
+                                new_frame ? "" : "D");
                     }
                 } else {
                     if (vret < 0) {
@@ -1994,7 +2190,6 @@ int main(int argc, char *argv[]) {
                          * audio-only playback) is cut off at close. */
                         log_msg("Playback finished, returning to idle");
                         resume_clear(&ps);
-                        resume_save(&ps);
                         player_close(&ps);
                         ps.quit = 0;
                     }
@@ -2061,7 +2256,7 @@ int main(int argc, char *argv[]) {
                     } else if (ps.seekdiag_target_valid
                                && (ps.seek_flags & AVSEEK_FLAG_BACKWARD)
                                && ps.video_clock >
-                                   (double)ps.seek_target / AV_TIME_BASE
+                                   (double)ps.seekdiag_target / AV_TIME_BASE
                                        + 5.0) {
                         /* Backward-landing veto (deck 8da58aa port):
                          * AVSEEK_FLAG_BACKWARD lands at a keyframe AT
@@ -2081,7 +2276,7 @@ int main(int argc, char *argv[]) {
                                 "backward seek landed %.1fs ABOVE "
                                 "target (flush survivor?)",
                                 ps.video_clock
-                                    - (double)ps.seek_target
+                                    - (double)ps.seekdiag_target
                                         / AV_TIME_BASE);
                     }
                 }
@@ -2111,9 +2306,9 @@ int main(int argc, char *argv[]) {
                         log_msg("DIAG: seek recovery complete at %.3fs "
                                 "(target %.3f, landed %+.3fs)",
                                 ps.video_clock,
-                                (double)ps.seek_target / AV_TIME_BASE,
+                                (double)ps.seekdiag_target / AV_TIME_BASE,
                                 ps.video_clock
-                                    - (double)ps.seek_target
+                                    - (double)ps.seekdiag_target
                                         / AV_TIME_BASE);
                     else
                         log_msg("DIAG: seek recovery complete at %.3fs",
@@ -2182,6 +2377,25 @@ int main(int argc, char *argv[]) {
                         av_now * 1000.0,
                         ps.diag_max_av_drift * 1000.0,
                         ps.av_bias * 1000.0);
+                /* AUDCLK: the audio clock correction's live inputs (review
+                 * DM19/DM20 engage line; instrument only — the clock still
+                 * subtracts only the clamped stream+internal term). dev =
+                 * the device period re-queried live, so a change across a
+                 * display mode switch shows here; the correction does NOT
+                 * include it yet. */
+                if (ps.audio_stream_idx >= 0 && ps.audio_stream) {
+                    double dev_sec = 0.0;
+                    SDL_AudioDeviceID dev = SDL_GetAudioStreamDevice(ps.audio_stream);
+                    SDL_AudioSpec dspec;
+                    int dframes = 0;
+                    if (dev && SDL_GetAudioDeviceFormat(dev, &dspec, &dframes)
+                            && dspec.freq > 0)
+                        dev_sec = (double)dframes / dspec.freq;
+                    log_msg("AUDCLK: buffered=%.3f (internal %d B, stream %d B) "
+                            "dev=%.3f clamped=%d",
+                            ps.aud_diag_buffered, ps.aud_diag_internal,
+                            ps.aud_diag_stream, dev_sec, ps.aud_diag_clamped);
+                }
 #ifdef DSVP_PROFILE
 #define PROF_AVG(sum, n) ((n) > 0 ? (sum) / (n) : 0.0)
                 if (ps.prof_n > 0 || ps.prof_rb_n > 0

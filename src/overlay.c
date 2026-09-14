@@ -14,7 +14,7 @@
  *   - Media info (I key, mutually exclusive with debug)
  *   - Pause indicator
  *   - Track-change / volume OSD
- *   - Subtitles (SDL_ttf rendered)
+ *   - Subtitles (SDL_ttf rendered; libass images composited when built with it)
  */
 
 #include "dsvp.h"
@@ -365,6 +365,81 @@ static void blit_rgba_scaled(uint8_t *buf, int bw, int bh,
 }
 
 
+#ifdef DSVP_HAVE_LIBASS
+/* Composite one libass image onto the overlay buffer. The image is an
+ * 8-bit coverage bitmap (stride-padded except possibly the last row)
+ * with ONE colour: RGBA where the A byte is INVERTED (0 = opaque, as
+ * ASS writes it). Straight-alpha "over" in integer math — this runs
+ * for every glyph/outline/shadow layer of every frame during \move
+ * and \t animations, and DM16 already convicted the float path for
+ * the SDL_ttf lines. Dirty rows accumulate like the other blits.
+ * No scaling: libass rasterises at the output size (ETHOS — nothing
+ * resamples the author's glyphs a second time). */
+static void blit_ass_image(uint8_t *buf, int bw, int bh,
+                           const ASS_Image *img, int origin_x, int origin_y) {
+    if (!img || !img->bitmap || img->w <= 0 || img->h <= 0) return;
+    const uint32_t c = img->color;
+    const unsigned r = (c >> 24) & 0xFFu, g = (c >> 16) & 0xFFu, b = (c >> 8) & 0xFFu;
+    const unsigned opacity = 255u - (c & 0xFFu);
+    if (opacity == 0) return;
+
+    const int dst_x = origin_x + img->dst_x;
+    const int dst_y = origin_y + img->dst_y;
+    int y0 = (dst_y < 0) ? 0 : dst_y;
+    int y1 = dst_y + img->h;
+    if (y1 > bh) y1 = bh;
+    if (y1 <= y0) return;
+    if (dst_x >= bw || dst_x + img->w <= 0) return;
+    if (y0 < s_frame_y0) s_frame_y0 = y0;
+    if (y1 > s_frame_y1) s_frame_y1 = y1;
+
+    const int stride = bw * 4;
+    for (int sy = 0; sy < img->h; sy++) {
+        const int dy = dst_y + sy;
+        if (dy < 0 || dy >= bh) continue;
+        const uint8_t *src_row = img->bitmap + (size_t)sy * (size_t)img->stride;
+        uint8_t *dst_row = buf + (size_t)dy * (size_t)stride;
+        for (int sx = 0; sx < img->w; sx++) {
+            const int dx = dst_x + sx;
+            if (dx < 0 || dx >= bw) continue;
+            const unsigned sa = (src_row[sx] * opacity + 127u) / 255u;   /* 0..255 */
+            if (sa == 0) continue;
+            uint8_t *dp = dst_row + (size_t)dx * 4;
+            const unsigned da = dp[3];
+            if (sa == 255u || da == 0) {
+                dp[0] = (uint8_t)r; dp[1] = (uint8_t)g; dp[2] = (uint8_t)b;
+                dp[3] = (uint8_t)sa;
+                continue;
+            }
+            /* out_a = sa + da(1-sa); out_c = (sc·sa + dc·da(1-sa)) / out_a,
+             * everything scaled by 255: den = out_a·255. Max numerator
+             * 255³ fits unsigned. */
+            const unsigned inv = 255u - sa;
+            const unsigned den = sa * 255u + da * inv;
+            dp[0] = (uint8_t)((r * sa * 255u + dp[0] * da * inv) / den);
+            dp[1] = (uint8_t)((g * sa * 255u + dp[1] * da * inv) / den);
+            dp[2] = (uint8_t)((b * sa * 255u + dp[2] * da * inv) / den);
+            dp[3] = (uint8_t)((den + 127u) / 255u);
+        }
+    }
+}
+#endif /* DSVP_HAVE_LIBASS */
+
+
+/* The video's output rectangle in overlay (physical) pixels: display_rect
+ * is in logical window coordinates. One mapping for every subtitle kind
+ * so bitmap and ASS placement can never disagree. */
+static void video_rect_px(const PlayerState *ps, int bw, int bh,
+                          int *x, int *y, int *w, int *h) {
+    double px_sx = (ps->win_w > 0) ? (double)bw / ps->win_w : 1.0;
+    double px_sy = (ps->win_h > 0) ? (double)bh / ps->win_h : 1.0;
+    *x = (int)(ps->display_rect.x * px_sx);
+    *y = (int)(ps->display_rect.y * px_sy);
+    *w = (int)(ps->display_rect.w * px_sx);
+    *h = (int)(ps->display_rect.h * px_sy);
+}
+
+
 /* UI scale factor: 1× in windowed mode, 2× in fullscreen.
  * Set at the top of overlay_render() and overlay_render_idle()
  * before any draw calls. Multiplied into all hardcoded pixel
@@ -675,6 +750,36 @@ static void draw_subtitles(uint8_t *buf, int bw, int bh, PlayerState *ps) {
     double now = (ps->audio_stream_idx >= 0) ? ps->audio_clock_sync : ps->video_clock;
     if (now < ps->sub_start_pts || now > ps->sub_end_pts) return;
 
+#ifdef DSVP_HAVE_LIBASS
+    /* ASS via libass — rendered at the video's output size, images
+     * positioned inside the video rectangle (same mapping as bitmaps). */
+    if (ps->sub_ass_active) {
+        int dr_x, dr_y, dr_w, dr_h;
+        video_rect_px(ps, bw, bh, &dr_x, &dr_y, &dr_w, &dr_h);
+        /* Render clock = the PRESENTED FRAME's PTS, not the audio clock.
+         * This runs every display tick (60 Hz) while the picture steps
+         * at the file's rate; an animated tag (\move, \t) sampled at the
+         * continuously advancing audio clock slides between frames and
+         * the picture then jumps under it — a sign pinned to a pan
+         * shimmers (field 2026-09-09, JoJo leg, Holden's eye: "very
+         * obvious"). Sampled at the frame PTS the sign moves only when
+         * the frame does, by exactly the frame's time step. Falsification
+         * DSVP_ASS_AUDIO_CLOCK=1 restores the audio clock exactly. */
+        static int s_ass_audio_clock = -1;
+        if (s_ass_audio_clock < 0) {
+            const char *e = SDL_getenv("DSVP_ASS_AUDIO_CLOCK");
+            s_ass_audio_clock = (e && e[0] == '1') ? 1 : 0;
+        }
+        double ass_now = (ps->video_stream_idx >= 0 && !s_ass_audio_clock)
+                       ? ps->video_clock : now;
+        int changed = 0;
+        for (ASS_Image *img = sub_ass_render(ps, dr_w, dr_h, ass_now, &changed);
+             img; img = img->next)
+            blit_ass_image(buf, bw, bh, img, dr_x, dr_y);
+        return;
+    }
+#endif
+
     /* Bitmap subtitles — scale from canvas coords to overlay pixel buffer */
     if (ps->sub_is_bitmap && ps->sub_bitmap_count > 0) {
         int canvas_w = (ps->sub_codec_ctx && ps->sub_codec_ctx->width > 0)
@@ -683,12 +788,8 @@ static void draw_subtitles(uint8_t *buf, int bw, int bh, PlayerState *ps) {
             ? ps->sub_codec_ctx->height : ps->vid_h;
 
         /* Map display_rect from logical window coords to physical overlay pixels */
-        double px_sx = (ps->win_w > 0) ? (double)bw / ps->win_w : 1.0;
-        double px_sy = (ps->win_h > 0) ? (double)bh / ps->win_h : 1.0;
-        int dr_x = (int)(ps->display_rect.x * px_sx);
-        int dr_y = (int)(ps->display_rect.y * px_sy);
-        int dr_w = (int)(ps->display_rect.w * px_sx);
-        int dr_h = (int)(ps->display_rect.h * px_sy);
+        int dr_x, dr_y, dr_w, dr_h;
+        video_rect_px(ps, bw, bh, &dr_x, &dr_y, &dr_w, &dr_h);
 
         double sx = (canvas_w > 0) ? (double)dr_w / canvas_w : 1.0;
         double sy = (canvas_h > 0) ? (double)dr_h / canvas_h : 1.0;

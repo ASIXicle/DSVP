@@ -104,9 +104,12 @@ Section "DSVP (required)" SecCore
     SetOutPath "$INSTDIR"
 
     ; Copy everything from DSVP-portable/ (embedded at compile time).
-    ; /x dsvp.log: a test-run of the portable build before makensis
-    ; must not ship its log file.
-    File /r /x dsvp.log "..\${PORTABLE_DIR}\*.*"
+    ; /x dsvp.log, /x dsvp.resume: a test-run of the portable build
+    ; before makensis must not ship its log or its resume record
+    ; (build-installer.ps1 rebuilds the bundle first, but a bare
+    ; makensis after a manual run would embed both — TODO-X64 hygiene
+    ; item, 2026-09-08).
+    File /r /x dsvp.log /x dsvp.resume /x dsvp.resume.tmp "..\${PORTABLE_DIR}\*.*"
 
     ; Write uninstaller
     WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -199,6 +202,7 @@ Section "Uninstall"
     Delete "$INSTDIR\LICENSE"
     Delete "$INSTDIR\README.txt"
     Delete "$INSTDIR\dsvp.log"
+    Delete "$INSTDIR\dsvp.resume"       ; only if the user chose a writable install dir
     Delete "$INSTDIR\uninstall.exe"
     RMDir /r "$INSTDIR\shadercaches"   ; app-owned cache dir only
     RMDir "$INSTDIR"                     ; removes only if now empty
