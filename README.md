@@ -36,7 +36,7 @@ https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=ms
 - **Multi-threaded decoding** — adaptive thread count per codec (HEVC up to 12, H.264 up to 8, others up to 16), capped to logical CPU count
 - **Full subtitle support** — text (SRT, ASS/SSA), bitmap (PGS, VobSub), CJK fallback fonts, golden yellow with black outline, cycle tracks with `S`
 - **ASS/SSA typesetting** — ASS tracks render through libass: the author's styles and fonts (embedded font attachments included), positioning, rotation, `\move`/`\t` animation, karaoke. A sign translation lands on the sign. `DSVP_NO_LIBASS=1` falls back to plain text in the house style.
-- **Folder navigation** — `B`/`N` keys to jump between media files in the current folder, with clickable prev/next buttons
+- **Folder navigation** — `B`/`N` keys to jump between media files in the current folder, with clickable prev/next buttons. At the end of a file the next one plays; after the last file the folder starts again from the first (`DSVP_NO_AUTOPLAY=1` stops at the end instead). An audio or subtitle track you pick with `A`/`S` carries to the next file by language and title (`DSVP_NO_KEEP_TRACKS=1` uses each file's defaults)
 - **Portable or installed** — Windows installer and Debian `.deb` package, or extract-and-run portable tarballs with all dependencies bundled
 - **Secure** — no networking, enforced: file opening runs under an FFmpeg protocol whitelist (`file` only), so even URL arguments cannot touch the network
 - **Cross-platform** — Vulkan on Windows/Linux (macOS untested)
@@ -47,18 +47,20 @@ https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=ms
 |---|---|
 | `O` | Open file |
 | `Q` | Quit / close current file |
-| `Space` | Pause / resume |
+| `Space` | Pause / resume (a seek while paused shows where it lands) |
 | `F` / double-click | Toggle fullscreen |
 | `S` | Cycle subtitle tracks (off → track 1 → track 2 → off) |
 | `A` | Cycle audio tracks |
 | `←` / `→` | Seek ±5 seconds |
+| `,` / `.` | One frame back / forward (pauses; hold to keep stepping) |
 | `↑` / `↓` | Volume up / down |
 | `B` / `N` | Previous / next file in folder |
 | `D` | Toggle debug overlay |
 | `I` | Toggle media info overlay |
+| `K` | Show every key binding (also on the idle screen) |
 | `Z` | HDR output: tone-map (SDR) ↔ passthrough (display switches to HDR; needs an HDR display) |
 | `PgUp` / `PgDn` | Previous / next chapter (MKV/MP4 chapters; OSD shows the name) |
-| `R` | On the idle screen: resume the last file where you left off |
+| `R` | On the idle screen: resume the last file where you left off, with the same audio and subtitle tracks |
 | `Esc` | Cancel the open-file dialog (Linux) |
 | `H` | Cycle HDR debug views (normal / comparison / PQ bypass / grayscale) |
 | `T` | Cycle SDR target nits (203 / 300 / 400) |
@@ -164,8 +166,8 @@ sudo apt install patchelf   # once — rewrites the shipped binary's RUNPATH
 ```
 `package.sh` refuses to package an `unknown`, `+dirty` or debug build (pass `--allow-dirty` for a test bundle), prints where every bundled library came from, sets each one's RUNPATH to `$ORIGIN` and the binary's to `$ORIGIN/lib:$ORIGIN`, and re-checks the assembled bundle with `LD_LIBRARY_PATH` unset. The X11/DRM/GL/Vulkan/Wayland stack stays on the host by design.
 
-> **Resume:** DSVP remembers the last file you watched and where you were, in a three-line
-> `dsvp.resume` next to the executable when that directory is writable — so a portable copy
+> **Resume:** DSVP remembers the last file you watched, where you were and which audio and
+> subtitle tracks were on, in a small `dsvp.resume` next to the executable when that directory is writable — so a portable copy
 > keeps its own history, and never reads or deletes the record belonging to an installed copy
 > on the same machine. An installed build cannot write beside itself, so it uses
 > `%LOCALAPPDATA%\DSVP` / `$XDG_STATE_HOME/dsvp` instead. One of the two is chosen per launch

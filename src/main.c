@@ -467,10 +467,10 @@ static void set_fullscreen(PlayerState *ps, SDL_Window *window, bool want_fs) {
         /* Same gate as the device-removed handler: resuming during an
          * in-flight seek plays run-ahead audio through the recovery
          * window, then recovery clears and clock-snaps it. */
-        if (!ps->paused && !ps->seek_request && !ps->seek_recovering
-                && !ps->seeking && ps->audio_stream)
+        if (!ps->paused && !ps->seek_request && !ps->seek_inflight
+                && !ps->seek_recovering && !ps->seeking && ps->audio_stream)
             SDL_ResumeAudioStreamDevice(ps->audio_stream);
-        else if (!ps->paused && ps->seeking)
+        else if (!ps->paused && (ps->seeking || ps->seek_inflight))
             /* Between the demux clearing seek_request (4793) and arming
              * seek_recovering (4926) neither old gate term is set, yet
              * the device is paused for the flush (review d-D2-4). */
@@ -630,6 +630,495 @@ static void av_hold_after_stall(PlayerState *ps, double stall) {
             stall * 1000.0, ps->av_bias * 1000.0);
 }
 
+/* ── Seek recovery: is the frame just popped the one recovery waits for? ──
+ * Shared by the playing branch and the paused-seek path (T1), so both
+ * judge a landing by the same two rules. Returns 1 = refused (logged). */
+static int seek_recovery_refused(PlayerState *ps) {
+    if (ps->seek_request || ps->seek_inflight) {
+        /* (A) 2026-10-06: a newer seek is requested or picked up but not
+         * yet flushed — this frame carries the current serial and is the
+         * PREVIOUS seek's. Clearing on it printed a false 'landed' and,
+         * paused, flashed that seek's picture before the right one. */
+        log_msg("SEEKDIAG: recovery clear refused — a newer seek is pending "
+                "(frame %.3fs is the previous seek's)", ps->video_clock);
+        return 1;
+    }
+    if (ps->video_frame_serial != ps->video_frame_q.flush_serial) {
+        /* Serial gate: main can legitimately pop a PRE-seek frame and
+         * spend 5-20ms displaying it while the demux thread completes
+         * the ENTIRE seek — without this check, recovery resynced every
+         * clock to the pre-seek position (the consumer-side twin of the
+         * fq_put expect_serial bug; see that comment). A mismatched
+         * serial just means: not the recovery frame yet, keep waiting.
+         * Logged now (deck 32c74b0 vocabulary) — on the deck this fired
+         * on ~40% of seeks and the engage line is the proof it works. */
+        log_msg("SEEKDIAG: recovery clear refused — "
+                "displayed frame serial=%d, seek "
+                "serial=%d", ps->video_frame_serial,
+                ps->video_frame_q.flush_serial);
+        return 1;
+    }
+    if (ps->seekdiag_target_valid
+            && ps->seekdiag_backward   /* the serviced seek's flag, not the live one */
+            && ps->video_clock >
+                (double)ps->seekdiag_target / AV_TIME_BASE + 5.0) {
+        /* Backward-landing veto (deck 8da58aa port):
+         * AVSEEK_FLAG_BACKWARD lands at a keyframe AT OR BELOW the
+         * target — a current-serial frame far ABOVE it is pre-seek
+         * content (an async flush survivor the drain missed; the serial
+         * is blind to those — decoded from old input, received under
+         * the new serial). Anchoring on one pins the audio floor minutes
+         * high and the floor then discards ALL replay audio: the 200ms
+         * stall death spiral. Refuse and wait for the honest keyframe.
+         * Fail-open is the existing 2s recovery timeout in the playing
+         * branch — no file can wedge recovery. */
+        log_msg("SEEKDIAG: recovery clear refused — "
+                "backward seek landed %.1fs ABOVE "
+                "target (flush survivor?)",
+                ps->video_clock
+                    - (double)ps->seekdiag_target / AV_TIME_BASE);
+        return 1;
+    }
+    return 0;
+}
+
+/* ── Seek recovery: the landing frame is on screen — resync and resume ── */
+static void seek_recovery_clear(PlayerState *ps) {
+    ps->seek_recovering = 0;
+    ps->seek_recovering_start = 0.0;
+    ps->av_settled_samples = 0;  /* (B): the run peak admits samples again after 30 */
+    ps->step_seek_pending = 0;   /* T2: resumed mid-step, or the step landed */
+    ps->step_dirty = 0;          /* the seek reset audio at the new spot */
+    if (strcmp(ps->aud_osd, "Stepping...") == 0)   /* a seek cancelled the step */
+        ps->aud_osd_until = 0.0;
+    ps->frame_timer = get_time_sec();
+
+    /* Re-sync clocks to the actual first-frame PTS.
+     * av_bias survives the seek — it models output-path
+     * latency, which is position-independent; zeroing it
+     * here caused the post-seek drop/judder burst. */
+    ps->audio_clock      = ps->video_clock;
+    ps->audio_clock_sync = ps->video_clock;
+    ps->audio_pts_floor  = ps->video_clock;
+    ps->frame_last_pts   = ps->video_clock;
+    /* (B) 2026-10-06: diag_max_av_drift is NOT reset here any more. The
+     * reset made it "peak since the last seek" while the DIAG line and the
+     * Playback Summary called it the peak: a seek-heavy run printed
+     * 'A/V=-65.7ms peak=-54.7ms' and a summary peak below values its own
+     * ticks had shown. Seek transients stay out by the gate where it is
+     * updated (!seek_recovering, >= 30 samples), so a whole-run peak of
+     * settled samples is what it now is. */
+
+    /* Flush stale audio and resume (paused: Space resumes it — it
+     * checks seek_recovering, which is now clear) */
+    if (ps->audio_stream) {
+        SDL_ClearAudioStream(ps->audio_stream);
+        if (!ps->paused)
+            SDL_ResumeAudioStreamDevice(ps->audio_stream);
+    }
+
+    if (ps->seekdiag_target_valid)
+        log_msg("DIAG: seek recovery complete at %.3fs "
+                "(target %.3f, landed %+.3fs)",
+                ps->video_clock,
+                (double)ps->seekdiag_target / AV_TIME_BASE,
+                ps->video_clock
+                    - (double)ps->seekdiag_target / AV_TIME_BASE);
+    else
+        log_msg("DIAG: seek recovery complete at %.3fs",
+                ps->video_clock);
+}
+
+/* ── T1 (Holden 2026-10-06): a seek while paused shows where it landed ──
+ * The decode thread keeps filling the frame queue while paused, but the
+ * paused branch only re-blitted the last picture: nothing popped the
+ * landing frame, so ←/→ or a seekbar click moved the clock and the bar
+ * and left the old picture up until Space. Now the paused branch pops
+ * (bounded per tick) until the recovery frame arrives, discarding the
+ * pre-seek frames the playing branch would have flashed.
+ * DSVP_PAUSED_SEEK_LEGACY=1 restores the old behaviour (seek landings
+ * only; frame steps are not affected).
+ *
+ * ── T2 (Holden 2026-10-06): frame step, `.` forward / `,` back ──
+ * Forward pops the next decoded frame — instant while the queue holds
+ * one. Back cannot pop: it is an EXACT seek — backward to the keyframe
+ * at or before the previous frame, then frames below step_target are
+ * decoded and discarded here, and the first one at the target is shown.
+ * Forward falls back to the same exact seek when the queue cannot
+ * deliver: while paused the demuxer stops reading once EITHER packet
+ * queue passes PACKET_QUEUE_MAX, and a paused audio queue gets there
+ * fast (256 TrueHD packets ≈ 0.2 s), so a long forward walk runs dry.
+ *
+ * Returns 0 = nothing new, 1 = a stepped frame is in ps->video_frame
+ * (display it), 2 = a seek landing is (display it, then
+ * seek_recovery_clear()). */
+static double frame_step_dur(const PlayerState *ps) {
+    AVStream *vs = ps->fmt_ctx->streams[ps->video_stream_idx];
+    if (ps->video_frame && ps->video_frame->duration > 0)
+        return (double)ps->video_frame->duration * av_q2d(vs->time_base);
+    AVRational fr = av_guess_frame_rate(ps->fmt_ctx, vs, NULL);
+    if (fr.num > 0 && fr.den > 0) return (double)fr.den / fr.num;
+    return (ps->frame_last_delay > 0.0) ? ps->frame_last_delay : 1.0 / 24.0;
+}
+
+/* ── Seek recovery fail-open (both branches since 2026-10-06) ──
+ * No video frame has been decoded for 2 s: the stream cannot land this
+ * seek (corrupt region, missing keyframe, a demuxer that cannot reach
+ * the target). Measured from the LAST decoded frame, not from the
+ * seek while PAUSED — an exact frame step decodes a whole GOP and must
+ * not be cut off while it makes progress; refused frames are not
+ * progress. Playing, nothing stamps, so it is 2 s since the seek as it
+ * always was (Win11 2026-10-06: 8.4 s of 4K AV1 was
+ * being decoded when the old 2 s-since-seek timeout fired, and its
+ * label said "no video frame in 2s" while frames arrived the whole
+ * time). The paused branch had no fail-open at all until now. */
+static int seek_recovery_stalled(const PlayerState *ps, double now) {
+    if (!ps->seek_recovering || ps->seek_recovering_start <= 0.0) return 0;
+    double since = (ps->seek_recover_last_frame > ps->seek_recovering_start)
+                 ? ps->seek_recover_last_frame : ps->seek_recovering_start;
+    return (now - since) > 2.0;
+}
+
+static void seek_recovery_timeout(PlayerState *ps, double now, const char *why) {
+    ps->seek_recovering = 0;
+    ps->seek_recovering_start = 0.0;
+    ps->av_settled_samples = 0;  /* (B): a timeout landing settles like a clear */
+    ps->frame_timer = now;
+    /* audio_clock was set to seek_pos by the demux thread. For
+     * audio-only this is exactly where audio should resume; for a video
+     * timeout it is a best-effort starting point. av_bias survives this
+     * path — it models output-path latency, position-independent. */
+    ps->audio_clock_sync = ps->audio_clock;
+    ps->audio_pts_floor  = ps->audio_clock;
+    if (ps->audio_stream) {
+        SDL_ClearAudioStream(ps->audio_stream);
+        if (!ps->paused)
+            SDL_ResumeAudioStreamDevice(ps->audio_stream);
+    }
+    if (ps->step_seek_pending) {
+        log_msg("Frame step: gave up — no frame decoded in 2 s (target %.3f); "
+                "the picture stays where it was", ps->step_target);
+        snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Frame step: no frame");
+        ps->aud_osd_until = now + 2.0;
+    }
+    /* the same step resets seek_recovery_clear makes — a timeout that
+     * left step_seek_pending set refused every later step (Win11
+     * 2026-10-06, until the next seek cleared it) */
+    ps->step_seek_pending = 0;
+    ps->step_fwd_pending  = 0;
+    ps->step_dirty        = 0;
+    log_msg("DIAG: seek recovery timeout — %s at %.3fs (%s)",
+            ps->paused ? "picture holds, audio stays paused"
+                       : "forcing audio resume",
+            ps->audio_clock, why);
+}
+
+static void step_osd(PlayerState *ps, const char *what) {
+    double t = ps->video_clock;
+    if (t < 0.0) t = 0.0;
+    int ms = (int)((t - (int)t) * 1000.0);
+    snprintf(ps->aud_osd, sizeof(ps->aud_osd), "%s  %d:%02d:%02d.%03d",
+             what, (int)t / 3600, ((int)t / 60) % 60, (int)t % 60, ms);
+    ps->aud_osd_until = get_time_sec() + 2.0;
+}
+
+/* Exact step to the frame at `target` (s): backward keyframe seek, then
+ * decode-to-target in paused_present_pop. */
+static void step_exact_seek(PlayerState *ps, double target, const char *why) {
+    if (target < 0.0) target = 0.0;
+    player_seek_abs(ps, target, 1);   /* clears any pending step... */
+    ps->step_seek_pending = 1;        /* ...so arm this one after it */
+    ps->step_target = target;
+    log_msg("Frame step: exact seek to %.3fs (%s)", target, why);
+    /* a long GOP decodes for seconds with nothing else on screen: say so
+     * (a stop condition the user cannot see is not a protocol); the
+     * landing's own OSD replaces it */
+    snprintf(ps->aud_osd, sizeof(ps->aud_osd), "Stepping...");
+    ps->aud_osd_until = get_time_sec() + 30.0;
+}
+
+static int paused_present_pop(PlayerState *ps) {
+    static int legacy = -1;
+    if (legacy < 0) {
+        legacy = SDL_getenv("DSVP_PAUSED_SEEK_LEGACY") != NULL;
+        if (legacy)
+            log_msg("Paused seek: legacy behaviour (DSVP_PAUSED_SEEK_LEGACY) — "
+                    "the picture updates only on resume");
+    }
+    if (ps->video_stream_idx < 0) return 0;
+
+    if (ps->seek_recovering) {
+        if (legacy && !ps->step_seek_pending) return 0;
+        if (ps->step_seek_pending && ps->audio_stream_idx >= 0
+                && ps->audio_pq.nb_packets > PACKET_QUEUE_MAX / 2) {
+            /* The demuxer stops reading once a packet queue passes
+             * PACKET_QUEUE_MAX and nothing drains the audio queue while
+             * paused — so an exact step whose target sits further past
+             * the keyframe than ~256 audio packets (8 s of AC3, 5 s of
+             * AAC/Opus, 0.2 s of TrueHD) could never arrive: Win11
+             * 2026-10-06, 4K AV1 + AC3, decode stopped 8.05 s past the
+             * keyframe with the target at 8.4 s. Audio below the target
+             * is dead either way (the post-seek floor discards it
+             * decoded), so drop it queued and the demuxer reads on. */
+            AVStream *as = ps->fmt_ctx->streams[ps->audio_stream_idx];
+            int64_t keep = av_rescale_q(
+                (int64_t)((ps->step_target - 0.25) * AV_TIME_BASE),
+                AV_TIME_BASE_Q, as->time_base);
+            int before = ps->audio_pq.nb_packets;
+            pq_prune_stale(&ps->audio_pq, keep);
+            int dropped = before - ps->audio_pq.nb_packets;
+            static double s_prune_said = -1.0;   /* engage line once per step */
+            if (dropped > 0 && s_prune_said != ps->step_target) {
+                s_prune_said = ps->step_target;
+                log_msg("Frame step: dropped %d queued audio packets below the "
+                        "target %.3f (the demuxer was held; more follow silently)",
+                        dropped, ps->step_target);
+            }
+        }
+        for (int n = 0; n < 8; n++) {   /* bounded: stale frames are cheap pops */
+            if (!video_decode_frame(ps)) return 0;   /* not decoded yet: next tick */
+            ps->diag_frames_decoded++;
+            if (seek_recovery_refused(ps)) continue; /* pre-seek frame: discard */
+            /* progress = an ACCEPTED frame. Knot 2026-10-06: stamped before
+             * the refusal, a seek whose every frame is refused (the
+             * backward-landing veto's flush-survivor class) reset the 2 s
+             * clock ~24 times a second and never timed out — the veto's
+             * own fail-open. Frames below the step target still count. */
+            ps->seek_recover_last_frame = get_time_sec();
+            if (ps->step_seek_pending
+                    && ps->video_clock < ps->step_target - 0.5 * frame_step_dur(ps))
+                continue;                            /* below the step target */
+            if (ps->step_seek_pending) {
+                ps->step_seek_pending = 0;
+                log_msg("Frame step: landed at %.3fs (target %.3f) — paused",
+                        ps->video_clock, ps->step_target);
+                step_osd(ps, "Frame");
+            } else {
+                /* player_open arms the same recovery: paused before the
+                 * first frame showed, this presents the first frame. */
+                log_msg("Paused: presenting the %s at %.3fs — still paused",
+                        ps->seekdiag_target_valid ? "seek's landing frame"
+                                                  : "file's first frame",
+                        ps->video_clock);
+            }
+            return 2;
+        }
+        return 0;
+    }
+
+    if (ps->step_fwd_pending) {
+        if (video_decode_frame(ps)) {
+            ps->diag_frames_decoded++;
+            ps->step_fwd_pending = 0;
+            ps->step_dirty = 1;
+            /* Clocks follow the picture while paused: text subtitles and
+             * the bar read them; the audio is resynced on resume. */
+            ps->audio_clock      = ps->video_clock;
+            ps->audio_clock_sync = ps->video_clock;
+            ps->frame_last_pts   = ps->video_clock;
+            log_msg("Frame step: +1 -> %.3fs", ps->video_clock);
+            step_osd(ps, "Frame +1");
+            return 1;
+        }
+        int starved = ps->video_pq.nb_packets == 0
+                      && ps->audio_pq.nb_packets > PACKET_QUEUE_MAX;
+        double waited = get_time_sec() - ps->step_fwd_since;
+        if (ps->eof && ps->video_pq.nb_packets == 0 && waited > 0.5) {
+            ps->step_fwd_pending = 0;
+            log_msg("Frame step: +1 refused — end of file");
+            snprintf(ps->aud_osd, sizeof(ps->aud_osd), "End of file");
+            ps->aud_osd_until = get_time_sec() + 2.0;
+        } else if (starved || waited > 1.0) {
+            /* fail open: a step that cannot be popped is seeked */
+            ps->step_fwd_pending = 0;
+            step_exact_seek(ps, ps->video_clock + frame_step_dur(ps),
+                            starved ? "forward, demuxer held by a full audio queue"
+                                    : "forward, no frame in 1 s");
+        }
+    }
+    return 0;
+}
+
+/* `.` / `,` handler. Pauses first if playing (a step is a paused act). */
+static void set_paused(PlayerState *ps, int pause);
+static void frame_step(PlayerState *ps, int dir, int repeat) {
+    if (!ps->playing || ps->video_stream_idx < 0) return;
+    if (!ps->paused) set_paused(ps, 1);
+    /* seek_inflight: between demux pickup (seek_request already 0) and
+     * the flush, every other flag here is clear — field 2026-10-06: two
+     * presses 110 ms apart issued 'exact seek to 80.706s' twice. */
+    if (ps->seek_request || ps->seek_inflight || ps->seeking
+            || ps->seek_recovering || ps->step_seek_pending
+            || ps->step_fwd_pending) {
+        if (!repeat)   /* a held key repeats ~30/s: only a real press is news */
+            log_msg("Frame step: %s ignored — the previous step or seek is still landing",
+                    dir > 0 ? "+1" : "-1");
+        return;
+    }
+    if (dir > 0) {
+        ps->step_fwd_pending = 1;
+        ps->step_fwd_since = get_time_sec();
+        return;
+    }
+    double dur = frame_step_dur(ps);
+    double start = (ps->fmt_ctx->start_time != AV_NOPTS_VALUE)
+        ? (double)ps->fmt_ctx->start_time / AV_TIME_BASE : 0.0;
+    if (ps->video_clock - dur < start - 0.5 * dur) {
+        snprintf(ps->aud_osd, sizeof(ps->aud_osd), "First frame");
+        ps->aud_osd_until = get_time_sec() + 2.0;
+        return;
+    }
+    step_exact_seek(ps, ps->video_clock - dur, "back");
+}
+
+/* Forward steps moved the picture while audio sat paused at the old
+ * spot. Its queued packets still run contiguously from there, so drop
+ * what is buffered and let the post-seek floor discard decoded audio
+ * below the picture: playback resumes in sync without a seek. */
+static void step_audio_resync(PlayerState *ps) {
+    ps->step_dirty = 0;
+    if (ps->audio_stream_idx < 0) return;
+    if (ps->audio_stream) {
+        /* barrier: no callback in flight (device is paused) */
+        SDL_LockAudioStream(ps->audio_stream);
+        SDL_UnlockAudioStream(ps->audio_stream);
+        SDL_ClearAudioStream(ps->audio_stream);
+    }
+    ps->audio_buf_size   = 0;
+    ps->audio_buf_index  = 0;
+    ps->audio_clock      = ps->video_clock;
+    ps->audio_clock_sync = ps->video_clock;
+    ps->audio_pts_floor  = ps->video_clock;
+    log_msg("Frame step: audio resynced to %.3fs on resume", ps->video_clock);
+}
+
+static void set_paused(PlayerState *ps, int pause) {
+    if (!ps->playing || ps->paused == pause) return;
+    ps->paused = pause;
+    if (!pause && ps->step_dirty && !ps->seek_request && !ps->seek_inflight
+            && !ps->seek_recovering && !ps->seeking)
+        step_audio_resync(ps);
+    if (ps->audio_stream) {
+        if (pause)
+            SDL_PauseAudioStreamDevice(ps->audio_stream);
+        else if (!ps->seek_request && !ps->seek_inflight
+                 && !ps->seek_recovering && !ps->seeking)
+            SDL_ResumeAudioStreamDevice(ps->audio_stream);
+        /* else: seek recovery owns the resume */
+    }
+    if (!pause) {
+        ps->frame_timer = get_time_sec();
+        /* Restart FPS window — the paused gap would
+         * otherwise skew the first reading on resume */
+        ps->fps_window_start   = 0.0;
+        ps->fps_window_frames  = 0;
+        ps->rfps_window_frames = 0;
+    }
+}
+
+/* ── (I) window / display events, one log line each (instrument first) ──
+ * End-user logs carried two unattributed early stalls (~0.7 s and ~1 s,
+ * no seek, no Z) and main.c logged no window event at all. Hypothesis
+ * banked, not a verdict: a title-bar drag (the Windows size/move loop
+ * blocks the message pump) or an OS HDR flip from Xbox Game Bar. These
+ * lines name either case when it happens. Moves and resizes arrive in
+ * bursts during a drag: the first of a burst is logged with the clock,
+ * the rest within 250 ms are counted onto the next line. */
+enum { WEV_MOVE, WEV_RESIZE, WEV_KINDS };
+static void win_event_log(const PlayerState *ps, int kind, const char *what,
+                          int a, int b) {
+    static double t_last[WEV_KINDS];
+    static int    held[WEV_KINDS];
+    double now = get_time_sec();
+    if (kind >= 0) {
+        if (now - t_last[kind] < 0.25) { held[kind]++; return; }
+        t_last[kind] = now;
+    }
+    double at = !ps->playing ? -1.0
+              : (ps->video_stream_idx >= 0) ? ps->video_clock : ps->audio_clock_sync;
+    char more[40] = "";
+    if (kind >= 0 && held[kind] > 0) {
+        snprintf(more, sizeof(more), " (+%d more since the last line)", held[kind]);
+        held[kind] = 0;
+    }
+    char ab[32] = "";   /* coordinates only where they mean something */
+    if (kind >= 0) snprintf(ab, sizeof(ab), " %d,%d", a, b);
+    if (at >= 0.0)
+        log_msg("Window: %s%s at %.3fs%s", what, ab, at, more);
+    else
+        log_msg("Window: %s%s (idle)%s", what, ab, more);
+}
+
+/* ── T5: open a file carrying the kept audio/subtitle choices ──
+ * mode = TRACKS_APPLY_PREF (N/B, auto-play) or TRACKS_APPLY_RESUME (R).
+ * The audio pick happens inside player_open (before the decoder opens);
+ * the subtitle track opens here, through the same path as an S press.
+ * DSVP_NO_KEEP_TRACKS=1 = the old behaviour (each file's defaults). */
+static int open_carrying(PlayerState *ps, const char *path, int mode) {
+    static int off = -1;
+    if (off < 0) {
+        off = SDL_getenv("DSVP_NO_KEEP_TRACKS") != NULL;
+        if (off) log_msg("Tracks: kept choices off (DSVP_NO_KEEP_TRACKS)");
+    }
+    ps->track_apply = off ? TRACKS_APPLY_NONE : mode;
+    int rc = player_open(ps, path);
+    if (rc == 0) track_apply_subs(ps);
+    ps->track_apply = TRACKS_APPLY_NONE;
+    return rc;
+}
+
+/* ── T3 + T4 (Holden 2026-10-06): auto-play the next file, loop the folder ──
+ * The deck has auto-played the next file in the folder for a long time;
+ * x64 went to the idle screen at end of file. Now, at a natural end of
+ * file, the next playlist file opens (same close/open as N), and after
+ * the last one the first one opens again (T4: the deck stops at the
+ * end — a deliberate x64 divergence, Holden's ask). A file that fails to
+ * open is stepped past, as N does; a whole lap that fails, or a lap that
+ * ends in under a second (a folder of files that end as soon as they
+ * open), stops at the idle screen instead of spinning.
+ * The caller has already cleared the resume record for the finished file.
+ * Returns 1 when a file is playing again. DSVP_NO_AUTOPLAY=1 = the old
+ * behaviour (idle screen at end of file). */
+static int autoplay_next(PlayerState *ps) {
+    static double s_lap_t0 = 0.0;
+    if (SDL_getenv("DSVP_NO_AUTOPLAY")) {
+        log_msg("Auto-play: off (DSVP_NO_AUTOPLAY)");
+        return 0;
+    }
+    if (ps->playlist_count <= 0 || ps->playlist_index < 0) return 0;
+    /* Every try is a synchronous close+open inside ONE tick with no
+     * events serviced: a folder of files that fail slowly (dead share,
+     * deep probes) would freeze the loop for the whole lap. Eight in a
+     * row is the bound; N still steps one per press. */
+    int max_tries = ps->playlist_count < 8 ? ps->playlist_count : 8;
+    for (int tries = 0; tries < max_tries; tries++) {
+        int next = ps->playlist_index + 1;
+        if (next >= ps->playlist_count) {
+            double now = get_time_sec();
+            if (s_lap_t0 > 0.0 && now - s_lap_t0 < 1.0) {
+                log_msg("Auto-play: the last lap of the folder took %.2f s — "
+                        "stopping instead of looping", now - s_lap_t0);
+                s_lap_t0 = 0.0;
+                return 0;
+            }
+            s_lap_t0 = now;
+            next = 0;
+            log_msg("Auto-play: end of folder — looping to the first file");
+        }
+        player_close(ps);
+        log_msg("Auto-play next: [%d/%d] %s", next + 1, ps->playlist_count,
+                ps->playlist_files[next]);
+        ps->playlist_index = next;   /* advances on failure too, as N does */
+        if (open_carrying(ps, ps->playlist_files[next], TRACKS_APPLY_PREF) == 0) {
+            reset_gain(ps);
+            return 1;
+        }
+        log_msg("ERROR: Auto-play failed: %s", ps->playlist_files[next]);
+    }
+    log_msg("Auto-play: %d file(s) in a row would not open — idle", max_tries);
+    return 0;
+}
+
 /* Which place the record lives in, decided ONCE per launch. 0 = beside
  * the executable, 1 = the per-user state dir.
  *
@@ -671,6 +1160,8 @@ static int resume_which(void) {
 static void resume_load(PlayerState *ps) {
     ps->resume_path[0] = '\0';
     ps->resume_pos = 0.0;
+    ps->resume_aud_stream = -2;   /* T5: not recorded (0 is a real stream) */
+    ps->resume_sub_stream = -2;
     if (!resume_enabled()) { log_msg("Resume: disabled (DSVP_NO_RESUME)"); return; }
     const int legacy = resume_legacy_paths();
     const int only   = legacy ? -1 : resume_which();
@@ -690,6 +1181,30 @@ static void resume_load(PlayerState *ps) {
         char tag[32] = "", pos[64] = "", file[1024] = "";
         int ok = fgets(tag, sizeof(tag), f) && fgets(pos, sizeof(pos), f)
               && fgets(file, sizeof(file), f);
+        /* T5 optional lines; a record without them is a pre-T5 record */
+        int rec_aud = -2, rec_sub = -2;
+        TrackPref rec_pa = {0}, rec_ps = {0};
+        char line[512];
+        while (ok && fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (strncmp(line, "tracks\t", 7) == 0) {
+                if (sscanf(line + 7, "%d\t%d", &rec_aud, &rec_sub) != 2)
+                    rec_aud = rec_sub = -2;
+            } else if (strncmp(line, "pref-aud\t", 9) == 0
+                       || strncmp(line, "pref-sub\t", 9) == 0) {
+                TrackPref *tp = (line[5] == 'a') ? &rec_pa : &rec_ps;
+                char *f1 = line + 9;                 /* pos \t lang \t title */
+                char *f2 = strchr(f1, '\t');
+                char *f3 = f2 ? strchr(f2 + 1, '\t') : NULL;
+                if (!f2 || !f3) continue;
+                *f2++ = '\0';
+                *f3++ = '\0';
+                tp->set = 1;
+                tp->pos = atoi(f1);
+                snprintf(tp->lang,  sizeof(tp->lang),  "%s", f2);
+                snprintf(tp->title, sizeof(tp->title), "%s", f3);
+            }
+        }
         fclose(f);
         if (!ok || strncmp(tag, "DSVP-RESUME 1", 13) != 0) {
             log_msg("Resume: %s is not a resume record — ignored", path);
@@ -706,8 +1221,17 @@ static void resume_load(PlayerState *ps) {
         fclose(probe);
         snprintf(ps->resume_path, sizeof(ps->resume_path), "%s", file);
         ps->resume_pos = p > 0.0 ? p : 0.0;
+        ps->resume_aud_stream = rec_aud;
+        ps->resume_sub_stream = rec_sub;
+        if (rec_pa.set && !ps->pref_aud.set) ps->pref_aud = rec_pa;
+        if (rec_ps.set && !ps->pref_sub.set) ps->pref_sub = rec_ps;
         log_msg("Resume: last file at %.1f s (R on the idle screen) — record in %s",
                 ps->resume_pos, path);
+        if (rec_aud != -2 && rec_sub >= 0)
+            log_msg("Resume: tracks recorded — audio stream %d, subtitle stream %d",
+                    rec_aud, rec_sub);
+        else if (rec_aud != -2)
+            log_msg("Resume: tracks recorded — audio stream %d, subtitles off", rec_aud);
         return;
     }
 }
@@ -724,6 +1248,20 @@ static void resume_write(PlayerState *ps, const char *file, double pos) {
         FILE *f = resume_fopen(tmp, RESUME_MODE_W);
         if (!f) continue;                    /* not writable — next place, legacy only */
         fprintf(f, "DSVP-RESUME 1\n%.3f\n%s\n", pos, file);
+        /* T5: optional lines (older builds read only the first three).
+         * tracks = the active streams, for R on this same file; pref-* =
+         * the explicit A / S choices, carried to the next file. */
+        int aud = ps->playing ? ps->audio_stream_idx : -2;
+        int sub = !ps->playing ? -2
+                : (ps->sub_selection > 0 && ps->sub_selection <= ps->sub_count)
+                    ? ps->sub_stream_indices[ps->sub_selection - 1] : -1;
+        fprintf(f, "tracks\t%d\t%d\n", aud, sub);
+        if (ps->pref_aud.set)
+            fprintf(f, "pref-aud\t%d\t%s\t%s\n", ps->pref_aud.pos,
+                    ps->pref_aud.lang, ps->pref_aud.title);
+        if (ps->pref_sub.set)
+            fprintf(f, "pref-sub\t%d\t%s\t%s\n", ps->pref_sub.pos,
+                    ps->pref_sub.lang, ps->pref_sub.title);
         fclose(f);
         if (resume_replace(tmp, path) != 0) {
             log_msg("Resume: could not replace %s — trying the next place", path);
@@ -737,6 +1275,8 @@ static void resume_write(PlayerState *ps, const char *file, double pos) {
         }
         snprintf(ps->resume_path, sizeof(ps->resume_path), "%s", file);
         ps->resume_pos = pos;
+        ps->resume_aud_stream = aud;
+        ps->resume_sub_stream = sub;
         return;
     }
 }
@@ -1296,6 +1836,9 @@ int main(int argc, char *argv[]) {
     ps.video_stream_idx = -1;
     ps.audio_stream_idx = -1;
     ps.sub_active_idx   = -1;
+    ps.ui_display_scale = SDL_GetWindowDisplayScale(window);   /* (D) */
+    log_msg("Display: scale %.2f (pixel density %.2f)", ps.ui_display_scale,
+            SDL_GetWindowPixelDensity(window));
     ps.win_w = DEFAULT_WIN_W;
     ps.win_h = DEFAULT_WIN_H;
     ps.hdr_target_idx = 0;  /* default: 203 nits (industry standard) */
@@ -1384,8 +1927,9 @@ int main(int argc, char *argv[]) {
                  * close/open cycles. Volume arrows are the one binding
                  * where hold-to-repeat is wanted (clamped, idempotent). */
                 if (ev.key.repeat
-                        && ev.key.key != SDLK_UP && ev.key.key != SDLK_DOWN)
-                    break;
+                        && ev.key.key != SDLK_UP && ev.key.key != SDLK_DOWN
+                        && ev.key.key != SDLK_PERIOD && ev.key.key != SDLK_COMMA)
+                    break;   /* frame step holds to creep (T2), one step in flight at a time */
                 switch (ev.key.key) {
 
                 case SDLK_Q:
@@ -1423,7 +1967,7 @@ int main(int argc, char *argv[]) {
                          * path owns the resume then) */
                         if (was_playing) {
                             ps.frame_timer = get_time_sec();   /* also video-only (d-D1-7) */
-                            if (ps.audio_stream && !ps.seek_request
+                            if (ps.audio_stream && !ps.seek_request && !ps.seek_inflight
                                     && !ps.seek_recovering && !ps.seeking)
                                 SDL_ResumeAudioStreamDevice(ps.audio_stream);
                         }
@@ -1449,7 +1993,7 @@ int main(int argc, char *argv[]) {
                     if (!ps.playing && ps.resume_path[0]) {
                         double at = ps.resume_pos;
                         log_msg("Resume: opening %s at %.1f s (R)", ps.resume_path, at);
-                        if (player_open(&ps, ps.resume_path) != 0) {
+                        if (open_carrying(&ps, ps.resume_path, TRACKS_APPLY_RESUME) != 0) {
                             log_msg("ERROR: Failed to open: %s", ps.resume_path);
                         } else {
                             reset_gain(&ps);
@@ -1467,29 +2011,20 @@ int main(int argc, char *argv[]) {
                     break;
 
                 case SDLK_SPACE:
-                    if (ps.playing) {
-                        ps.paused = !ps.paused;
-                        if (ps.audio_stream) {
-                            if (ps.paused)
-                                SDL_PauseAudioStreamDevice(ps.audio_stream);
-                            else if (!ps.seek_request && !ps.seek_recovering
-                                     && !ps.seeking)
-                                SDL_ResumeAudioStreamDevice(ps.audio_stream);
-                            /* else: seek recovery owns the resume */
-                        }
-                        if (!ps.paused) {
-                            ps.frame_timer = get_time_sec();
-                            /* Restart FPS window — the paused gap would
-                             * otherwise skew the first reading on resume */
-                            ps.fps_window_start   = 0.0;
-                            ps.fps_window_frames  = 0;
-                            ps.rfps_window_frames = 0;
-                        }
-                    }
+                    set_paused(&ps, !ps.paused);
                     break;
 
                 case SDLK_F:
                     toggle_fullscreen(&ps, window);
+                    break;
+
+                case SDLK_K:   /* T6: every key binding (idle screen too) */
+                    ps.show_keys = !ps.show_keys;
+                    if (ps.show_keys) {
+                        ps.show_debug = 0;   /* same screen area: one panel */
+                        ps.show_info  = 0;
+                    }
+                    log_msg("Keys: binding list %s", ps.show_keys ? "shown" : "closed");
                     break;
 
                 case SDLK_D:
@@ -1497,6 +2032,7 @@ int main(int argc, char *argv[]) {
                         ps.show_debug = !ps.show_debug;
                         if (ps.show_debug) {
                             ps.show_info = 0;  /* mutually exclusive */
+                            ps.show_keys = 0;
                             player_build_debug_info(&ps);
                         }
                     }
@@ -1507,6 +2043,7 @@ int main(int argc, char *argv[]) {
                         ps.show_info = !ps.show_info;
                         if (ps.show_info) {
                             ps.show_debug = 0;  /* mutually exclusive */
+                            ps.show_keys  = 0;
                             player_build_media_info(&ps);
                         }
                     }
@@ -1620,6 +2157,14 @@ int main(int argc, char *argv[]) {
                     player_seek(&ps, -SEEK_STEP_SEC);
                     break;
 
+                case SDLK_PERIOD:   /* T2: one frame forward (pauses) */
+                    frame_step(&ps, +1, ev.key.repeat);
+                    break;
+
+                case SDLK_COMMA:    /* T2: one frame back (pauses; exact seek) */
+                    frame_step(&ps, -1, ev.key.repeat);
+                    break;
+
                 case SDLK_RIGHT:
                     player_seek(&ps, SEEK_STEP_SEC);
                     break;
@@ -1715,7 +2260,8 @@ int main(int argc, char *argv[]) {
                              * the next N/B steps past a bad file instead of
                              * retrying it forever. */
                             ps.playlist_index = next;
-                            if (player_open(&ps, ps.playlist_files[next]) == 0) {
+                            if (open_carrying(&ps, ps.playlist_files[next],
+                                              TRACKS_APPLY_PREF) == 0) {
                                 reset_gain(&ps);
                             } else {
                                 log_msg("ERROR: Failed to open: %s",
@@ -1812,11 +2358,20 @@ int main(int argc, char *argv[]) {
                                 double duration = (ps.fmt_ctx->duration != AV_NOPTS_VALUE)
                                     ? (double)ps.fmt_ctx->duration / AV_TIME_BASE : 0.0;
                                 double target = frac * duration;
-                                /* Audio-only files track position on the
-                                 * audio clock, not video_clock */
+                                /* Absolute, not relative: a relative seek
+                                 * computed from the stale clock during a
+                                 * pending seek chains onto that seek's
+                                 * target (m-S1-a) and lands off by its
+                                 * displacement. The click names a position;
+                                 * ask for it. Direction keeps the old rule: a
+                                 * click behind the playhead lands on the
+                                 * keyframe at or before it (BACKWARD), ahead
+                                 * on the next one (Knot 2026-10-06: "forward,
+                                 * as before" was wrong — incr < 0 was BACKWARD). */
                                 double curpos = (ps.video_stream_idx >= 0)
                                     ? ps.video_clock : ps.audio_clock_sync;
-                                player_seek(&ps, target - curpos);
+                                ps.chapter_nav_idx = -1;   /* a free seek ends the chapter pre-roll rule */
+                                player_seek_abs(&ps, target, target < curpos);
                             }
                         }
                     }
@@ -1852,7 +2407,7 @@ int main(int argc, char *argv[]) {
                         if (audio_open(&ps) == 0) {
                             /* Don't resume into an in-flight seek — its
                              * recovery path owns the resume then. */
-                            if (!ps.paused && !ps.seek_request
+                            if (!ps.paused && !ps.seek_request && !ps.seek_inflight
                                     && !ps.seek_recovering && !ps.seeking)
                                 SDL_ResumeAudioStreamDevice(ps.audio_stream);
                         } else {
@@ -1887,9 +2442,73 @@ int main(int argc, char *argv[]) {
             case SDL_EVENT_WINDOW_RESIZED:
                     ps.win_w = ev.window.data1;
                     ps.win_h = ev.window.data2;
+                    win_event_log(&ps, WEV_RESIZE, "resized to",
+                                  ev.window.data1, ev.window.data2);
+                break;
+
+            /* (I): log-only — nothing below changes behaviour */
+            case SDL_EVENT_WINDOW_MOVED:
+                win_event_log(&ps, WEV_MOVE, "moved to", ev.window.data1, ev.window.data2);
+                break;
+            case SDL_EVENT_WINDOW_FOCUS_LOST:
+                win_event_log(&ps, -1, "focus lost", 0, 0);
+                break;
+            case SDL_EVENT_WINDOW_FOCUS_GAINED:
+                win_event_log(&ps, -1, "focus gained", 0, 0);
+                break;
+            case SDL_EVENT_WINDOW_MINIMIZED:
+                win_event_log(&ps, -1, "minimized", 0, 0);
+                break;
+            case SDL_EVENT_WINDOW_RESTORED:
+                win_event_log(&ps, -1, "restored", 0, 0);
+                break;
+            case SDL_EVENT_WINDOW_OCCLUDED:
+                win_event_log(&ps, -1, "occluded", 0, 0);
+                break;
+            case SDL_EVENT_WINDOW_DISPLAY_CHANGED: {
+                char what[48];
+                snprintf(what, sizeof(what), "moved to display %d", (int)ev.window.data1);
+                win_event_log(&ps, -1, what, 0, 0);
                 break;
             }
+            case SDL_EVENT_WINDOW_HDR_STATE_CHANGED: {
+                /* the OS HDR toggle flipped under us (Win+Alt+B, Settings,
+                 * Game Bar) — or our own Z engage/revert */
+                bool sdl_on = SDL_GetBooleanProperty(SDL_GetWindowProperties(window),
+                                                     SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false);
+                /* Win11 2026-10-06: SDL's window property read false on all
+                 * four events (our Z on/off, the Settings toggle on/off),
+                 * so the OS is asked directly; SDL's answer stays on the
+                 * line as data when the two disagree. */
+                int os_on = hdr_sys_os_hdr_active(&ps);
+                int on = (os_on >= 0) ? os_on : (sdl_on ? 1 : 0);
+                char what[112];
+                snprintf(what, sizeof(what), "display HDR state now %s%s",
+                         !on ? "OFF"
+                             : ps.hdr_out_active ? "ON (our passthrough)"
+                                                 : "ON (not ours: tone-mapping continues)",
+                         (os_on >= 0 && (os_on != 0) != (sdl_on != 0))
+                             ? (sdl_on ? " [SDL property says on]"
+                                       : " [SDL property says off]") : "");
+                win_event_log(&ps, -1, what, 0, 0);
+                hdr_black_lift_on_hdr_state(&ps, on);   /* batch J learn-at-Z */
+                break;
+            }
+
+            case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED: {
+                /* (D) moved to a display with another scale, or the OS
+                 * setting changed: the UI scale follows on the next draw */
+                float ds = SDL_GetWindowDisplayScale(window);
+                if (ds == ps.ui_display_scale) break;   /* SDL also sends it on first show */
+                log_msg("Display: scale changed %.2f -> %.2f", ps.ui_display_scale, ds);
+                ps.ui_display_scale = ds;
+                ps.overlay_force_full = 1;   /* every row re-drawn at the new size */
+                break;
+            }
+            }
         }
+
+        hdr_black_lift_tick(&ps, get_time_sec());   /* batch J: deferred probes after an HDR switch */
 
         /* ── Render ── */
         if (ps.playing && !ps.paused) {
@@ -1910,7 +2529,7 @@ int main(int argc, char *argv[]) {
             overlay_render(&ps);
 
             /* Hide cursor when seek bar auto-hides */
-            if (!ps.show_seekbar && !ps.show_debug && !ps.show_info)
+            if (!ps.show_seekbar && !ps.show_debug && !ps.show_info && !ps.show_keys)
                 SDL_HideCursor();
 
             /* ── Video decode and A/V sync ──
@@ -1941,6 +2560,9 @@ int main(int argc, char *argv[]) {
                 if (vret > 0) {
                     decoded_this_tick++;
                     ps.diag_frames_decoded++;
+                    /* no progress stamp here: playing, recovery clears on the
+                     * first frame accepted AND displayed, so 2 s since the seek
+                     * is the rule, as it was (Knot 2026-10-06) */
 
                     /* Compute inter-frame delay from PTS */
                     double pts_delay = ps.video_clock - ps.frame_last_pts;
@@ -2047,6 +2669,7 @@ int main(int argc, char *argv[]) {
                         if (!ps.seek_recovering && !ps.av_hold) {
                             ps.av_bias = ps.av_bias * 0.95 + av_diff * 0.05;
                             ps.av_bias_samples++;
+                            ps.av_settled_samples++;
                         }
                         av_diff_c = av_diff;
                         if (ps.av_bias_samples >= 60) {
@@ -2097,8 +2720,14 @@ int main(int argc, char *argv[]) {
                             delay = pts_delay + bias * 0.02;
                         }
 
-                        if (!ps.seek_recovering
-                                && ps.av_bias_samples >= 30
+                        /* (B) settled = not recovering, not under the Z-toggle
+                         * bias hold, and 30 samples past the last landing —
+                         * the old gate used av_bias_samples, reset only at
+                         * open, and let a Z stall or a timeout burst become
+                         * the "whole run, settled" peak (Win11 2026-10-06:
+                         * -295 ms, the burst after a recovery timeout). */
+                        if (!ps.seek_recovering && !ps.av_hold
+                                && ps.av_settled_samples >= 30
                                 && fabs(av_diff) > fabs(ps.diag_max_av_drift))
                             ps.diag_max_av_drift = av_diff;
                     }
@@ -2181,16 +2810,25 @@ int main(int argc, char *argv[]) {
                         resume_save(&ps);
                         player_close(&ps);
                         ps.quit = 0;
-                    } else if (ps.eof && ps.video_pq.nb_packets == 0
+                    } else if (ps.eof && !ps.seeking && !ps.seek_request
+                                    && !ps.seek_inflight   /* a seek flushes both
+                                       queues before the demuxer clears eof: with
+                                       the tail queued (eof=1 ~10 s early) a seek
+                                       read here as end of file — and since T3
+                                       that clears the record and opens the next
+                                       file (review 2026-10-06) */
+                                    && ps.video_pq.nb_packets == 0
                                     && ps.audio_pq.nb_packets == 0
                                     && (!ps.audio_stream
                                         || SDL_GetAudioStreamQueued(ps.audio_stream) <= 0)) {
                         /* Wait for SDL's queued audio to drain too —
                          * otherwise the tail of the audio (matters for
                          * audio-only playback) is cut off at close. */
-                        log_msg("Playback finished, returning to idle");
                         resume_clear(&ps);
-                        player_close(&ps);
+                        if (!autoplay_next(&ps)) {
+                            log_msg("Playback finished, returning to idle");
+                            player_close(&ps);
+                        }
                         ps.quit = 0;
                     }
                     break;
@@ -2233,87 +2871,10 @@ int main(int argc, char *argv[]) {
                  *     negative drift, burst of frame drops.
                  */
                 int recovery_refused = 0;
-                if (ps.seek_recovering) {
-                    if (ps.video_frame_serial
-                            != ps.video_frame_q.flush_serial) {
-                        /* Serial gate: main can legitimately pop a
-                         * PRE-seek frame and spend 5-20ms displaying
-                         * it while the demux thread completes the
-                         * ENTIRE seek — without this check, recovery
-                         * resynced every clock to the pre-seek
-                         * position (the consumer-side twin of the
-                         * fq_put expect_serial bug; see that
-                         * comment). A mismatched serial just means:
-                         * not the recovery frame yet, keep waiting.
-                         * Logged now (deck 32c74b0 vocabulary) — on
-                         * the deck this fired on ~40% of seeks and
-                         * the engage line is the proof it works. */
-                        recovery_refused = 1;
-                        log_msg("SEEKDIAG: recovery clear refused — "
-                                "displayed frame serial=%d, seek "
-                                "serial=%d", ps.video_frame_serial,
-                                ps.video_frame_q.flush_serial);
-                    } else if (ps.seekdiag_target_valid
-                               && (ps.seek_flags & AVSEEK_FLAG_BACKWARD)
-                               && ps.video_clock >
-                                   (double)ps.seekdiag_target / AV_TIME_BASE
-                                       + 5.0) {
-                        /* Backward-landing veto (deck 8da58aa port):
-                         * AVSEEK_FLAG_BACKWARD lands at a keyframe AT
-                         * OR BELOW the target — a current-serial frame
-                         * far ABOVE it is pre-seek content (an async
-                         * flush survivor the drain missed; the serial
-                         * is blind to those — decoded from old input,
-                         * received under the new serial). Anchoring on
-                         * one pins the audio floor minutes high and
-                         * the floor then discards ALL replay audio:
-                         * the 200ms stall death spiral. Refuse and
-                         * wait for the honest keyframe. Fail-open is
-                         * the existing 2s recovery timeout below — no
-                         * file can wedge recovery. */
-                        recovery_refused = 1;
-                        log_msg("SEEKDIAG: recovery clear refused — "
-                                "backward seek landed %.1fs ABOVE "
-                                "target (flush survivor?)",
-                                ps.video_clock
-                                    - (double)ps.seekdiag_target
-                                        / AV_TIME_BASE);
-                    }
-                }
-                if (ps.seek_recovering && !recovery_refused) {
-                    ps.seek_recovering = 0;
-                    ps.seek_recovering_start = 0.0;
-                    ps.frame_timer = get_time_sec();
-
-                    /* Re-sync clocks to the actual first-frame PTS.
-                     * av_bias survives the seek — it models output-path
-                     * latency, which is position-independent; zeroing it
-                     * here caused the post-seek drop/judder burst. */
-                    ps.audio_clock      = ps.video_clock;
-                    ps.audio_clock_sync = ps.video_clock;
-                    ps.audio_pts_floor  = ps.video_clock;
-                    ps.frame_last_pts   = ps.video_clock;
-                    ps.diag_max_av_drift = 0.0;
-
-                    /* Flush stale audio and resume */
-                    if (ps.audio_stream) {
-                        SDL_ClearAudioStream(ps.audio_stream);
-                        if (!ps.paused)
-                            SDL_ResumeAudioStreamDevice(ps.audio_stream);
-                    }
-
-                    if (ps.seekdiag_target_valid)
-                        log_msg("DIAG: seek recovery complete at %.3fs "
-                                "(target %.3f, landed %+.3fs)",
-                                ps.video_clock,
-                                (double)ps.seekdiag_target / AV_TIME_BASE,
-                                ps.video_clock
-                                    - (double)ps.seekdiag_target
-                                        / AV_TIME_BASE);
-                    else
-                        log_msg("DIAG: seek recovery complete at %.3fs",
-                                ps.video_clock);
-                }
+                if (ps.seek_recovering)
+                    recovery_refused = seek_recovery_refused(&ps);
+                if (ps.seek_recovering && !recovery_refused)
+                    seek_recovery_clear(&ps);
             }
 
             /* Audio-only / no-video-frame fallback for seek recovery.
@@ -2325,49 +2886,31 @@ int main(int argc, char *argv[]) {
              * forever. For video files where the seek lands on an
              * unrecoverable region (corrupt stream, missing keyframe),
              * a 2-second timeout forces resume so the user isn't left
-             * in silence.
+             * in silence. Since 2026-10-06 the 2 s run from the LAST
+             * decoded frame (seek_recovery_stalled), and the paused
+             * branch has the same fail-open.
              *
              * Either branch is mutually exclusive with the in-display
              * recovery — that one already cleared seek_recovering. */
             if (ps.playing && ps.seek_recovering
-                    && (ps.video_stream_idx < 0
-                        || (ps.seek_recovering_start > 0.0
-                            && (now - ps.seek_recovering_start) > 2.0))) {
-                ps.seek_recovering = 0;
-                ps.seek_recovering_start = 0.0;
-                ps.frame_timer = now;
-                /* audio_clock was set to seek_pos by the demux thread.
-                 * For audio-only this is exactly where we want audio
-                 * to resume; for video-timeout it's a best-effort
-                 * starting point. */
-                ps.audio_clock_sync = ps.audio_clock;
-                ps.audio_pts_floor  = ps.audio_clock;
-                /* av_bias survives this path too — it models output-path
-                 * latency, position-independent by design; zeroing it here
-                 * (only) let the post-seek judder burst return on the
-                 * timeout-recovery path, inconsistent with the normal
-                 * recovery branch above. */
-                if (ps.audio_stream) {
-                    SDL_ClearAudioStream(ps.audio_stream);
-                    if (!ps.paused)
-                        SDL_ResumeAudioStreamDevice(ps.audio_stream);
-                }
-                log_msg("DIAG: seek recovery timeout — forcing audio "
-                        "resume at %.3fs (%s)",
-                        ps.audio_clock,
-                        (ps.video_stream_idx < 0)
-                            ? "audio-only file"
-                            : "no video frame in 2s");
-            }
+                    && (ps.video_stream_idx < 0 || seek_recovery_stalled(&ps, now)))
+                seek_recovery_timeout(&ps, now,
+                    (ps.video_stream_idx < 0) ? "audio-only file"
+                                              : "no video frame in 2s");
 
             /* Periodic diagnostics (every 10 seconds) */
             if (ps.playing && now - ps.diag_last_report >= 10.0) {
                 resume_save(&ps);   /* every 10 s: a crash still resumes near here */
                 double av_now = (ps.audio_stream_idx >= 0)
                     ? ps.video_clock - ps.audio_clock_sync : 0.0;
+                /* (B): this tick's A/V is ungated; the peak counts only
+                 * settled samples — say so when this one is not, or the
+                 * line can show an A/V bigger than its own peak. */
+                int settling = ps.seek_recovering || ps.av_hold
+                               || ps.av_settled_samples < 30;
                 log_msg("DIAG: [%.0fs] decoded=%d displayed=%d "
                         "dropped=%d multi_ticks=%d snaps=%d "
-                        "A/V=%.1fms peak=%.1fms bias=%.1fms",
+                        "A/V=%.1fms%s peak=%.1fms bias=%.1fms",
                         ps.video_clock,
                         ps.diag_frames_decoded,
                         ps.diag_frames_displayed,
@@ -2375,6 +2918,7 @@ int main(int argc, char *argv[]) {
                         ps.diag_multi_decodes,
                         ps.diag_timer_snaps,
                         av_now * 1000.0,
+                        settling ? " (settling, not in peak)" : "",
                         ps.diag_max_av_drift * 1000.0,
                         ps.av_bias * 1000.0);
                 /* AUDCLK: the audio clock correction's live inputs (review
@@ -2484,7 +3028,8 @@ int main(int argc, char *argv[]) {
 
 
         } else if (ps.playing && ps.paused) {
-            /* Paused — decode pending subs, render overlays, redraw current frame */
+            /* Paused — decode pending subs, render overlays, redraw current
+             * frame; a seek made while paused presents its landing (T1) */
             if (ps.video_stream_idx < 0) {
                 /* Audio-only: refresh physical dims (see playing branch) */
                 int pw, phh;
@@ -2492,11 +3037,21 @@ int main(int argc, char *argv[]) {
                 ps.sc_w = pw;
                 ps.sc_h = phh;
             }
+            int landed = paused_present_pop(&ps);   /* before overlay: bar + subs read video_clock */
+            if (!landed && ps.video_stream_idx >= 0) {
+                double tnow = get_time_sec();
+                if (seek_recovery_stalled(&ps, tnow))
+                    seek_recovery_timeout(&ps, tnow, "paused, no video frame in 2s");
+            }
             sub_decode_pending(&ps);
             overlay_render(&ps);
-            if (!ps.show_seekbar && !ps.show_debug && !ps.show_info)
+            if (!ps.show_seekbar && !ps.show_debug && !ps.show_info && !ps.show_keys)
                 SDL_HideCursor();
-            if (ps.gpu_tex_y && ps.video_ready) {
+            if (landed) {
+                video_display(&ps);
+                ps.diag_frames_displayed++;
+                if (landed == 2) seek_recovery_clear(&ps);
+            } else if (ps.gpu_tex_y && ps.video_ready) {
                 video_reblit(&ps);
             } else if (ps.video_stream_idx < 0) {
                 /* Audio-only: no video texture — background + overlay */

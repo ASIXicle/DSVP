@@ -440,20 +440,54 @@ static void video_rect_px(const PlayerState *ps, int bw, int bh,
 }
 
 
-/* UI scale factor: 1× in windowed mode, 2× in fullscreen.
- * Set at the top of overlay_render() and overlay_render_idle()
- * before any draw calls. Multiplied into all hardcoded pixel
- * sizes (bar heights, margins, font scales, padding). */
-/* UI scale derives from the swapchain's physical height — NOT the
- * fullscreen flag, which is only a proxy for "compositor scaled 2x" and
- * is wrong in both directions: windowed on a HiDPI/4K display rendered
- * half-size UI, fullscreen on a small panel doubled it for no reason.
- * main.c's seekbar hit-testing calls this same function, so clicks
- * cannot land where the bar is not. */
+/* UI scale factor: a whole number, multiplied into every hardcoded pixel
+ * size (bar heights, margins, font scales, padding) — whole steps keep the
+ * 5x7 bitmap font crisp (nearest, no resampling). Set at the top of
+ * overlay_render() and overlay_render_idle() before any draw calls, and
+ * main.c's seekbar hit-testing calls this same function, so clicks cannot
+ * land where the bar is not.
+ *
+ * Two inputs, the larger wins:
+ *  - the swapchain's PHYSICAL height (>= 1600 -> 2): unchanged from before.
+ *    NOT the fullscreen flag, which is only a proxy for "compositor scaled
+ *    2x" and is wrong in both directions.
+ *  - (D, end-user ask 2026-09-14; Holden's go 2026-10-06) the OS display
+ *    scale, rounded. Height alone cannot tell a 32" 4K panel from a 27"
+ *    1440p one: the field user's window was 80% of a 4K desktop, 3072x1286,
+ *    scale 1 under the height rule, "very difficult to read". The OS scale
+ *    is the user's own setting for exactly that question (150% would give
+ *    2; their actual value is unverified until a log carries the 'UI
+ *    scale:' line). Capped at one step per 540 physical rows: the
+ *    idle menu needs ~445 rows per step, so a 1080p laptop at 150% keeps 1
+ *    in an 864-row window and still fits.
+ * DSVP_UI_SCALE_LEGACY=1 = the height rule alone (the old behaviour). */
 int ui_scale_for(const PlayerState *ps, int sc_h) {
-    (void)ps;
-    if (sc_h >= 1600) return 2;
-    return 1;
+    static int legacy = -1;
+    static int s_last = 0;
+    static float s_last_ds = -1.0f;
+    if (legacy < 0) legacy = SDL_getenv("DSVP_UI_SCALE_LEGACY") != NULL;
+    int by_h = (sc_h >= 1600) ? 2 : 1;
+    int s = by_h, by_os = 0, os_raw = 0, fit = sc_h / 540;
+    float ds = ps ? ps->ui_display_scale : 0.0f;
+    if (!legacy && ds > 0.0f) {
+        os_raw = by_os = (int)(ds + 0.5f);
+        if (by_os > fit) by_os = fit;
+        if (by_os > s) s = by_os;
+    }
+    if (s > 4) s = 4;
+    if (s != s_last || ds != s_last_ds) {
+        /* the cap is named only when it bit (field 2026-10-06: the line
+         * said "capped by height" on every print — a label that lied) */
+        char cap[48] = "";
+        if (os_raw > by_os)
+            snprintf(cap, sizeof(cap), ", held to %d by the %d-row height", by_os, sc_h);
+        log_msg("UI scale: %d (display scale %.2f -> %d%s; height %d -> %d%s)",
+                s, ds, os_raw, cap, sc_h, by_h,
+                legacy ? "; DSVP_UI_SCALE_LEGACY: height rule only" : "");
+        s_last = s;
+        s_last_ds = ds;
+    }
+    return s;
 }
 
 static int s_ui_scale = 1;
@@ -683,7 +717,8 @@ static void draw_menubar(uint8_t *buf, int bw, int bh) {
     const char *items[] = {
         "[O] Open",  "[Space] Pause",  "[F] Fullscreen",
         "[D] Debug",  "[I] Info",  "[S] Sub",
-        "[A] Audio",  "[B] Prev",  "[N] Next",  "[Q] Close",  NULL
+        "[A] Audio",  "[B] Prev",  "[N] Next",  "[Q] Close",
+        "[K] Bindings",   /* T7: the full list, after the basics (Holden: not "Keys") */  NULL
     };
 
     int margin = 12 * sc;
@@ -906,6 +941,58 @@ static int       s_solo_streak = 0;  /* last drawn frame was solo-debug */
  * dark background. Called from main.c's gpu_draw_idle path.
  */
 
+/* ── T6 (Holden 2026-10-06): every key binding, on K ──
+ * ASCII only: the overlay font is the 5x7 bitmap (32..126). Drawn at the
+ * info panel's size; halved when that would not fit the window. Keep this
+ * list in step with main.c's key handlers and README's key table. */
+static const char k_keys_text[] =
+    "KEY BINDINGS                                (K closes)\n"
+    "\n"
+    "Playback\n"
+    "  Space        Play / pause\n"
+    "  Left/Right   Seek 5 s back / forward\n"
+    "  , / .        One frame back / forward (pauses)\n"
+    "  PgUp/PgDn    Previous / next chapter\n"
+    "  Up/Down      Volume\n"
+    "  Mouse        Click the seek bar to seek\n"
+    "\n"
+    "Files\n"
+    "  O            Open file\n"
+    "  B / N        Previous / next file in the folder\n"
+    "  R            Resume the last file (idle screen)\n"
+    "  Q            Close the file / quit\n"
+#ifndef _WIN32
+    "  Esc          Cancel the open-file dialog\n"
+#endif
+    "               At the end of a file the next one in the\n"
+    "               folder plays; after the last, the first.\n"
+    "\n"
+    "Tracks and view\n"
+    "  A            Cycle audio tracks\n"
+    "  S            Cycle subtitles (off until you pick one)\n"
+    "  F            Fullscreen (or double-click)\n"
+    "  I            Media info\n"
+    "  D            Debug overlay\n"
+    "  K            This list\n"
+    "\n"
+    "HDR files\n"
+    "  Z            Tone-map <-> passthrough (HDR display)\n"
+    "  H            HDR debug views\n"
+    "  T            SDR target nits (203 / 300 / 400)\n"
+    "  G            Midtone gain";
+
+static void draw_keys_panel(uint8_t *buf, int bw, int bh) {
+    int scale = 2 * s_ui_scale;
+    if (text_height(k_keys_text, scale) + 40 * s_ui_scale > bh
+            || text_width(k_keys_text, scale) + 40 * s_ui_scale > bw)
+        scale = s_ui_scale;   /* too big for this window: half size */
+    int x = (bw - text_width(k_keys_text, scale)) / 2;
+    int y = (bh - text_height(k_keys_text, scale)) / 2;
+    if (x < 10 * s_ui_scale) x = 10 * s_ui_scale;
+    if (y < 10 * s_ui_scale) y = 10 * s_ui_scale;
+    draw_text_panel(buf, bw, bh, k_keys_text, x, y, scale);
+}
+
 void overlay_render_idle(PlayerState *ps) {
     s_solo_streak = 0;   /* idle raster overwrote the shared texture */
     /* Use physical pixel dimensions when available */
@@ -940,6 +1027,14 @@ void overlay_render_idle(PlayerState *ps) {
     memset(s_pixels, 0, buf_size);
     s_dirty_y0 = 0;
     s_dirty_y1 = h;
+
+    if (ps->show_keys) {   /* T6: K on the idle screen shows the full list */
+        draw_keys_panel(s_pixels, w, h);
+        ps->overlay_force_full = 0;
+        gpu_overlay_upload(ps, s_pixels, w, h, 0, h);
+        ps->overlay_active = 1;
+        return;
+    }
 
     /* ── Title: "DSVP" in large bitmap font ── */
     int S = s_ui_scale;
@@ -986,6 +1081,7 @@ void overlay_render_idle(PlayerState *ps) {
         { "Up/Down",    "Volume" },
         { "B/N",        "Prev / Next file" },
         { "Q",     "Close / Quit" },
+        { "K",     "All key bindings" },   /* T6 */
         { NULL, NULL }
     };
 
@@ -1021,7 +1117,7 @@ void overlay_render_idle(PlayerState *ps) {
         for (const char *c = ps->resume_path; *c; c++)
             if (*c == '/' || *c == '\\') nm = c + 1;
         char shown[48];
-        snprintf(shown, sizeof(shown), "%.40s%s", nm, strlen(nm) > 40 ? "…" : "");
+        snprintf(shown, sizeof(shown), "%.40s%s", nm, strlen(nm) > 40 ? "..." : "");   /* ASCII: the font has no U+2026 */
         int at = (int)ps->resume_pos;
         char desc[96];
         snprintf(desc, sizeof(desc), "Resume %s at %d:%02d:%02d",
@@ -1070,6 +1166,7 @@ void overlay_render(PlayerState *ps) {
     int need_seekbar = ps->show_seekbar;
     int need_debug   = ps->show_debug;
     int need_info    = ps->show_info;
+    int need_keys    = ps->show_keys;
     int need_pause   = ps->paused;
     int need_sub     = (ps->sub_valid && ps->sub_selection > 0);
 
@@ -1087,7 +1184,7 @@ void overlay_render(PlayerState *ps) {
 
     int need_osd = (osd_text != NULL);
 
-    if (!need_seekbar && !need_debug && !need_info &&
+    if (!need_seekbar && !need_debug && !need_info && !need_keys &&
         !need_pause && !need_osd && !need_sub) {
         ps->overlay_active = 0;
         s_solo_streak = 0;
@@ -1126,7 +1223,7 @@ void overlay_render(PlayerState *ps) {
      * already shows exactly this frame. Skip the clear/raster/upload
      * (a full-height 4K RGBA raster + upload per frame otherwise —
      * the instrument was a perturbation on SW-decode boxes). */
-    int solo_debug = need_debug && !need_seekbar && !need_info &&
+    int solo_debug = need_debug && !need_seekbar && !need_info && !need_keys &&
                      !need_pause && !need_osd && !need_sub;
     if (solo_debug && s_solo_streak && !debug_dirty &&
         !ps->overlay_force_full && s_pix_w == w && s_pix_h == h) {
@@ -1188,7 +1285,10 @@ void overlay_render(PlayerState *ps) {
         draw_text_panel(s_pixels, w, h, ps->media_info,
                         10 * s_ui_scale, 40 * s_ui_scale, 2 * s_ui_scale);
 
-    if (need_pause)
+    if (need_keys)
+        draw_keys_panel(s_pixels, w, h);
+
+    if (need_pause && !need_keys)   /* the panel covers the centre */
         draw_pause(s_pixels, w, h);
 
     if (need_osd)

@@ -1017,9 +1017,25 @@ int sub_open_codec(PlayerState *ps, int stream_idx) {
     }
 
     ps->sub_active_idx = stream_idx;
-    log_msg("Subtitle codec opened: %s (stream %d), canvas %dx%d",
-        codec->name, stream_idx,
-        ps->sub_codec_ctx->width, ps->sub_codec_ctx->height);
+    /* (C) 2026-10-06: print the canvas the overlay will USE (overlay.c
+     * falls back to the video size when the track carries none), not the
+     * raw unset 0x0 — which read like a defect on tracks that render
+     * correctly. Text tracks have no canvas: they are laid out at the
+     * output size. */
+    const AVCodecDescriptor *sd = avcodec_descriptor_get(codec->id);
+    if (sd && (sd->props & AV_CODEC_PROP_BITMAP_SUB)) {
+        if (ps->sub_codec_ctx->width > 0 && ps->sub_codec_ctx->height > 0)
+            log_msg("Subtitle codec opened: %s (stream %d), canvas %dx%d",
+                codec->name, stream_idx,
+                ps->sub_codec_ctx->width, ps->sub_codec_ctx->height);
+        else
+            log_msg("Subtitle codec opened: %s (stream %d), canvas %dx%d "
+                "(the video's size — the track carries none)",
+                codec->name, stream_idx, ps->vid_w, ps->vid_h);
+    } else {
+        log_msg("Subtitle codec opened: %s (stream %d), text — laid out at "
+            "the output size", codec->name, stream_idx);
+    }
 
     /* Diagnostic: log codec extradata for PGS format analysis */
     if (ps->sub_codec_ctx->extradata_size > 0) {
@@ -1071,20 +1087,13 @@ void sub_close_codec(PlayerState *ps) {
  * in the container. This is standard behavior (VLC, mpv do the same).
  */
 
-void sub_cycle(PlayerState *ps) {
-    if (ps->sub_count == 0) {
-        snprintf(ps->sub_osd, sizeof(ps->sub_osd), "No subtitles available");
-        ps->sub_osd_until = get_time_sec() + 2.0;
-        return;
-    }
-
-    /* Cycle: 0 (off) → 1 → 2 → ... → N → 0 (off).
-     * Queues are NOT flushed here: the demuxer keeps every track as a
-     * rolling ~35s window precisely so the newly selected track has the
-     * current moment's packets on hand — flushing made S appear dead
-     * for the ~10s it took playback to reach the demux read position.
-     * The decode-side stale-skip absorbs the (bounded) backlog. */
-    ps->sub_selection = (ps->sub_selection + 1) % (ps->sub_count + 1);
+/* Select subtitle entry `sel`: 0 = off, 1..sub_count = that track.
+ * Shared by S (sub_cycle) and the T5 kept-choice apply after an open.
+ * Returns 0 on success, -1 when the codec failed to open. */
+int sub_select(PlayerState *ps, int sel) {
+    if (sel < 0 || sel > ps->sub_count) return -1;
+    ps->sub_selection = sel;
+    int rc = 0;
 
     if (ps->sub_selection == 0) {
         /* Codec teardown under seek_mutex: the demux seek handler
@@ -1096,8 +1105,8 @@ void sub_cycle(PlayerState *ps) {
         snprintf(ps->sub_osd, sizeof(ps->sub_osd), "Subtitles: Off");
         log_msg("Subtitles disabled");
     } else {
-        int sel = ps->sub_selection - 1;
-        int stream_idx = ps->sub_stream_indices[sel];
+        int sel0 = ps->sub_selection - 1;
+        int stream_idx = ps->sub_stream_indices[sel0];
 
         SDL_LockMutex(ps->seek_mutex);
         int open_ret = sub_open_codec(ps, stream_idx);
@@ -1111,18 +1120,42 @@ void sub_cycle(PlayerState *ps) {
             /* Announcing the track anyway would leave sub_selection
              * pointing at a dead codec and the OSD lying about it. */
             snprintf(ps->sub_osd, sizeof(ps->sub_osd),
-                "Subtitles: %s (codec error)", ps->sub_stream_names[sel]);
+                "Subtitles: %s (codec error)", ps->sub_stream_names[sel0]);
             log_msg("Subtitles: failed to open %s (stream %d)",
-                ps->sub_stream_names[sel], stream_idx);
+                ps->sub_stream_names[sel0], stream_idx);
+            rc = -1;
         } else {
             snprintf(ps->sub_osd, sizeof(ps->sub_osd), "Subtitles: %s",
-                ps->sub_stream_names[sel]);
+                ps->sub_stream_names[sel0]);
             log_msg("Subtitles: %s (stream %d)",
-                ps->sub_stream_names[sel], stream_idx);
+                ps->sub_stream_names[sel0], stream_idx);
         }
     }
 
     ps->sub_osd_until = get_time_sec() + 2.0;
+    return rc;
+}
+
+void sub_cycle(PlayerState *ps) {
+    if (ps->sub_count == 0) {
+        snprintf(ps->sub_osd, sizeof(ps->sub_osd), "No subtitles available");
+        ps->sub_osd_until = get_time_sec() + 2.0;
+        return;
+    }
+
+    /* Cycle: 0 (off) → 1 → 2 → ... → N → 0 (off).
+     * Queues are NOT flushed here: the demuxer keeps every track as a
+     * rolling ~35s window precisely so the newly selected track has the
+     * current moment's packets on hand — flushing made S appear dead
+     * for the ~10s it took playback to reach the demux read position.
+     * The decode-side stale-skip absorbs the (bounded) backlog. */
+    int sel = (ps->sub_selection + 1) % (ps->sub_count + 1);
+    int rc = sub_select(ps, sel);
+    /* T5: an S choice is carried to the next file; Off forgets it */
+    if (sel == 0)
+        track_pref_note(ps, 1, -1, -1);
+    else if (rc == 0)
+        track_pref_note(ps, 1, ps->sub_stream_indices[sel - 1], sel - 1);
 }
 
 

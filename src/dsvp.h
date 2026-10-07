@@ -43,7 +43,7 @@
 
 /* ── Constants ──────────────────────────────────────────────────────── */
 
-#define DSVP_VERSION        "0.3.8-beta"
+#define DSVP_VERSION        "0.3.9-beta"
 #define DSVP_WINDOW_TITLE   "DSVP"
 
 #define PACKET_QUEUE_MAX    256     /* max packets buffered per stream  */
@@ -59,6 +59,14 @@
 #define SUB_MAX_ACTIVE_CUES 8       /* concurrent text cues (review M4)  */
 #define SUB_CUE_TEXT_SIZE   1024    /* one text cue                      */
 typedef struct { char text[SUB_CUE_TEXT_SIZE]; double start, end; } SubCue;
+
+/* T5: an explicit A / S choice, carried to the next file in the folder.
+ * Matched by language + title, then language, then (untagged) title or
+ * position — never by stream index, which means nothing across files. */
+typedef struct { int set; int pos; char lang[16]; char title[96]; } TrackPref;
+#define TRACKS_APPLY_NONE   0   /* O, argv: the file's own defaults           */
+#define TRACKS_APPLY_PREF   1   /* N/B, auto-play: carry the explicit choices */
+#define TRACKS_APPLY_RESUME 2   /* R: the record's exact streams, then prefs  */
 
 /* Default window size when no video is loaded */
 #define DEFAULT_WIN_W       960
@@ -330,6 +338,9 @@ typedef struct PlayerState {
     float                       hdr_smoothed_peak;    /* temporally smoothed peak (nits) */
     float                       hdr_prev_frame_peak;  /* raw peak from previous frame    */
     float                       hdr_static_peak;      /* metadata peak (fallback ceiling) */
+    int                         hdr_meta_pending;     /* 1 = open found no static metadata;
+                                                         adopt MDCV/CLL from the first presented
+                                                         frame's side data (SEI-only streams, H) */
     int                         hdr_target_idx;       /* index into SDR target nit table  */
     int                         dovi_metadata_logged; /* 1 = logged DV RPU for this file  */
     float                       dovi_l1_peak_nits;    /* DV L1 authored scene peak (nits);
@@ -337,6 +348,8 @@ typedef struct PlayerState {
                                                          the tone map ahead of histogram/
                                                          static (deck a4a90b5 port) */
     double                      dovi_l1_last_log;     /* L1 scene-change log throttle */
+    double                      black_relearn_at;   /* batch J learn-at-Z: next deferred probe (wall clock), 0 = none */
+    int                         black_relearn_left; /* probes still to try after the HDR switch */
     const char                 *black_src;            /* black-lift source label for
                                                          the engage log (default/env) */
     int                         hdr_pass_content;     /* current file's signal is HDR
@@ -362,6 +375,11 @@ typedef struct PlayerState {
     double              audio_clock_sync; /* latency-corrected snapshot for main thread A/V sync */
     double              av_bias;          /* adaptive A/V offset (EMA of av_diff) */
     int                 av_bias_samples;  /* warmup counter (apply after 60)     */
+    int                 av_settled_samples; /* samples since the last seek landed or
+                                               timed out: the run-peak gate ((B)
+                                               2026-10-06 — av_bias_samples never
+                                               reset at a seek, so it gated only the
+                                               first half-second of the file) */
     int                 av_hold;          /* 1 = estimator frozen across a display
                                            toggle stall (Z) until the lag clears */
     int                 av_hold_frames;   /* frames evaluated under the hold; 120 =
@@ -378,22 +396,45 @@ typedef struct PlayerState {
     int                 seek_flags;
     int                 seek_recovering;  /* 1 = waiting for first displayed frame post-seek */
     double              seek_recovering_start; /* wall-clock when seek_recovering=1 was set (timeout fallback) */
+    double              seek_recover_last_frame; /* wall-clock of the last frame decoded while
+                                                  recovering: the 2 s fail-open counts from
+                                                  here, not from the seek (T2, 2026-10-06) */
     /* SEEKDIAG one-shots (deck 20325d1 port): the recovery contract's
      * live inputs, logged per seek. The deck's seek-recovery week
      * convicted three races with these; vocabulary kept identical
      * across repos so the same greps work. */
     int                 seekdiag_vid_pending; /* 1 = log first post-seek video frame PTS */
     int                 seekdiag_aud_pending; /* 1 = log first post-seek audio frame PTS */
-    int64_t             seekdiag_target;  /* the target the demuxer actually SERVICED
-                                           (m-S1-c: seek_target is live — a second
-                                           request overwrites it mid-recovery)    */
+    int64_t             seekdiag_target;  /* the target the demuxer actually SERVICED,
+                                           stored when the frame queue is flushed
+                                           (the serial change) — (A) 2026-10-06:
+                                           stored at pickup it labelled the previous
+                                           seek's frames with the new target      */
+    int                 seekdiag_backward;/* that seek's BACKWARD flag, same moment
+                                             (seek_flags is live, like seek_target) */
+    int                 seek_inflight;    /* 1 = demux picked a request up and has not
+                                             flushed yet: frames popped now are the
+                                             PREVIOUS seek's, under the old serial */
     int                 seekdiag_target_valid; /* 1 = seek_target is from a real seek this file
                                                   (gates target/landed in the recovery log) */
+    /* Frame step (T2, `,` / `.`; main.c). All main-thread only. */
+    int                 step_fwd_pending; /* 1 = `.` waits for the next decoded frame */
+    double              step_fwd_since;   /* wall clock the pending step began (fail-open) */
+    int                 step_seek_pending;/* 1 = an exact-step seek is landing: frames
+                                             below step_target are decoded, not shown */
+    double              step_target;      /* PTS (s) the exact step must reach */
+    int                 step_dirty;       /* 1 = frames advanced by pop while paused:
+                                             audio needs a resync before it resumes */
 
     /* ── Threads ── */
     SDL_Thread         *demux_thread;
     SDL_Thread         *video_decode_thread;
     SDL_Mutex          *seek_mutex;    /* protects codec flush vs decode  */
+    SDL_Mutex          *seek_req_mutex;/* m-S1-a: the request slot only (seek_target/
+                                          flags/request + the pickup's inflight
+                                          mark), held for a few instructions —
+                                          never seek_mutex, which the decoder
+                                          holds across a whole 4K frame */
     int                 seeking;       /* 1 = flush in progress, skip decode */
 
     /* ── Playback state ── */
@@ -412,6 +453,9 @@ typedef struct PlayerState {
     int                 video_frame_serial; /* flush_serial of the displayed frame —
                                              * seek recovery accepts only a frame
                                              * popped after the flush              */
+    float               ui_display_scale;   /* (D) SDL_GetWindowDisplayScale — the OS
+                                               scale setting x pixel density; main
+                                               refreshes it on DISPLAY_SCALE_CHANGED */
     int                 overlay_force_full; /* overlay texture just (re)created:
                                              * GPU contents undefined, next render
                                              * must clear + upload full height     */
@@ -428,6 +472,7 @@ typedef struct PlayerState {
     /* ── Overlay visibility state ── */
     int                 show_debug;
     int                 show_info;
+    int                 show_keys;          /* T6: K — the key-bindings panel */
     int                 show_seekbar;         /* 1 = seek bar visible       */
     double              seekbar_hide_time;    /* auto-hide after this time  */
     int                 seekbar_track_x;      /* progress track left edge   */
@@ -495,6 +540,11 @@ typedef struct PlayerState {
      * DSVP_NO_RESUME=1 → never read, never written. */
     char                resume_path[1024];
     double              resume_pos;
+    int                 resume_aud_stream;  /* T5: active streams when the record was */
+    int                 resume_sub_stream;  /* written; -2 = not recorded, sub -1 = off */
+    TrackPref           pref_aud;           /* T5: survive close/open (main + player.c) */
+    TrackPref           pref_sub;
+    int                 track_apply;        /* TRACKS_APPLY_*, set around player_open  */
 
     /* Chapters (end-user request 2026-09-07: "segment support" = MKV
      * chapters). Read from the container at open; PgUp/PgDn step them,
@@ -596,6 +646,9 @@ void  player_update_display_rect(PlayerState *ps);
 int   gpu_create_pipelines(PlayerState *ps);
 void  gpu_destroy_pipelines(PlayerState *ps);
 void  hdr_sys_reconcile_stamp(void);
+void  hdr_black_lift_on_hdr_state(PlayerState *ps, int on);
+void  hdr_black_lift_tick(PlayerState *ps, double now);   /* batch J: deferred re-probes after an HDR switch (1, 2, 4 s) */ /* batch J learn-at-Z: on=1 probes the display's black with the desktop in HDR and keeps it; every flip re-decides the current file's lift */
+int   hdr_sys_os_hdr_active(PlayerState *ps); /* (I): OS HDR active on the window's monitor — 1/0, -1 unknown (Windows: DisplayConfig, read-only; Linux: -1) */
 int   hdr_sys_held_sdrbr(void);             /* KWin reference-luminance we hold (0 = none; Windows always 0) */         /* crash-restore: reconcile a dead
                                                 session's display stamp at launch,
                                                 BEFORE any probe (no-op on Windows) */
@@ -621,6 +674,8 @@ void  SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
 int   audio_decode_frame(PlayerState *ps);
 void  audio_find_streams(PlayerState *ps);
 void  audio_cycle(PlayerState *ps);
+void  track_pref_note(PlayerState *ps, int is_sub, int stream_idx, int pos);
+void  track_apply_subs(PlayerState *ps);
 
 /* ── Bitstream API (bitstream.c) ─────────────────────────────────── */
 
@@ -634,6 +689,7 @@ void  sub_find_streams(PlayerState *ps);
 int   sub_open_codec(PlayerState *ps, int stream_idx);
 void  sub_close_codec(PlayerState *ps);
 void  sub_cycle(PlayerState *ps);
+int   sub_select(PlayerState *ps, int sel);   /* 0 = off, 1..sub_count */
 void  sub_decode_pending(PlayerState *ps);
 void  sub_clear_display(PlayerState *ps);   /* drop cues + bitmaps + text (seek, close) */
 void  sub_ass_close_file(PlayerState *ps);  /* per-file libass library + renderer (player_close) */

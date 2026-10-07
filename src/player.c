@@ -1024,6 +1024,21 @@ static SDL_GPUShader *compile_shader(
  *   - gpu_pipeline_overlay: RGBA + alpha blend (1 texture, 1 sampler)
  */
 
+/* Log helper: the swapchain formats DSVP actually meets, by name — the
+ * bare enum int ('format = 12') had to be decoded from SDL's header
+ * (field 2026-09-20 nit). Unknown values still print their number. */
+static const char *gpu_format_name(SDL_GPUTextureFormat f) {
+    switch (f) {
+    case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM:      return "B8G8R8A8_UNORM";
+    case SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB: return "B8G8R8A8_UNORM_SRGB";
+    case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM:      return "R8G8B8A8_UNORM";
+    case SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB: return "R8G8B8A8_UNORM_SRGB";
+    case SDL_GPU_TEXTUREFORMAT_R10G10B10A2_UNORM:   return "R10G10B10A2_UNORM";
+    case SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT:  return "R16G16B16A16_FLOAT";
+    default:                                        return "other";
+    }
+}
+
 int gpu_create_pipelines(PlayerState *ps) {
     if (!ps->gpu_device || !ps->window) return -1;
 
@@ -1069,7 +1084,8 @@ int gpu_create_pipelines(PlayerState *ps) {
         SDL_ReleaseGPUShader(ps->gpu_device, vert);
         return -1;
     }
-    log_msg("GPU: swapchain format = %d", (int)color_desc.format);
+    log_msg("GPU: swapchain format = %s (%d)",
+            gpu_format_name(color_desc.format), (int)color_desc.format);
     log_msg("GPU: YUV planar pipeline created");
 
     /* Vertex shader done — safe to release now */
@@ -1504,6 +1520,82 @@ static int pick_ycbcr_matrix(const AVCodecParameters *par,
     return (h >= 720 || w >= 1280) ? 709 : 601;
 }
 
+/* Platform backend (defined in the display-HDR blocks far below): the
+ * display's AUTHORED min/max luminance from its HDR static-metadata
+ * block, 1 = known. Prototyped here because gpu_setup_uniforms consumes
+ * it above the backend (use-before-definition — the 0ad2b01 lesson). */
+static int hdr_sys_display_black_nits(PlayerState *ps, float *min_nits,
+                                      float *max_nits);
+
+/* Batch J decision, factored 2026-10-06 so the HDR-state event can
+ * re-run it (learn-at-Z, Holden's ruling): env override > the
+ * display's authored black (DXGI; cached per monitor, learned while
+ * the desktop is in HDR) > the x64 default. Sets the uniform and
+ * black_src, logs the decision. */
+static void black_lift_decide(PlayerState *ps) {
+    static float s_env_nits = -2.0f;   /* -2 = unparsed, -3 = no override */
+    static const char *s_env_src = NULL;
+    if (s_env_nits == -2.0f) {
+        s_env_nits = -3.0f;
+        const char *be = SDL_getenv("DSVP_BLACK_NITS");
+        if (be && be[0]) {
+            double bv = SDL_atof(be);
+            if (bv == 0.0) {
+                s_env_nits = -1.0f;
+                s_env_src = "DSVP_BLACK_NITS=0";
+            } else if (bv > 0.0 && bv <= 10.0) {
+                s_env_nits = (float)bv;
+                s_env_src = "DSVP_BLACK_NITS";
+            } else {
+                log_msg("WARN: DSVP_BLACK_NITS='%s' ignored "
+                        "(want 0 to disable, or 0-10 nits) — "
+                        "panel decides / x64 default 0.01", be);
+            }
+        }
+    }
+    static char s_src_buf[112];
+    float lift = 0.01f;
+    const char *src = "x64 default, display black unknown";
+    float dmin = 0.0f, dmax = 0.0f;
+    if (s_env_nits != -3.0f) {
+        lift = s_env_nits;
+        src  = s_env_src;
+    } else if (hdr_sys_display_black_nits(ps, &dmin, &dmax) && dmin > 0.0f) {
+        if (dmin < 0.01f) {
+            lift = -1.0f;
+            snprintf(s_src_buf, sizeof(s_src_buf),
+                     "display black %.4f nits authored: OLED-class, lift off",
+                     dmin);
+        } else {
+            snprintf(s_src_buf, sizeof(s_src_buf),
+                     "display black %.3f nits authored: LCD-class, eye-ruled 0.01",
+                     dmin);
+        }
+        src = s_src_buf;
+    }
+    if (lift < 0.0f)
+        log_msg("Black lift: off (%s)", src);
+    else
+        log_msg("Black lift: %.3f nits (%s)", lift, src);
+    ps->gpu_uniforms.out_black_nits = lift;
+    ps->black_src = src;
+}
+
+/* Re-decision from the HDR-state event or the deferred probe: paused,
+ * the redraw blits the shaded frame cache, so a changed lift must
+ * re-shade (H/T/G clear the cache the same way; Knot 2026-10-06).
+ * Windows only: learn-at-Z is the DXGI path; the Linux half (EDID) is
+ * parked, and its stub never re-decides (dellbian 2026-10-06: defined
+ * but not used). */
+#ifdef _WIN32
+static void black_lift_redecide(PlayerState *ps) {
+    float was = ps->gpu_uniforms.out_black_nits;
+    black_lift_decide(ps);
+    if (ps->gpu_uniforms.out_black_nits != was)
+        ps->cache_valid = 0;
+}
+#endif
+
 static void gpu_setup_uniforms(PlayerState *ps) {
     /* Determine YCbCr matrix — see pick_ycbcr_matrix. */
     const char *cs_reason = "no stream";
@@ -1518,40 +1610,31 @@ static void gpu_setup_uniforms(PlayerState *ps) {
     log_msg("GPU: YCbCr matrix %s (%s)", cs_name, cs_reason);
 
     /* BT.2390 black-lift config (deck 4614882 port; see dsvp.h
-     * out_black_nits): parsed once. x64 DEFAULT = 0.01 nits FIXED —
-     * Holden's eye, ladder-tuned on WIN11 IPS 2026-08-27 ("best
-     * balance between lift and ink, specks practically invisible"):
-     * IPS-class native black is ~0.1-0.3 nits, so the target/2000
-     * auto floor rendered ~8/255 codes and lifted WEB-DL baked-bar
-     * codec noise into view; 0.01 renders ~3 codes — detail above
-     * the crush survives, bar noise sits at dark-room threshold.
-     * PLATFORM DIVERGENCE: deck keeps target/2000 auto (OLED renders
-     * those floors for real). DSVP_BLACK_NITS overrides: "0" = lift
-     * off; 0<v<=10 = fixed nits. */
-    {
-        static float s_black_nits = -2.0f;   /* -2 = unparsed */
-        static const char *s_black_src = "x64 default";
-        if (s_black_nits == -2.0f) {
-            s_black_nits = 0.01f;
-            const char *be = SDL_getenv("DSVP_BLACK_NITS");
-            if (be && be[0]) {
-                double bv = SDL_atof(be);
-                if (bv == 0.0) {
-                    s_black_nits = -1.0f;
-                    s_black_src = "DSVP_BLACK_NITS=0";
-                } else if (bv > 0.0 && bv <= 10.0) {
-                    s_black_nits = (float)bv;
-                    s_black_src = "DSVP_BLACK_NITS";
-                } else {
-                    log_msg("WARN: DSVP_BLACK_NITS='%s' ignored "
-                            "(want 0 to disable, or 0-10 nits) — "
-                            "x64 default 0.01", be);
-                }
-            }
-        }
-        ps->gpu_uniforms.out_black_nits = s_black_nits;
-        ps->black_src = s_black_src;
-    }
+     * out_black_nits). x64 DEFAULT = 0.01 nits FIXED — Holden's eye,
+     * ladder-tuned on WIN11 IPS 2026-08-27 ("best balance between lift
+     * and ink, specks practically invisible"): IPS-class native black
+     * is ~0.1-0.3 nits, so the target/2000 auto floor rendered ~8/255
+     * codes and lifted WEB-DL baked-bar codec noise into view; 0.01
+     * renders ~3 codes — detail above the crush survives, bar noise
+     * sits at dark-room threshold. PLATFORM DIVERGENCE: deck keeps
+     * target/2000 auto (OLED renders those floors for real).
+     * DSVP_BLACK_NITS overrides: "0" = lift off; 0<v<=10 = fixed nits.
+     *
+     * Batch J (2026-09-21, Holden's ruling after the first OLED field
+     * user: the PANEL decides, nothing is tailored per user). Without
+     * the override, the display's AUTHORED black — CTA-861 HDR static
+     * metadata min luminance, read by the platform backend — decides
+     * the CLASS, not the number: a panel whose black sits BELOW the
+     * lift we would apply is OLED-class and gets no lift (lifting to
+     * 0.01 nits on a panel that renders 0.0005 throws away ink it can
+     * show); a panel at or above it keeps the eye-ruled 0.01 (the eye
+     * ruling stands with its conditions — the authored number does not
+     * replace it). 0 or absent = UNKNOWN (placeholder EDIDs are common;
+     * authored is trusted, absent is not invented) → the default. The
+     * env parse is once per session; the display read is per open
+     * (the window's monitor can change between files; the backend
+     * caches per monitor). */
+    black_lift_decide(ps);
 
     /* ── Range parameters ──
      *
@@ -1826,6 +1909,8 @@ static void gpu_setup_uniforms(PlayerState *ps) {
                     d_pri_n ? d_pri_n : "?", d_pri);
         }
 
+        ps->hdr_meta_pending = 0;   /* per file; set below if the open finds nothing */
+
         /* --- Transfer function check --- */
         if (par->color_trc == AVCOL_TRC_SMPTE2084) {
             is_hdr = 1;
@@ -1947,7 +2032,9 @@ static void gpu_setup_uniforms(PlayerState *ps) {
         /* Fallback: no metadata → 1000 nits (standard HDR10 assumption) */
         if (is_hdr && peak_nits == 0.0f) {
             peak_nits = 1000.0f;
-            log_msg("HDR: no luminance metadata — using 1000 nit fallback");
+            ps->hdr_meta_pending = 1;   /* item (H): the first presented frame may carry it as SEI */
+            log_msg("HDR: no luminance metadata in the container — 1000 nit "
+                    "fallback; first frame's side data checked next");
         }
 
         /* DV P5 base layer is full-range by spec (IPTPQc2).
@@ -1989,6 +2076,12 @@ static void gpu_setup_uniforms(PlayerState *ps) {
             is_dovi_active = 1;
             hdr_gamut = 1.0f;
             log_msg("HDR: Dolby Vision Profile 5 — DV reshape pipeline active");
+            /* Honest instruments (field nit 2026-09-20): the 'YCbCr
+             * matrix' line above names the container pick, which this
+             * path never runs — the shader takes the RPU's ycc_to_rgb. */
+            log_msg("GPU: YCbCr matrix not used on this file — the DV RPU's "
+                    "ycc_to_rgb matrix decodes it (the %s pick above is inert)",
+                    cs_name);
         } else {
             log_msg("WARN: DV P5 tagged but not 10-bit 4:2:0 passthrough "
                     "— DV pipeline disabled for this file");
@@ -2133,7 +2226,7 @@ static void gpu_setup_uniforms(PlayerState *ps) {
                     bnits, ps->black_src,
                     pq_oetf_cpu(bnits) / pq_oetf_cpu(peak_nits));
         } else {
-            log_msg("HDR: BT.2390 black lift disabled (DSVP_BLACK_NITS=0)");
+            log_msg("HDR: BT.2390 black lift disabled (%s)", ps->black_src);
         }
     }
 
@@ -3144,6 +3237,192 @@ static void hdr_sys_revert_all(void) {
  * nothing behind our PQ surface. No-op keeps the shared apply layer
  * platform-blind. */
 static void hdr_sys_apply_sdrbr(int pass_active) { (void)pass_active; }
+
+/* ── Batch J: the display's AUTHORED black and peak ─────────────────
+ * CTA-861 HDR static metadata (min/max luminance) as the driver reads
+ * it from the EDID, via DXGI's output description (dxgi1_6, Win10
+ * 1803+). Independent of our Vulkan swapchain — DXGI enumeration is
+ * its own object graph. dxgi.dll is loaded by name so no link flag is
+ * added and a pre-1803 system fails OPEN to "unknown" (default lift).
+ * IIDs are local so no GUID library is linked (same reason the
+ * DisplayConfig shims above are local). Cached per HMONITOR: the
+ * window's monitor decides and it can change between files. Returns 1
+ * with the authored values, 0 = unknown (caller keeps its default). */
+#define COBJMACROS
+#include <dxgi1_6.h>
+
+static const GUID dsvp_IID_IDXGIFactory1 =
+    {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1, 0xb3, 0x87}};
+static const GUID dsvp_IID_IDXGIOutput6 =
+    {0x068346e8, 0xaaec, 0x4b84, {0xad, 0xd7, 0x13, 0x7f, 0x51, 0x3f, 0x77, 0xa1}};
+typedef HRESULT (WINAPI *DsvpCreateDXGIFactory1Fn)(REFIID, void **);
+
+static HMONITOR s_mon   = NULL;   /* black-nits probe cache, per monitor —
+                                     file scope so learn-at-Z can forget it */
+static int      s_known = 0;
+static float    s_min   = 0.0f, s_max = 0.0f;
+static int hdr_sys_display_black_nits(PlayerState *ps, float *min_nits,
+                                      float *max_nits) {
+
+    *min_nits = 0.0f; *max_nits = 0.0f;
+    if (!ps || !ps->window) return 0;
+    HWND hwnd = (HWND)SDL_GetPointerProperty(
+                    SDL_GetWindowProperties(ps->window),
+                    SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    if (!hwnd) return 0;
+    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (!mon) return 0;
+    if (mon == s_mon) {
+        *min_nits = s_min; *max_nits = s_max;
+        return s_known;
+    }
+    s_mon = mon; s_known = 0; s_min = s_max = 0.0f;
+
+    HMODULE dll = LoadLibraryW(L"dxgi.dll");
+    if (!dll) {
+        log_msg("Black lift: dxgi.dll unavailable — display black unknown");
+        return 0;
+    }
+    DsvpCreateDXGIFactory1Fn create =
+        (DsvpCreateDXGIFactory1Fn)(void *)GetProcAddress(dll, "CreateDXGIFactory1");
+    IDXGIFactory1 *fac = NULL;
+    if (!create || FAILED(create(&dsvp_IID_IDXGIFactory1, (void **)&fac)) || !fac) {
+        log_msg("Black lift: CreateDXGIFactory1 failed — display black unknown");
+        FreeLibrary(dll);
+        return 0;
+    }
+    int matched = 0;
+    for (UINT a = 0; !matched; a++) {
+        IDXGIAdapter1 *ad = NULL;
+        if (IDXGIFactory1_EnumAdapters1(fac, a, &ad) != S_OK || !ad) break;
+        for (UINT o = 0; !matched; o++) {
+            IDXGIOutput *out = NULL;
+            if (IDXGIAdapter1_EnumOutputs(ad, o, &out) != S_OK || !out) break;
+            DXGI_OUTPUT_DESC d;
+            if (SUCCEEDED(IDXGIOutput_GetDesc(out, &d)) && d.Monitor == mon) {
+                matched = 1;
+                IDXGIOutput6 *o6 = NULL;
+                if (SUCCEEDED(IDXGIOutput_QueryInterface(
+                        out, &dsvp_IID_IDXGIOutput6, (void **)&o6)) && o6) {
+                    DXGI_OUTPUT_DESC1 d1;
+                    if (SUCCEEDED(IDXGIOutput6_GetDesc1(o6, &d1))) {
+                        s_min = d1.MinLuminance;
+                        s_max = d1.MaxLuminance;
+                        s_known = 1;
+                        log_msg("Black lift: display authored min %.4f / max %.0f / "
+                                "full-frame %.0f nits, %u bpc (DXGI)",
+                                d1.MinLuminance, d1.MaxLuminance,
+                                d1.MaxFullFrameLuminance,
+                                (unsigned)d1.BitsPerColor);
+                    } else {
+                        log_msg("Black lift: GetDesc1 failed — display black unknown");
+                    }
+                    IDXGIOutput6_Release(o6);
+                } else {
+                    log_msg("Black lift: IDXGIOutput6 unavailable (pre-1803 DXGI) "
+                            "— display black unknown");
+                }
+            }
+            IDXGIOutput_Release(out);
+        }
+        IDXGIAdapter1_Release(ad);
+    }
+    IDXGIFactory1_Release(fac);
+    FreeLibrary(dll);
+    if (!matched)
+        log_msg("Black lift: no DXGI output matches the window's monitor — "
+                "display black unknown");
+    *min_nits = s_min; *max_nits = s_max;
+    return s_known;
+}
+/* (I) 2026-10-06: the OS's own answer to "is HDR active on this window's
+ * monitor". Never writes the engage/revert fields (user_on, enabled,
+ * engaged, prior_dm): a re-probe while Z holds the display would
+ * overwrite what the engage decision read. The monitor MAPPING
+ * (adapter/target/gdi/valid) is re-done on every call, as engage does
+ * before it acts — a cached one goes stale when the window moves to
+ * another monitor (Knot 2026-10-06). SDL's SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN read
+ * false on all four HDR_STATE_CHANGED events of the Win11 2026-10-06 run
+ * (our Z on and off, the Settings toggle on and off), so the log line
+ * asks DisplayConfig. Returns 1/0, or -1 when it cannot say. */
+/* Batch J learn-at-Z (Holden's ruling 2026-10-06, "seems ideal"):
+ * DXGI's output luminance is MODE-DEPENDENT — the SDR desktop reports
+ * 0 / 240 / 240, the HDR desktop reports the EDID (Win11 2026-10-06,
+ * same monitor, two launches) — so the open-time probe cannot classify
+ * in the one mode where the lift applies. Whenever the desktop enters
+ * HDR (our Z, or the OS's own toggle: either lets DXGI answer), probe
+ * again and keep the answer for the session; on every flip re-decide
+ * the current file's lift so tone-map resumes with the learned black.
+ * Later opens hit the cache and classify directly. */
+void hdr_black_lift_tick(PlayerState *ps, double now) {
+    if (ps->black_relearn_left <= 0 || now < ps->black_relearn_at) return;
+    s_mon = NULL;
+    float dmin = 0.0f, dmax = 0.0f;
+    int tried = 4 - ps->black_relearn_left;   /* 1, 2, 3 */
+    if (hdr_sys_display_black_nits(ps, &dmin, &dmax) && dmin > 0.0f) {
+        log_msg("Black lift: learned display black %.4f nits on retry %d after the "
+                "HDR switch (kept for the session)", dmin, tried);
+        ps->black_relearn_left = 0;
+        if (ps->playing && ps->fmt_ctx && ps->video_stream_idx >= 0)
+            black_lift_redecide(ps);
+        return;
+    }
+    ps->black_relearn_left--;
+    if (ps->black_relearn_left > 0)
+        ps->black_relearn_at = now + (double)(1 << tried);   /* +2 s, then +4 s */
+    else
+        log_msg("Black lift: gave up — DXGI reported no authored black 1, 2 and 4 s "
+                "after the HDR switch (a launch with HDR already on does report it)");
+}
+
+void hdr_black_lift_on_hdr_state(PlayerState *ps, int on) {
+    if (on && !(s_known && s_min > 0.0f)) {
+        s_mon = NULL;                        /* forget the SDR-mode read */
+        float dmin = 0.0f, dmax = 0.0f;
+        if (hdr_sys_display_black_nits(ps, &dmin, &dmax) && dmin > 0.0f)
+            log_msg("Black lift: learned display black %.4f nits with the desktop "
+                    "in HDR (kept for the session)", dmin);
+        else {
+            /* Win11 2026-10-06: 165 ms after SET_HDR_STATE the probe still
+             * read the SDR-mode numbers, while a launch with HDR already on
+             * read the EDID. Either DXGI needs time after the mode set or
+             * it pins the description for the process. Retry at 1, 2 and
+             * 4 s; the log says which it was. */
+            log_msg("Black lift: nothing learned with the desktop in HDR yet (DXGI "
+                    "still reports no authored black) — retrying at 1, 2 and 4 s");
+            ps->black_relearn_left = 3;
+            ps->black_relearn_at   = get_time_sec() + 1.0;
+        }
+    }
+    if (!on) { ps->black_relearn_left = 0; ps->black_relearn_at = 0.0; }
+    if (ps->playing && ps->fmt_ctx && ps->video_stream_idx >= 0)
+        black_lift_redecide(ps);             /* logs the (re)decision */
+}
+int hdr_sys_os_hdr_active(PlayerState *ps) {
+    if (!ps || !ps->window) return -1;
+    HWND hwnd = (HWND)SDL_GetPointerProperty(
+                    SDL_GetWindowProperties(ps->window),
+                    SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    if (!hwnd || !winhdr_map_target(hwnd)) return -1;
+    DsvpAdvColorInfo2 v2;
+    memset(&v2, 0, sizeof(v2));
+    v2.header.type      = DSVP_DCDI_GET_ADVANCED_COLOR_INFO_2;
+    v2.header.size      = sizeof(v2);
+    v2.header.adapterId = g_winhdr.adapter;
+    v2.header.id        = g_winhdr.target;
+    if (DisplayConfigGetDeviceInfo(&v2.header) == ERROR_SUCCESS)
+        return (v2.activeColorMode == 2) ? 1 : 0;
+    DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO v1;
+    memset(&v1, 0, sizeof(v1));
+    v1.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+    v1.header.size      = sizeof(v1);
+    v1.header.adapterId = g_winhdr.adapter;
+    v1.header.id        = g_winhdr.target;
+    if (DisplayConfigGetDeviceInfo(&v1.header) == ERROR_SUCCESS)
+        return (v1.advancedColorSupported && !v1.wideColorEnforced
+                && v1.advancedColorEnabled) ? 1 : 0;
+    return -1;
+}
 int hdr_sys_held_sdrbr(void) { return 0; }
 
 /* Windows crash-restore (review DM9): the OS HDR toggle PERSISTS in
@@ -4017,6 +4296,9 @@ static void hdr_sys_apply_sdrbr(int pass_active) {
             rc == 0 ? "" : " — NOT applied, playing on");
 }
 int hdr_sys_held_sdrbr(void) { return g_linhdr.engaged ? g_linhdr.held_sdrbr : 0; }
+int hdr_sys_os_hdr_active(PlayerState *ps) { (void)ps; return -1; }   /* (I): no OS-truth read on Linux yet; SDL's property stands */
+void hdr_black_lift_on_hdr_state(PlayerState *ps, int on) { (void)ps; (void)on; }   /* batch J Linux half: EDID read ⏸ */
+void hdr_black_lift_tick(PlayerState *ps, double now) { (void)ps; (void)now; }
 
 /* ── Read-after-enable for the reference luminance (deck b0615b9
  * port, review HDR M8) ── kscreen-doctor only REPORTS sdr-brightness
@@ -4172,6 +4454,16 @@ static void hdr_sys_revert_all(void) {
     linhdr_revert();
 }
 
+/* Batch J: the display's authored black — Linux reads it from the
+ * connector's EDID HDR static-metadata block (second batch; until then
+ * unknown → the default lift). The deck tree is OLED and lift-off by
+ * ruling already; dellbian is SDR-only IPS where the default is right. */
+static int hdr_sys_display_black_nits(PlayerState *ps, float *min_nits,
+                                      float *max_nits) {
+    (void)ps;
+    *min_nits = 0.0f; *max_nits = 0.0f;
+    return 0;
+}
 #endif /* _WIN32 */
 
 /* Reconcile (display HDR, swapchain, shader path) with the current
@@ -4318,6 +4610,179 @@ void hdr_output_shutdown(PlayerState *ps) {
 
 /* Open a media file: probe format, find best streams, init decoders,
  * set up scaling context, create GPU textures, start demux thread. */
+/* ═══════════════════════════════════════════════════════════════════
+ * T5 (Holden 2026-10-06): keep the chosen audio / subtitle track
+ * ═══════════════════════════════════════════════════════════════════
+ * An explicit A or S press is remembered (track_pref_note) and carried
+ * to the next file in the folder (N/B, auto-play) by what the track IS —
+ * language + title, then language, then for untagged tracks the title or
+ * the position — because stream indices mean nothing across files. R
+ * reopens the record's exact streams first (same file). Subtitles stay
+ * strictly opt-in: only an S choice is carried, and choosing Off forgets
+ * it; nothing is turned on because a container flags it. */
+static void track_meta(AVStream *st, const char **lang, const char **title) {
+    const AVDictionaryEntry *l = av_dict_get(st->metadata, "language", NULL, 0);
+    const AVDictionaryEntry *t = av_dict_get(st->metadata, "title", NULL, 0);
+    *lang  = (l && l->value[0]) ? l->value : "";
+    *title = (t && t->value[0]) ? t->value : "";
+    if (!SDL_strcasecmp(*lang, "und")) *lang = "";   /* `und` is untagged (Knot 2026-10-06) */
+}
+
+void track_pref_note(PlayerState *ps, int is_sub, int stream_idx, int pos) {
+    TrackPref *p = is_sub ? &ps->pref_sub : &ps->pref_aud;
+    if (stream_idx < 0 || !ps->fmt_ctx
+            || stream_idx >= (int)ps->fmt_ctx->nb_streams) {
+        if (p->set) log_msg("Tracks: %s choice forgotten (off)",
+                            is_sub ? "subtitle" : "audio");
+        p->set = 0;
+        return;
+    }
+    const char *lang, *title;
+    track_meta(ps->fmt_ctx->streams[stream_idx], &lang, &title);
+    p->set = 1;
+    p->pos = pos;
+    snprintf(p->lang,  sizeof(p->lang),  "%s", lang);
+    snprintf(p->title, sizeof(p->title), "%s", title);
+    {   /* a capped title must not end in a split UTF-8 code point: the
+         * record and the log would carry invalid bytes (Knot 2026-10-06) */
+        size_t L = strlen(p->title);
+        if (L == sizeof(p->title) - 1) {
+            size_t i = L;
+            while (i > 0 && ((unsigned char)p->title[i - 1] & 0xC0) == 0x80) i--;
+            if (i > 0) {
+                unsigned char lead = (unsigned char)p->title[i - 1];
+                int need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+                if (need > 1 && (int)(L - (i - 1)) < need) p->title[i - 1] = '\0';
+            }
+        }
+    }
+    /* the resume record is tab/line separated: keep both out */
+    for (char *c = p->lang;  *c; c++) if (*c == '\t' || *c == '\r' || *c == '\n') *c = ' ';
+    for (char *c = p->title; *c; c++) if (*c == '\t' || *c == '\r' || *c == '\n') *c = ' ';
+    log_msg("Tracks: %s choice kept for the next file — #%d lang='%s' title='%s'",
+            is_sub ? "subtitle" : "audio", pos + 1, p->lang, p->title);
+}
+
+/* Position in idx[0..n) that matches the preference, or -1. */
+/* A stored title is capped at sizeof(TrackPref.title)-1 bytes; a live
+ * title longer than that can only match as a prefix (Knot 2026-10-06). */
+static int title_eq(const char *live, const char *stored) {
+    size_t cap = sizeof(((TrackPref *)0)->title) - 1;
+    if (!strcmp(live, stored)) return 1;
+    /* the UTF-8 trim in track_pref_note can leave a capped title 1-3 bytes
+     * short of cap (Knot 2026-10-06): a prefix of at least cap-3 bytes of a
+     * longer live title is the same capped title */
+    size_t ls = strlen(stored);
+    return ls >= cap - 3 && strlen(live) > ls && !strncmp(live, stored, ls);
+}
+
+static int track_pref_pick(PlayerState *ps, const TrackPref *p,
+                           const int *idx, int n, int skip_truehd,
+                           const char **how) {
+    if (!p->set) return -1;
+    for (int pass = 0; pass < 4; pass++) {
+        if (pass >= 2 && p->lang[0]) break;   /* a tagged choice never falls to guessing */
+        if (pass == 0 && !(p->lang[0] && p->title[0])) continue;
+        if (pass == 1 && !p->lang[0]) continue;
+        if (pass == 2 && !p->title[0]) continue;
+        /* several hits in one pass (two `und` tracks, two untitled `eng`):
+         * the one at the remembered position wins, else the first
+         * (Knot 2026-10-06: the first hit always won and the position
+         * pass was unreachable for any tagged language) */
+        int first = -1;
+        for (int k = 0; k < n; k++) {
+            AVStream *st = ps->fmt_ctx->streams[idx[k]];
+            if (skip_truehd && st->codecpar->codec_id == AV_CODEC_ID_TRUEHD) continue;
+            const char *lang, *title;
+            track_meta(st, &lang, &title);
+            int hit = 0;
+            switch (pass) {
+            case 0: hit = !SDL_strcasecmp(lang, p->lang) && title_eq(title, p->title); break;
+            case 1: hit = !SDL_strcasecmp(lang, p->lang); break;
+            case 2: hit = !lang[0] && title_eq(title, p->title); break;
+            case 3: hit = !lang[0] && k == p->pos; break;
+            }
+            if (hit && (k == p->pos || first < 0)) first = k;
+            if (hit && k == p->pos) break;
+        }
+        if (first >= 0) {
+            static const char *hows[] = { "language + title", "language",
+                                          "title", "position" };
+            *how = hows[pass];
+            return first;
+        }
+    }
+    return -1;
+}
+
+/* Called inside player_open after the default audio pick (TrueHD skip
+ * included), before the audio decoder opens. */
+static void track_apply_audio(PlayerState *ps) {
+    if (ps->track_apply == TRACKS_APPLY_NONE) return;
+    int idx[MAX_AUDIO_STREAMS], n = 0;
+    for (unsigned i = 0; i < ps->fmt_ctx->nb_streams && n < MAX_AUDIO_STREAMS; i++)
+        if (ps->fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            idx[n++] = (int)i;
+    int want = -1;
+    const char *how = NULL;
+    if (ps->track_apply == TRACKS_APPLY_RESUME && ps->resume_aud_stream >= 0) {
+        for (int k = 0; k < n; k++)
+            if (idx[k] == ps->resume_aud_stream
+                    && ps->fmt_ctx->streams[idx[k]]->codecpar->codec_id
+                       != AV_CODEC_ID_TRUEHD) {
+                want = idx[k];
+                how = "the resume record";
+            }
+    }
+    if (want < 0) {
+        int k = track_pref_pick(ps, &ps->pref_aud, idx, n, 1, &how);
+        if (k >= 0) want = idx[k];
+    }
+    if (want < 0) {
+        if (ps->pref_aud.set)
+            log_msg("Tracks: no audio track matches the kept choice (lang='%s' "
+                    "title='%s') — the file's default stays", ps->pref_aud.lang,
+                    ps->pref_aud.title);
+        return;
+    }
+    if (want == ps->audio_stream_idx) {
+        log_msg("Tracks: audio stream %d matches the kept choice by %s (the default)",
+                want, how);
+        return;
+    }
+    log_msg("Tracks: audio stream %d -> %d (kept choice, by %s)",
+            ps->audio_stream_idx, want, how);
+    ps->audio_stream_idx = want;
+}
+
+/* Called by main after a successful player_open in a carrying mode. */
+void track_apply_subs(PlayerState *ps) {
+    if (ps->track_apply == TRACKS_APPLY_NONE || ps->sub_count <= 0) return;
+    int pos = -1;
+    const char *how = NULL;
+    if (ps->track_apply == TRACKS_APPLY_RESUME && ps->resume_sub_stream != -2) {
+        if (ps->resume_sub_stream == -1) return;   /* recorded Off: stays off */
+        for (int k = 0; k < ps->sub_count; k++)
+            if (ps->sub_stream_indices[k] == ps->resume_sub_stream) {
+                pos = k;
+                how = "the resume record";
+            }
+    }
+    if (pos < 0)
+        pos = track_pref_pick(ps, &ps->pref_sub, ps->sub_stream_indices,
+                              ps->sub_count, 0, &how);
+    if (pos < 0) {
+        if (ps->pref_sub.set)
+            log_msg("Tracks: no subtitle track matches the kept choice (lang='%s' "
+                    "title='%s') — subtitles stay off", ps->pref_sub.lang,
+                    ps->pref_sub.title);
+        return;
+    }
+    log_msg("Tracks: subtitle track %d/%d on (kept choice, by %s)",
+            pos + 1, ps->sub_count, how);
+    sub_select(ps, pos + 1);
+}
+
 int player_open(PlayerState *ps, const char *filename) {
     int ret;
 
@@ -4387,6 +4852,8 @@ int player_open(PlayerState *ps, const char *filename) {
             }
         }
     }
+
+    track_apply_audio(ps);   /* T5: a kept A choice overrides the default */
 
     if (ps->video_stream_idx < 0 && ps->audio_stream_idx < 0) {
         log_msg("ERROR: No playable video or audio stream found");
@@ -4852,6 +5319,7 @@ int player_open(PlayerState *ps, const char *filename) {
 
     /* ── Seek mutex (protects codec flush vs decode) ── */
     ps->seek_mutex = SDL_CreateMutex();
+    ps->seek_req_mutex = SDL_CreateMutex();   /* m-S1-a */
     ps->seeking    = 0;
 
     /* ── Init timing ── */
@@ -4862,6 +5330,7 @@ int player_open(PlayerState *ps, const char *filename) {
     ps->audio_clock_sync = 0.0;
     ps->av_bias = 0.0;
     ps->av_bias_samples = 0;
+    ps->av_settled_samples = 0;
     ps->av_hold = 0;
     ps->av_hold_frames = 0;
     ps->av_trace_left = 0;
@@ -4871,10 +5340,14 @@ int player_open(PlayerState *ps, const char *filename) {
      * Adapts automatically to any codec's keyframe recovery time. */
     ps->seek_recovering = 1;
     ps->seek_recovering_start = get_time_sec();
+    ps->seek_recover_last_frame = 0.0;
     ps->seekdiag_vid_pending = 0;   /* armed only by real seeks */
     ps->seekdiag_aud_pending = 0;
     ps->seekdiag_target_valid = 0;
     ps->video_ready = 0;
+    ps->step_fwd_pending  = 0;   /* T2 frame step: per file */
+    ps->step_seek_pending = 0;
+    ps->step_dirty        = 0;
 
     /* ── Reset diagnostics ── */
     ps->diag_frames_displayed = 0;
@@ -4992,7 +5465,7 @@ void player_close(PlayerState *ps) {
                 ps->diag_frames_dropped, drop_pct);
         log_msg("DIAG:   Multi-decode ticks: %d", ps->diag_multi_decodes);
         log_msg("DIAG:   Timer snap-forwards: %d", ps->diag_timer_snaps);
-        log_msg("DIAG:   Peak A/V drift:    %.1fms",
+        log_msg("DIAG:   Peak A/V drift:    %.1fms (whole run, settled samples)",
                 ps->diag_max_av_drift * 1000.0);
         log_msg("DIAG:   A/V bias:          %.1fms",
                 ps->av_bias * 1000.0);
@@ -5053,6 +5526,7 @@ void player_close(PlayerState *ps) {
 
     /* Destroy seek mutex */
     if (ps->seek_mutex) { SDL_DestroyMutex(ps->seek_mutex); ps->seek_mutex = NULL; }
+    if (ps->seek_req_mutex) { SDL_DestroyMutex(ps->seek_req_mutex); ps->seek_req_mutex = NULL; }
 
     /* Free frames */
     if (ps->video_frame)  av_frame_free(&ps->video_frame);
@@ -5093,13 +5567,19 @@ void player_close(PlayerState *ps) {
     ps->seeking            = 0;
     ps->seek_recovering    = 0;
     ps->seek_recovering_start = 0.0;
+    ps->seek_recover_last_frame = 0.0;
+    ps->seek_inflight      = 0;
     ps->seekdiag_vid_pending = 0;
     ps->seekdiag_aud_pending = 0;
     ps->seekdiag_target_valid = 0;
+    ps->step_fwd_pending   = 0;
+    ps->step_seek_pending  = 0;
+    ps->step_dirty         = 0;
     ps->audio_pts_floor    = 0.0;
     ps->video_ready        = 0;
     ps->show_debug         = 0;
     ps->show_info          = 0;
+    ps->show_keys          = 0;
     ps->show_seekbar       = 0;
     ps->seekbar_hide_time  = 0.0;
     ps->overlay_active     = 0;
@@ -5481,20 +5961,32 @@ int demux_thread_func(void *arg) {
 
         /* ── Handle seek requests ── */
         if (ps->seek_request) {
+            /* m-S1-a: read the slot and clear it as one step — unlocked,
+             * a press between the read and the clear was swallowed, and a
+             * target could pair with the previous request's flags. */
+            SDL_LockMutex(ps->seek_req_mutex);
             int64_t target = ps->seek_target;
             int     tflags = ps->seek_flags;
+            ps->seek_inflight = 1;
+            ps->seek_request  = 0;
+            SDL_UnlockMutex(ps->seek_req_mutex);
             /* m-S1-c: the recovery gate and every SEEKDIAG line read
              * THIS value, not the live seek_target — a second request
              * issued during service overwrote the live one and the
              * 2026-08-29 double-seek printed seek#1's landing against
              * seek#2's target ('delta=-640', field 2026-09-07). */
-            ps->seekdiag_target = target;
-            /* Re-arm IMMEDIATELY: clearing only after the full
-             * seek+flush swallowed any second seek issued during
-             * service (double-tap on slow media; audio_cycle's
-             * recovery seek). The audio callback stays gated via
-             * ps->seeking for the whole window. */
-            ps->seek_request = 0;
+            /* (A) 2026-10-06: the serviced target is stored at the flush
+             * below, NOT here. Pickup can wait ~170 ms for seek_mutex while
+             * the decoder finishes a 4K frame (field, dellbian, paused ←
+             * presses), and every frame popped in that window still
+             * carries the old serial — stored here, it labelled them with
+             * this seek's target ('landed +3.938s' for a frame of the
+             * previous seek). seek_inflight marks the window instead
+             * (set above, with the slot read). Re-arm IMMEDIATELY:
+             * clearing only after the full seek+flush swallowed any
+             * second seek issued during service (double-tap on slow
+             * media; audio_cycle's recovery seek). The audio callback
+             * stays gated via ps->seeking for the whole window. */
             log_msg("Demux: seeking to %.3f s (flags=%s)",
                     (double)target / AV_TIME_BASE,
                     (tflags & AVSEEK_FLAG_BACKWARD) ? "backward"
@@ -5528,6 +6020,7 @@ int demux_thread_func(void *arg) {
                 log_msg("ERROR: Seek failed: %s — position unchanged (the frame timer was reset at request)",
                         av_err2str(ret));
                 ps->seeking = 0;
+                ps->seek_inflight = 0;
                 /* Resume under the mutex: audio_cycle and the
                  * device-removed handler destroy/replace audio_stream
                  * under this same lock — touching it after unlock was
@@ -5544,6 +6037,12 @@ int demux_thread_func(void *arg) {
                 for (int i = 0; i < ps->sub_count; i++)
                     pq_flush(&ps->sub_pqs[i]);
                 fq_flush(&ps->video_frame_q);
+                /* The serial just changed: from here every frame belongs
+                 * to THIS seek, so this is where its target becomes the
+                 * one recovery and SEEKDIAG judge against (m-S1-c, (A)). */
+                ps->seekdiag_target   = target;
+                ps->seekdiag_backward = (tflags & AVSEEK_FLAG_BACKWARD) != 0;
+                ps->seek_inflight     = 0;
                 log_msg("Demux: queues flushed, flushing video codec");
                 if (ps->video_codec_ctx)
                     avcodec_flush_buffers(ps->video_codec_ctx);
@@ -5635,6 +6134,7 @@ int demux_thread_func(void *arg) {
              * Cleared in main.c when a frame is actually shown. */
             ps->seek_recovering = 1;
             ps->seek_recovering_start = get_time_sec();
+            ps->seek_recover_last_frame = 0.0;
             /* SEEKDIAG one-shots (deck 20325d1 port): first decoded
              * video/audio PTS post-seek, logged against the target —
              * where the demuxer actually put each stream is the fact
@@ -6544,6 +7044,65 @@ static void dovi_populate_uniforms(PlayerState *ps, const AVFrame *frame)
     ps->dovi_metadata_logged = 2;
 }
 
+/* Item (H) — SEI-only static metadata (convicted 2026-09-23 on the field
+ * user's HDR10 x265 encode: frame 0 carries a 4000-nit mastering block
+ * and MaxCLL 1546, the container carries nothing, and the open-time read
+ * is container-only — so the file tone-mapped as 1000-nit content, the
+ * static ceiling clamping the dynamic peak below what the source
+ * authored). FFmpeg exposes HEVC MDCV/CLL SEI as FRAME side data, and
+ * most x265 encodes reach us that way (mkvmerge does not copy SEI into
+ * the container). Adopt from the first presented frame — once per file,
+ * only when the open found nothing — with the open-time sanitisation:
+ * mastering max first, MaxCLL clamped against it, PQ ceiling. Runs on
+ * the render thread on the ORIGINAL decoded frame (side data is not on
+ * the swscale output), ahead of the DV L1 update so an authored L1
+ * still wins per scene. Authored metadata is trusted; this is authored. */
+static void hdr_adopt_frame_metadata(PlayerState *ps, const AVFrame *frame)
+{
+    if (!ps->hdr_meta_pending || !frame) return;
+    ps->hdr_meta_pending = 0;   /* MDCV/CLL SEI rides every IDR; frame 0 decides */
+    if (ps->gpu_uniforms.is_hdr < 0.5f) return;
+
+    float mast_max = 0.0f, peak = 0.0f;
+    unsigned cll_max = 0, cll_avg = 0;
+    const AVFrameSideData *msd = av_frame_get_side_data(
+        frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    if (msd && msd->size >= sizeof(AVMasteringDisplayMetadata)) {
+        const AVMasteringDisplayMetadata *mdm =
+            (const AVMasteringDisplayMetadata *)msd->data;
+        if (mdm->has_luminance && av_q2d(mdm->max_luminance) > 0.0)
+            mast_max = (float)av_q2d(mdm->max_luminance);
+    }
+    const AVFrameSideData *csd = av_frame_get_side_data(
+        frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    if (csd && csd->size >= sizeof(AVContentLightMetadata)) {
+        const AVContentLightMetadata *cll =
+            (const AVContentLightMetadata *)csd->data;
+        cll_max = cll->MaxCLL;
+        cll_avg = cll->MaxFALL;
+    }
+    if (cll_max > 0) {
+        peak = (float)cll_max;
+        if (mast_max > 0.0f && peak > mast_max) peak = mast_max;
+    } else if (mast_max > 0.0f) {
+        peak = mast_max;
+    }
+    if (peak <= 0.0f) {
+        if (ps->gpu_uniforms.is_dovi < 0.5f)   /* DV takes its peak from the RPU */
+            log_msg("HDR: no static metadata on the first frame either — "
+                    "1000 nit fallback stands");
+        return;
+    }
+    if (peak > 10000.0f) peak = 10000.0f;
+    log_msg("HDR: static metadata from frame side data (SEI, absent from the "
+            "container): mastering max=%.0f nits, MaxCLL=%u, MaxFALL=%u — "
+            "tone-map peak %.0f -> %.0f nits",
+            mast_max, cll_max, cll_avg, ps->hdr_static_peak, peak);
+    ps->hdr_static_peak = peak;
+    /* Smoothing seeds on this same frame (hdr_smoothed_peak == 0 → first
+     * frame jumps), so no reset is needed here. */
+}
+
 #define PEAK_ATTACK_RATE    0.3f     /* rise towards new peak per frame   */
 #define PEAK_DECAY_RATE     0.03f    /* decay towards new peak per frame  */
 #define PEAK_SCENE_CUT_THR  0.5f     /* 50% increase = scene cut, jump up */
@@ -6814,6 +7373,7 @@ void video_display(PlayerState *ps) {
     /* ── Dolby Vision RPU metadata extraction ──
      * Extract and log reshaping curves from first DV frame.
      * Uses original decoded frame (side data not on swscale output). */
+    hdr_adopt_frame_metadata(ps, ps->video_frame);   /* item (H): before the DV L1 update */
     dovi_log_frame_metadata(ps, ps->video_frame);
     dovi_populate_uniforms(ps, ps->video_frame);
     dovi_update_l1_peak(ps, ps->video_frame);   /* P5 AND P8 */
@@ -7129,10 +7689,14 @@ void video_reblit(PlayerState *ps) {
  * forward step). Same request slot as player_seek. */
 void player_seek_abs(PlayerState *ps, double pos_sec, int backward) {
     if (!ps->playing) return;
+    ps->step_seek_pending = 0;   /* a new seek cancels an exact frame step (T2) */
+    ps->step_fwd_pending  = 0;
     if (pos_sec < 0.0) pos_sec = 0.0;
+    SDL_LockMutex(ps->seek_req_mutex);   /* m-S1-a: the three as one */
     ps->seek_target  = (int64_t)(pos_sec * AV_TIME_BASE);
     ps->seek_flags   = backward ? AVSEEK_FLAG_BACKWARD : 0;
     ps->seek_request = 1;
+    SDL_UnlockMutex(ps->seek_req_mutex);
     ps->frame_timer      = get_time_sec();
     ps->frame_last_delay = 0.04;
 }
@@ -7148,18 +7712,34 @@ int player_chapter_index(const PlayerState *ps, double pos_sec) {
 
 void player_seek(PlayerState *ps, double incr) {
     if (!ps->playing) return;
+    ps->step_seek_pending = 0;   /* a new seek cancels an exact frame step (T2) */
+    ps->step_fwd_pending  = 0;
     ps->chapter_nav_idx = -1;   /* a free seek ends the chapter pre-roll rule */
 
+    /* m-S1-a: while a seek is requested, picked up or being serviced,
+     * the clocks still hold the OLD position (demux presets them only at
+     * the end of the seek), so a second press based on them repeated the
+     * first target (field 2026-10-06: 133.101 and 128.101 each requested
+     * twice). Chain onto the pending target instead. Once the seek is
+     * done the clock holds the target preset, then the real landing —
+     * the right base again (a forward landing a GOP past its target must
+     * not be re-requested from the target). */
+    SDL_LockMutex(ps->seek_req_mutex);
+    int chained = ps->seek_request || ps->seek_inflight || ps->seeking;
     /* Audio-only files never update video_clock — seek relative to
      * the audio playback position instead. */
-    double base = (ps->video_stream_idx >= 0)
-        ? ps->video_clock : ps->audio_clock_sync;
+    double base = chained ? (double)ps->seek_target / AV_TIME_BASE
+                : (ps->video_stream_idx >= 0) ? ps->video_clock
+                : ps->audio_clock_sync;
     double pos = base + incr;
     if (pos < 0.0) pos = 0.0;
 
     ps->seek_target  = (int64_t)(pos * AV_TIME_BASE);
     ps->seek_flags   = (incr < 0) ? AVSEEK_FLAG_BACKWARD : 0;
     ps->seek_request = 1;
+    SDL_UnlockMutex(ps->seek_req_mutex);
+    if (chained)
+        log_msg("Seek: chained onto pending target %.3f s (%+.1f)", base, incr);
 
     /* Reset video timing after seek */
     ps->frame_timer      = get_time_sec();
@@ -7516,7 +8096,8 @@ void player_build_debug_info(PlayerState *ps) {
             else if (u->out_black_nits == 0.0f)
                 INFO_APPEND("Black:   lift auto target/2000\n");
             else
-                INFO_APPEND("Black:   lift off\n");
+                INFO_APPEND("Black:   lift off (%s)\n",
+                    ps->black_src ? ps->black_src : "?");
             {
                 static const char *dbg_names[] = {
                     "off", "1 (target+100 compare)",

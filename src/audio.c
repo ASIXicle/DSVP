@@ -194,7 +194,7 @@ void SDLCALL audio_callback(void *userdata, SDL_AudioStream *stream,
     PlayerState *ps = (PlayerState *)userdata;
     (void)total_amount;
 
-    if (ps->paused || ps->seek_request || ps->seeking) return;
+    if (ps->paused || ps->seek_request || ps->seek_inflight || ps->seeking) return;
     if (additional_amount <= 0) return;
 
     int written = 0;
@@ -540,6 +540,7 @@ void audio_cycle(PlayerState *ps) {
 
     ps->aud_selection    = new_sel;
     ps->audio_stream_idx = new_stream_idx;
+    track_pref_note(ps, 0, new_stream_idx, new_sel);   /* T5: carried to the next file */
 
     log_msg("Audio: now playing %s (%s %dHz)",
         ps->aud_stream_names[new_sel], codec->name, new_rate);
@@ -550,9 +551,11 @@ void audio_cycle(PlayerState *ps) {
     double pos = (ps->video_stream_idx >= 0) ? ps->video_clock
                                              : ps->audio_clock_sync;
     if (pos < 0.1) pos = 0.1;
+    SDL_LockMutex(ps->seek_req_mutex);   /* m-S1-a: the slot as one */
     ps->seek_target  = (int64_t)(pos * AV_TIME_BASE);
     ps->seek_flags   = AVSEEK_FLAG_BACKWARD;
     ps->seek_request = 1;
+    SDL_UnlockMutex(ps->seek_req_mutex);
 
     SDL_UnlockMutex(ps->seek_mutex);
 
